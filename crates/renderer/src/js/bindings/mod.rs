@@ -1924,10 +1924,10 @@ mod realm_tests {
         let services: Arc<dyn BrowserServices> = Arc::new(NullServices);
         let shared = SharedJsRuntime::default();
         for (url, expected) in [
-            ("https://a.test/", "true,function,true,function"),
+            ("https://a.test/", "true,function,true,true,function"),
             // `http://a.test` is not loopback, so it is not potentially
             // trustworthy.
-            ("http://a.test/", "false,undefined,false,undefined"),
+            ("http://a.test/", "false,undefined,false,false,undefined"),
         ] {
             let stop = Arc::new(Stop::new());
             let documents = Rc::new(RefCell::new(crate::documents::DocumentStore::default()));
@@ -1947,6 +1947,7 @@ mod realm_tests {
                     [
                       String(isSecureContext),
                       typeof crypto.randomUUID,
+                      String('randomUUID' in Crypto.prototype),
                       String('userAgentData' in navigator),
                       typeof NavigatorUAData
                     ].join(",");
@@ -1955,6 +1956,112 @@ mod realm_tests {
                 .expect("secure context surfaces");
             assert_eq!(outcome, expected, "{url}");
         }
+    }
+
+    /// `Crypto` is an interface object with one instance, and its algorithms
+    /// never read page-replaceable state: not the method that fills bytes,
+    /// not the instance's own views, and not the typed-array prototype
+    /// (<https://w3c.github.io/webcrypto/#Crypto-interface>).
+    #[test]
+    fn crypto_is_one_interface_with_one_instance() {
+        let services: Arc<dyn BrowserServices> = Arc::new(NullServices);
+        let shared = SharedJsRuntime::default();
+        let stop = Arc::new(Stop::new());
+        let documents = Rc::new(RefCell::new(crate::documents::DocumentStore::default()));
+        let registry = Rc::new(RefCell::new(crate::js::RealmRegistry::default()));
+        let world = world_with_document(
+            &shared,
+            &services,
+            &documents,
+            &registry,
+            "https://a.test/",
+            "<!doctype html><p></p>",
+        );
+        let realm = JsRealm::new(&shared.handle(), world, stop).expect("realm");
+        let outcome = realm
+            .eval(
+                "
+                const results = [];
+                const proto = Object.getPrototypeOf(crypto);
+                const attempt = run => {
+                  try { run(); results.push('no throw'); }
+                  catch (error) { results.push(error.name + ': ' + error.message); }
+                };
+                results.push(globalThis.crypto === crypto);
+                results.push(proto === Crypto.prototype);
+                results.push(typeof proto.getRandomValues);
+                results.push(String('randomUUID' in proto));
+                const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'crypto');
+                results.push(String(typeof descriptor.get) + String(descriptor.set === undefined));
+                attempt(() => new Crypto());
+                attempt(() => Crypto.prototype.getRandomValues.call({}, new Uint8Array(1)));
+                attempt(() => crypto.getRandomValues(new Float32Array(1)));
+                attempt(() => crypto.getRandomValues(new DataView(new ArrayBuffer(1))));
+                const oversized = new Uint8Array(70000);
+                Object.defineProperty(oversized, 'byteLength', { value: 0 });
+                attempt(() => crypto.getRandomValues(oversized));
+                const bytes = new Uint8Array(4);
+                results.push(String(crypto.getRandomValues(bytes) === bytes));
+                const original = Crypto.prototype.getRandomValues;
+                Crypto.prototype.getRandomValues = () => new Uint8Array(16);
+                const uuid = crypto.randomUUID();
+                Crypto.prototype.getRandomValues = original;
+                results.push(String(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(uuid)));
+                results.push(String(uuid !== '00000000-0000-4000-8000-000000000000'));
+                results.join(',');
+                ",
+            )
+            .expect("crypto interface");
+        assert_eq!(
+            outcome,
+            concat!(
+                "true,true,function,true,functiontrue,",
+                "TypeError: Illegal constructor,",
+                "TypeError: Illegal invocation,",
+                "TypeMismatchError: destination must be an integer TypedArray,",
+                "TypeMismatchError: destination must be an integer TypedArray,",
+                "QuotaExceededError: random byte quota exceeded,",
+                "true,true,true"
+            )
+        );
+    }
+
+    /// A generated interface's instances carry the generated prototype, not
+    /// the class literal's, and a subclass still chooses its own
+    /// (<https://webidl.spec.whatwg.org/#internally-create-a-new-object-implementing-the-interface>).
+    #[test]
+    fn a_constructed_js_interface_gets_the_generated_prototype() {
+        let services: Arc<dyn BrowserServices> = Arc::new(NullServices);
+        let shared = SharedJsRuntime::default();
+        let stop = Arc::new(Stop::new());
+        let documents = Rc::new(RefCell::new(crate::documents::DocumentStore::default()));
+        let registry = Rc::new(RefCell::new(crate::js::RealmRegistry::default()));
+        let world = world_with_document(
+            &shared,
+            &services,
+            &documents,
+            &registry,
+            "https://a.test/",
+            "<!doctype html><p></p>",
+        );
+        let realm = JsRealm::new(&shared.handle(), world, stop).expect("realm");
+        let outcome = realm
+            .eval(
+                "
+                const encoder = new TextEncoder();
+                const Subclass = class extends TextEncoder {};
+                const sub = new Subclass();
+                [
+                  Object.getPrototypeOf(encoder) === TextEncoder.prototype,
+                  encoder instanceof TextEncoder,
+                  Object.getPrototypeOf(sub) === Subclass.prototype,
+                  sub instanceof TextEncoder,
+                  typeof encoder.encode
+                ].join(',');
+                ",
+            )
+            .expect("generated prototype");
+        assert_eq!(outcome, "true,true,true,true,function");
     }
 
     /// A call is a direct eval only when the callee is `%eval%` itself

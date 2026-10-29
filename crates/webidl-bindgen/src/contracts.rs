@@ -8,7 +8,7 @@ use weedle::interface::{InterfaceMember, Special};
 use weedle::literal::DefaultValue;
 use weedle::types::{IntegerType, NonAnyType, SingleType, Type, UnionMemberType};
 
-use crate::database::Database;
+use crate::database::{Database, has_no_args};
 use crate::model::{
     self, ArgumentArity, ConstructorArgumentKind, GetterMapping, InterfaceKind, OperationResult,
     PropertyGetter, PropertyHooks, PrototypeParent, ReturnType,
@@ -430,6 +430,7 @@ fn lower(
     }
     let declaration = database.interface(&implementation.interface)?;
     validate_interface_attributes(declaration.attributes.as_ref())?;
+    let secure_context = has_no_args(declaration.attributes.as_ref(), "SecureContext");
     // https://webidl.spec.whatwg.org/#js-DOMException-specialness
     let parent = declaration
         .parent
@@ -455,6 +456,7 @@ fn lower(
         stringifier: None,
         indexed_setter: None,
         install_targets: Vec::new(),
+        secure_context,
         contract: None,
     };
     interface.contract = Some(lower_members(
@@ -510,6 +512,7 @@ fn lower_mixin(
         properties: PropertyHooks::None,
         stringifier: None,
         indexed_setter: None,
+        secure_context: false,
         install_targets: database
             .includers(&implementation.interface)
             .into_iter()
@@ -577,6 +580,7 @@ fn lower_members(
     let inherited = database.hook_members(declaration.name)?;
     for member in declaration.members.iter().chain(inherited.iter()) {
         let resolved = member;
+        let exposure = member.exposure(declaration);
         match &member.declaration {
             InterfaceMember::Const(member) => {
                 resolved.validate_scopes().map_err(|error| {
@@ -598,11 +602,12 @@ fn lower_members(
                 )?;
             }
             InterfaceMember::Attribute(member) => {
-                let Some((attribute, signature)) =
+                let Some((mut attribute, signature)) =
                     lower_attribute(database, member, &implementation.methods)?
                 else {
                     continue;
                 };
+                attribute.exposure = exposure;
                 resolved.validate_scopes().map_err(|error| {
                     crate::Error(format!("{}: {error}", member_name(&resolved.declaration)))
                 })?;
@@ -659,6 +664,8 @@ fn lower_members(
                     getters.push(property);
                 }
                 methods.push(signature);
+                let mut operation = operation;
+                operation.exposure = exposure;
                 interface.operations.push(operation);
             }
             InterfaceMember::Constructor(_)
@@ -1064,27 +1071,11 @@ fn infer_property_hooks(
             let attributes = declaration.attributes.as_ref();
             Ok(PropertyHooks::IndexedNamed {
                 names: supported,
-                unenumerable: has_attribute(attributes, "LegacyUnenumerableNamedProperties"),
-                override_builtins: has_attribute(attributes, "LegacyOverrideBuiltIns"),
+                unenumerable: has_no_args(attributes, "LegacyUnenumerableNamedProperties"),
+                override_builtins: has_no_args(attributes, "LegacyOverrideBuiltIns"),
             })
         }
     }
-}
-
-fn has_attribute(
-    attributes: Option<&weedle::attribute::ExtendedAttributeList<'_>>,
-    name: &str,
-) -> bool {
-    attributes.is_some_and(|attributes| {
-        attributes
-            .body
-            .list
-            .iter()
-            .any(|attribute| match attribute {
-                weedle::attribute::ExtendedAttribute::NoArgs(attribute) => attribute.0.0 == name,
-                _ => false,
-            })
-    })
 }
 
 /// One constructor member's lowering.
@@ -1232,8 +1223,8 @@ fn lower_operation(
         ));
     }
     validate_operation_attributes(member.attributes.as_ref())?;
-    let reactions = has_attribute(member.attributes.as_ref(), "CEReactions");
-    let unscopable = has_attribute(member.attributes.as_ref(), "Unscopable");
+    let reactions = has_no_args(member.attributes.as_ref(), "CEReactions");
+    let unscopable = has_no_args(member.attributes.as_ref(), "Unscopable");
     if !method.has_self {
         return Err(Error(format!(
             "native operation {name} must take self as its first parameter"
@@ -1290,6 +1281,7 @@ fn lower_operation(
         fn #rust(&self, ctx: Ctx<'js>, #this_parameter #(#parameters),*) -> Result<#returns>;
     };
     let operation = model::Operation {
+        exposure: crate::database::Exposure::default(),
         name: name.into(),
         rust,
         result,
@@ -1334,12 +1326,11 @@ fn lower_argument(
     };
     validate_argument_attributes(argument.attributes.as_ref())?;
     validate_argument_attributes(argument.type_.attributes.as_ref())?;
-    let legacy_null_to_empty =
-        has_attribute(argument.attributes.as_ref(), "LegacyNullToEmptyString")
-            || has_attribute(
-                argument.type_.attributes.as_ref(),
-                "LegacyNullToEmptyString",
-            );
+    let legacy_null_to_empty = has_no_args(argument.attributes.as_ref(), "LegacyNullToEmptyString")
+        || has_no_args(
+            argument.type_.attributes.as_ref(),
+            "LegacyNullToEmptyString",
+        );
     let type_ = native_type(database, &argument.type_.type_, &mut BTreeSet::new())?;
     if legacy_null_to_empty && !matches!(type_, ReturnType::String) {
         return Err(Error("LegacyNullToEmptyString requires DOMString".into()));
@@ -1603,8 +1594,8 @@ fn union_result(
 /// and non-stringifier special attributes lose their semantics as plain
 /// methods.
 fn is_special_reflect_shape(member: &weedle::interface::AttributeInterfaceMember<'_>) -> bool {
-    has_attribute(member.attributes.as_ref(), "SameObject")
-        || has_attribute(member.attributes.as_ref(), "PutForwards")
+    has_no_args(member.attributes.as_ref(), "SameObject")
+        || has_no_args(member.attributes.as_ref(), "PutForwards")
         || member.modifier.as_ref().is_some_and(|modifier| {
             !matches!(
                 modifier,
@@ -1620,8 +1611,8 @@ fn is_special_reflect_shape(member: &weedle::interface::AttributeInterfaceMember
 fn reject_legacy_non_string_reflect(
     member: &weedle::interface::AttributeInterfaceMember<'_>,
 ) -> Result<(), Error> {
-    let legacy = has_attribute(member.attributes.as_ref(), "LegacyNullToEmptyString")
-        || has_attribute(member.type_.attributes.as_ref(), "LegacyNullToEmptyString");
+    let legacy = has_no_args(member.attributes.as_ref(), "LegacyNullToEmptyString")
+        || has_no_args(member.type_.attributes.as_ref(), "LegacyNullToEmptyString");
     if legacy
         && reflect_content(member.attributes.as_ref(), member.identifier.0).is_some()
         && !matches!(
@@ -1711,12 +1702,12 @@ fn lower_attribute(
     }
     validate_attribute_attributes(member.attributes.as_ref())?;
     validate_argument_attributes(member.type_.attributes.as_ref())?;
-    let reactions = has_attribute(member.attributes.as_ref(), "CEReactions");
-    let legacy_null_to_empty = has_attribute(member.attributes.as_ref(), "LegacyNullToEmptyString")
-        || has_attribute(member.type_.attributes.as_ref(), "LegacyNullToEmptyString")
+    let reactions = has_no_args(member.attributes.as_ref(), "CEReactions");
+    let legacy_null_to_empty = has_no_args(member.attributes.as_ref(), "LegacyNullToEmptyString")
+        || has_no_args(member.type_.attributes.as_ref(), "LegacyNullToEmptyString")
         || match &member.type_.type_ {
             Type::Union(union_) => {
-                union_member_has_attribute(&union_.type_.body.list, "LegacyNullToEmptyString")
+                union_member_has_no_args(&union_.type_.body.list, "LegacyNullToEmptyString")
             }
             Type::Single(_) => false,
         };
@@ -1749,6 +1740,7 @@ fn lower_attribute(
     let mut signature = quote! { fn #getter(&self, ctx: &Ctx<'js>) -> Result<#result>; };
     let setter = attribute_setter(member, &type_, writable, &setter_name, &mut signature)?;
     let attribute = model::Attribute {
+        exposure: crate::database::Exposure::default(),
         name: member.identifier.0.into(),
         rust: getter,
         return_type: type_,
@@ -1944,8 +1936,8 @@ fn lower_reflect_setter_attribute(
     }
     validate_argument_attributes(member.type_.attributes.as_ref())?;
     validate_attribute_attributes(member.attributes.as_ref())?;
-    if has_attribute(member.attributes.as_ref(), "SameObject")
-        || has_attribute(member.attributes.as_ref(), "PutForwards")
+    if has_no_args(member.attributes.as_ref(), "SameObject")
+        || has_no_args(member.attributes.as_ref(), "PutForwards")
     {
         return Err(Error(format!(
             "{}: reflect setter semantics are not supported yet",
@@ -1978,8 +1970,8 @@ fn lower_reflect_setter_attribute(
         )));
     }
     let getter = format_ident!("{getter_name}");
-    let legacy_null_to_empty = has_attribute(member.attributes.as_ref(), "LegacyNullToEmptyString")
-        || has_attribute(member.type_.attributes.as_ref(), "LegacyNullToEmptyString");
+    let legacy_null_to_empty = has_no_args(member.attributes.as_ref(), "LegacyNullToEmptyString")
+        || has_no_args(member.type_.attributes.as_ref(), "LegacyNullToEmptyString");
     // Like operation arguments, `[LegacyNullToEmptyString]` requires
     // `DOMString`: on numerics it would otherwise be silently dropped by
     // the generated setter.
@@ -2003,6 +1995,7 @@ fn lower_reflect_setter_attribute(
     }
     let signature = reflect_setter_signature(member.identifier.0, &getter, &type_)?;
     let attribute = model::Attribute {
+        exposure: crate::database::Exposure::default(),
         name: member.identifier.0.into(),
         rust: getter,
         return_type: type_,
@@ -2011,7 +2004,7 @@ fn lower_reflect_setter_attribute(
             content: content.into(),
         }),
         legacy_null_to_empty,
-        reactions: has_attribute(member.attributes.as_ref(), "CEReactions"),
+        reactions: has_no_args(member.attributes.as_ref(), "CEReactions"),
     };
     Ok(Some((attribute, signature)))
 }
@@ -2137,16 +2130,16 @@ fn lower_reflect_attribute(
     }
     let writable = member.readonly.is_none();
     validate_argument_attributes(member.type_.attributes.as_ref())?;
-    if has_attribute(member.attributes.as_ref(), "SameObject")
-        || has_attribute(member.attributes.as_ref(), "PutForwards")
+    if has_no_args(member.attributes.as_ref(), "SameObject")
+        || has_no_args(member.attributes.as_ref(), "PutForwards")
     {
         return Ok(None);
     }
     // `[LegacyNullToEmptyString]` reflection is auto-generatable for
     // strings: the getter is plain reflection and the setter converts null
     // to the empty string. On booleans it is invalid IDL.
-    let legacy_null_to_empty = has_attribute(member.attributes.as_ref(), "LegacyNullToEmptyString")
-        || has_attribute(member.type_.attributes.as_ref(), "LegacyNullToEmptyString");
+    let legacy_null_to_empty = has_no_args(member.attributes.as_ref(), "LegacyNullToEmptyString")
+        || has_no_args(member.type_.attributes.as_ref(), "LegacyNullToEmptyString");
     // Only plain string, boolean, and `USVString` reflection so far.
     // `USVString` under a plain `[Reflect]` reads the raw content attribute
     // exactly like `DOMString` (`a.ping`, `img.srcset`): stored content is
@@ -2193,6 +2186,7 @@ fn lower_reflect_attribute(
         None
     };
     let attribute = model::Attribute {
+        exposure: crate::database::Exposure::default(),
         name: member.identifier.0.into(),
         rust: getter,
         return_type: type_,
@@ -2201,7 +2195,7 @@ fn lower_reflect_attribute(
         },
         setter,
         legacy_null_to_empty,
-        reactions: has_attribute(member.attributes.as_ref(), "CEReactions"),
+        reactions: has_no_args(member.attributes.as_ref(), "CEReactions"),
     };
     Ok(Some((attribute, quote! {})))
 }
@@ -2243,10 +2237,10 @@ fn lower_reflect_url_attribute(
     }
     let writable = member.readonly.is_none();
     validate_argument_attributes(member.type_.attributes.as_ref())?;
-    if has_attribute(member.attributes.as_ref(), "SameObject")
-        || has_attribute(member.attributes.as_ref(), "PutForwards")
-        || has_attribute(member.attributes.as_ref(), "LegacyNullToEmptyString")
-        || has_attribute(member.type_.attributes.as_ref(), "LegacyNullToEmptyString")
+    if has_no_args(member.attributes.as_ref(), "SameObject")
+        || has_no_args(member.attributes.as_ref(), "PutForwards")
+        || has_no_args(member.attributes.as_ref(), "LegacyNullToEmptyString")
+        || has_no_args(member.type_.attributes.as_ref(), "LegacyNullToEmptyString")
     {
         return Ok(None);
     }
@@ -2260,6 +2254,7 @@ fn lower_reflect_url_attribute(
         None
     };
     let attribute = model::Attribute {
+        exposure: crate::database::Exposure::default(),
         name: member.identifier.0.into(),
         rust: getter,
         return_type: ReturnType::UsvString,
@@ -2268,7 +2263,7 @@ fn lower_reflect_url_attribute(
         },
         setter,
         legacy_null_to_empty: false,
-        reactions: has_attribute(member.attributes.as_ref(), "CEReactions"),
+        reactions: has_no_args(member.attributes.as_ref(), "CEReactions"),
     };
     Ok(Some((attribute, quote! {})))
 }
@@ -2807,10 +2802,10 @@ fn member_return_type(type_: &model::UnionMemberType) -> ReturnType {
 
 /// Whether any union member or nested member carries `name`, so attribute
 /// lowering can read `[LegacyNullToEmptyString]` off a collapsed member.
-fn union_member_has_attribute(list: &[UnionMemberType<'_>], name: &str) -> bool {
+fn union_member_has_no_args(list: &[UnionMemberType<'_>], name: &str) -> bool {
     list.iter().any(|member| match member {
-        UnionMemberType::Single(member) => has_attribute(member.attributes.as_ref(), name),
-        UnionMemberType::Union(inner) => union_member_has_attribute(&inner.type_.body.list, name),
+        UnionMemberType::Single(member) => has_no_args(member.attributes.as_ref(), name),
+        UnionMemberType::Union(inner) => union_member_has_no_args(&inner.type_.body.list, name),
     })
 }
 
@@ -2859,6 +2854,7 @@ fn validate_attribute_attributes(
                             | "Reflect"
                             | "ReflectSetter"
                             | "ReflectURL"
+                            | "SecureContext"
                     ) => {}
                 // Numeric reflection parameters: hand-written getters encode
                 // the spec algorithm, so the normal method path documents
@@ -2930,7 +2926,10 @@ fn validate_operation_attributes(
         for attribute in &attributes.body.list {
             match attribute {
                 ExtendedAttribute::NoArgs(item)
-                    if matches!(item.0.0, "NewObject" | "CEReactions" | "Unscopable") => {}
+                    if matches!(
+                        item.0.0,
+                        "NewObject" | "CEReactions" | "Unscopable" | "SecureContext"
+                    ) => {}
                 _ => {
                     return Err(Error(format!(
                         "native operation semantics are not supported yet: {attribute:?}"
@@ -2974,25 +2973,19 @@ fn validate_empty_attributes(attributes: Option<&ExtendedAttributeList<'_>>) -> 
 fn validate_interface_attributes(
     attributes: Option<&ExtendedAttributeList<'_>>,
 ) -> Result<(), Error> {
-    let mut exposed = false;
     if let Some(attributes) = attributes {
         for attribute in &attributes.body.list {
             match attribute {
-                ExtendedAttribute::WildCard(item) if item.identifier.0 == "Exposed" => {
-                    exposed = true;
-                }
-                ExtendedAttribute::Ident(item) if item.lhs_identifier.0 == "Exposed" => {
-                    exposed = item.rhs.0 == "Window";
-                }
-                ExtendedAttribute::IdentList(item) if item.identifier.0 == "Exposed" => {
-                    exposed = item.list.body.list.iter().any(|item| item.0 == "Window");
-                }
+                ExtendedAttribute::WildCard(item) if item.identifier.0 == "Exposed" => {}
+                ExtendedAttribute::Ident(item) if item.lhs_identifier.0 == "Exposed" => {}
+                ExtendedAttribute::IdentList(item) if item.identifier.0 == "Exposed" => {}
                 ExtendedAttribute::NoArgs(item)
                     if matches!(
                         item.0.0,
                         "Serializable"
                             | "LegacyUnenumerableNamedProperties"
                             | "LegacyOverrideBuiltIns"
+                            | "SecureContext"
                     ) => {}
                 // A named factory function (`new Option(...)`) is a JS shim
                 // concern; the generator installs no member for it.
@@ -3006,7 +2999,7 @@ fn validate_interface_attributes(
             }
         }
     }
-    if exposed {
+    if crate::database::exposed_in(attributes, "Window") {
         Ok(())
     } else {
         Err(Error("native interface is not exposed in Window".into()))

@@ -8,6 +8,28 @@ pub type ExtendedAttributeList<'a> = Bracketed<Punctuated<ExtendedAttribute<'a>,
 /// Matches comma separated identifier list
 pub type IdentifierList<'a> = Punctuated<Identifier<'a>, term!(,)>;
 
+/// Whether the list carries `[name]` with no arguments.
+pub fn has_no_args(list: &ExtendedAttributeList<'_>, name: &str) -> bool {
+    list.body.list.iter().any(|attribute| match attribute {
+        ExtendedAttribute::NoArgs(item) => item.0 .0 == name,
+        _ => false,
+    })
+}
+
+/// Whether `[Exposed]` names `target`, including the `*` wildcard.
+pub fn exposed_in(list: &ExtendedAttributeList<'_>, target: &str) -> bool {
+    list.body.list.iter().any(|attribute| match attribute {
+        ExtendedAttribute::WildCard(item) if item.identifier.0 == "Exposed" => true,
+        ExtendedAttribute::Ident(item) if item.lhs_identifier.0 == "Exposed" => {
+            item.rhs.0 == target
+        }
+        ExtendedAttribute::IdentList(item) if item.identifier.0 == "Exposed" => {
+            item.list.body.list.iter().any(|item| item.0 == target)
+        }
+        _ => false,
+    })
+}
+
 ast_types! {
     /// Parses on of the forms of attribute
     enum ExtendedAttribute<'a> {

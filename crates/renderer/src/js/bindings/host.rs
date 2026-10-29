@@ -34,6 +34,9 @@ impl Operation {
 
 pub(crate) struct Member {
     pub(crate) name: &'static str,
+    /// `[SecureContext]`: the member is absent outside a secure context
+    /// (<https://webidl.spec.whatwg.org/#SecureContext>).
+    pub(crate) secure_context: bool,
     pub(crate) kind: MemberKind,
 }
 
@@ -73,6 +76,15 @@ impl NativeFunc for HostCall {
     fn call<'js>(&self, params: Params<'_, 'js>) -> Result<Value<'js>> {
         (self.dispatch)(self.operation, &params)
     }
+}
+
+/// Whether the realm's environment is a secure context.
+///
+/// One read per install: every `[SecureContext]` member of the interface is
+/// decided by this value
+/// (<https://w3c.github.io/webappsec-secure-contexts/#is-settings-object-contextually-secure>).
+pub(crate) fn is_secure_context(ctx: &Ctx<'_>) -> Result<bool> {
+    Ok(world(ctx)?.borrow().is_secure_context())
 }
 
 /// Install regular readonly attributes, constants, and the interface's tag.
@@ -144,7 +156,11 @@ pub(crate) fn install_members(
     // https://webidl.spec.whatwg.org/#es-attributes
     // https://webidl.spec.whatwg.org/#es-operations
     let ctx = prototype.ctx();
+    let secure_context = is_secure_context(ctx)?;
     for member in members {
+        if member.secure_context && !secure_context {
+            continue;
+        }
         match member.kind {
             MemberKind::Attribute { getter, setter } => {
                 let getter = Function::new_native(ctx.clone(), HostCall::new(dispatch, getter))?

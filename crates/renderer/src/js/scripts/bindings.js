@@ -34,17 +34,31 @@ const __tbIDLTypedArray = Object.getPrototypeOf(Uint8Array.prototype);
 const __tbIDLTypedArrayTag = __tbIDLDescriptor(__tbIDLTypedArray, Symbol.toStringTag).get;
 const __tbIDLTypedArrayLength = __tbIDLDescriptor(__tbIDLTypedArray, 'length').get;
 const __tbIDLTypedArrayBuffer = __tbIDLDescriptor(__tbIDLTypedArray, 'buffer').get;
+const __tbIDLTypedArrayByteOffset = __tbIDLDescriptor(__tbIDLTypedArray, 'byteOffset').get;
+const __tbIDLTypedArrayByteLength = __tbIDLDescriptor(__tbIDLTypedArray, 'byteLength').get;
+const __tbIDLTypedArraySet = __tbIDLTypedArray.set;
+const __tbIDLDataViewBuffer = __tbIDLDescriptor(DataView.prototype, 'buffer').get;
 const __tbIDLBufferLength = __tbIDLDescriptor(ArrayBuffer.prototype, 'byteLength').get;
 const __tbIDLResizable = __tbIDLDescriptor(ArrayBuffer.prototype, 'resizable')?.get;
 const __tbIDLSharedPrototype = globalThis.SharedArrayBuffer?.prototype;
 const __tbIDLSharedLength = __tbIDLSharedPrototype && __tbIDLDescriptor(__tbIDLSharedPrototype, 'byteLength').get;
 const __tbIDLGrowable = __tbIDLSharedPrototype && __tbIDLDescriptor(__tbIDLSharedPrototype, 'growable')?.get;
-const __tbIDLUint8Array = (value, allowShared) => {
+const __tbIDLBufferSource = (value, allowShared) => {
   // https://webidl.spec.whatwg.org/#es-buffer-source-types
-  if (__tbApply(__tbIDLTypedArrayTag, value, []) !== 'Uint8Array') {
-    throw new TypeError('value must be a Uint8Array');
+  let buffer;
+  try {
+    __tbApply(__tbIDLTypedArrayTag, value, []);
+    buffer = __tbApply(__tbIDLTypedArrayBuffer, value, []);
+  } catch {
+    buffer = undefined;
   }
-  const buffer = __tbApply(__tbIDLTypedArrayBuffer, value, []);
+  if (buffer === undefined) {
+    try {
+      buffer = __tbApply(__tbIDLDataViewBuffer, value, []);
+    } catch {
+      throw new TypeError('value is not an ArrayBufferView');
+    }
+  }
   let shared = false;
   try { __tbApply(__tbIDLBufferLength, buffer, []); }
   catch (error) {
@@ -60,6 +74,12 @@ const __tbIDLUint8Array = (value, allowShared) => {
     throw new TypeError('resizable buffers are not allowed');
   }
   return value;
+};
+const __tbIDLUint8Array = (value, allowShared) => {
+  if (__tbApply(__tbIDLTypedArrayTag, value, []) !== 'Uint8Array') {
+    throw new TypeError('value must be a Uint8Array');
+  }
+  return __tbIDLBufferSource(value, allowShared);
 };
 const __tbIDLRealmUint8Array = (value, allowShared, realm) => {
   // https://webidl.spec.whatwg.org/#es-buffer-source-types
@@ -95,19 +115,44 @@ const __tbIDLResultDictionary = (value, fields) => {
 const __tbInstallInterface = (implementation, name, construction, members) => {
   // https://webidl.spec.whatwg.org/#es-interface
   const brand = host.slots('webidl.' + name);
-  const prototype = implementation.prototype;
-  // The relevant realm of an instance is the realm that constructed it. Store
-  // that realm's constructors on the brand so a cross-realm method call still
-  // allocates results in the receiver's realm.
   const realm = { Uint8Array: __tbUint8Array };
-  const descriptors = __tbIDLDescriptors(prototype);
-  const required = (args, count) => {
-    if (args.length < count) throw new TypeError(name + ': insufficient arguments');
-  };
+  const secureContext = host.__tbSecureContext === true;
+  const algorithms = __tbIDLDescriptors(implementation.prototype);
+  // The class body is the algorithm store; the interface prototype is
+  // generated (<https://webidl.spec.whatwg.org/#interface-prototype-object>).
+  const prototype = {};
+  for (const member of members) {
+    if (member.exposure.secureContext && !secureContext) continue;
+    const descriptor = algorithms[member.name];
+    const algorithm = member.kind === 'method' ? descriptor.value : descriptor[member.kind];
+    const operation = {
+      invoke(...args) {
+        // https://webidl.spec.whatwg.org/#es-operations
+        // https://webidl.spec.whatwg.org/#es-attributes
+        if (!brand.has(this)) throw new TypeError('Illegal invocation');
+        if (args.length < member.count) {
+          throw new TypeError(name + ': insufficient arguments');
+        }
+        return member.result(__tbApply(algorithm, this, member.convert(args)), brand.get(this));
+      },
+    }.invoke;
+    __tbDefineProperty(operation, 'name', { __proto__: null, value: member.kind === 'method' ? member.name : member.kind + ' ' + member.name, configurable: true });
+    __tbDefineProperty(operation, 'length', { __proto__: null, value: member.count, configurable: true });
+    const property = { __proto__: null, enumerable: true, configurable: true };
+    if (member.kind === 'method') {
+      property.value = operation;
+      property.writable = true;
+    } else {
+      const prior = __tbIDLDescriptor(prototype, member.name);
+      property.get = member.kind === 'get' ? operation : prior?.get;
+      property.set = member.kind === 'set' ? operation : prior?.set;
+    }
+    __tbDefineProperty(prototype, member.name, property);
+  }
   const constructor = function(...args) {
     // https://webidl.spec.whatwg.org/#es-interface-call
     if (new.target === undefined || construction === null) throw new TypeError('Illegal constructor');
-    required(args, construction[0]);
+    if (args.length < construction[0]) throw new TypeError(name + ': insufficient arguments');
     const converted = construction[1](args);
     // OrdinaryCreateFromConstructor reads new.target's prototype once and
     // falls back to the interface prototype when it is not an object
@@ -117,7 +162,7 @@ const __tbInstallInterface = (implementation, name, construction, members) => {
     const chosen = target !== null && (typeof target === 'object' || typeof target === 'function')
       ? target
       : prototype;
-    if (chosen !== prototype) __tbIDLSetPrototypeOf(value, chosen);
+    __tbIDLSetPrototypeOf(value, chosen);
     brand.set(value, realm);
     return value;
   };
@@ -126,31 +171,10 @@ const __tbInstallInterface = (implementation, name, construction, members) => {
   __tbDefineProperty(constructor, 'prototype', { __proto__: null, value: prototype, writable: false });
   __tbDefineProperty(prototype, 'constructor', { __proto__: null, value: constructor, writable: true, configurable: true });
   __tbDefineProperty(prototype, Symbol.toStringTag, { __proto__: null, value: name, configurable: true });
-  for (let index = 0; index < members.length; index++) {
-    const [member, kind, count, convert, result] = members[index];
-    const descriptor = descriptors[member];
-    const algorithm = kind === 'method' ? descriptor.value : descriptor[kind];
-    const operation = {
-      invoke(...args) {
-        // https://webidl.spec.whatwg.org/#es-operations
-        // https://webidl.spec.whatwg.org/#es-attributes
-        if (!brand.has(this)) throw new TypeError('Illegal invocation');
-        required(args, count);
-        return result(__tbApply(algorithm, this, convert(args)), brand.get(this));
-      },
-    }.invoke;
-    __tbDefineProperty(operation, 'name', { __proto__: null, value: kind === 'method' ? member : kind + ' ' + member, configurable: true });
-    __tbDefineProperty(operation, 'length', { __proto__: null, value: count, configurable: true });
-    const property = { __proto__: null, enumerable: true, configurable: true };
-    if (kind === 'method') {
-      property.value = operation;
-      property.writable = true;
-    } else {
-      const prior = __tbIDLDescriptor(prototype, member);
-      property.get = kind === 'get' ? operation : prior.get;
-      property.set = kind === 'set' ? operation : prior.set;
-    }
-    __tbDefineProperty(prototype, member, property);
+  if (construction === null) {
+    const instance = __tbIDLSetPrototypeOf({}, prototype);
+    brand.set(instance, realm);
+    return [constructor, instance];
   }
   return constructor;
 };

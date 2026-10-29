@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use weedle::attribute::{ExtendedAttribute, ExtendedAttributeList};
 use weedle::interface::{
     InterfaceMember, Special, StringifierOrInheritOrStatic, StringifierOrStatic,
 };
@@ -23,7 +24,18 @@ pub(crate) struct Interface<'idl> {
 
 pub(crate) struct Member<'idl> {
     pub(crate) declaration: InterfaceMember<'idl>,
-    scopes: Vec<weedle::attribute::ExtendedAttributeList<'idl>>,
+    scopes: Vec<ExtendedAttributeList<'idl>>,
+}
+
+/// What a member's declaration and enclosing scopes say about its exposure.
+///
+/// `[SecureContext]` is one fact no matter where it is declared: on the member,
+/// on its interface, or on a partial interface or mixin the interface includes
+/// (<https://webidl.spec.whatwg.org/#SecureContext>). Both emitters read this
+/// one value.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Exposure {
+    pub(crate) secure_context: bool,
 }
 
 impl Clone for Member<'_> {
@@ -36,20 +48,40 @@ impl Clone for Member<'_> {
 }
 
 impl Member<'_> {
+    pub(crate) fn attributes(&self) -> Option<&ExtendedAttributeList<'_>> {
+        match &self.declaration {
+            InterfaceMember::Attribute(member) => member.attributes.as_ref(),
+            InterfaceMember::Operation(member) => member.attributes.as_ref(),
+            InterfaceMember::Constructor(member) => member.attributes.as_ref(),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn exposure(&self, interface: &Interface<'_>) -> Exposure {
+        Exposure {
+            secure_context: has_no_args(self.attributes(), "SecureContext")
+                || has_no_args(interface.attributes.as_ref(), "SecureContext")
+                || self
+                    .scopes
+                    .iter()
+                    .any(|scope| has_no_args(Some(scope), "SecureContext")),
+        }
+    }
+
     pub(crate) fn validate_scopes(&self) -> Result<(), Error> {
         // https://webidl.spec.whatwg.org/#SecureContext
         // https://webidl.spec.whatwg.org/#using-mixins-and-partials
-        // `[LegacyOverrideBuiltIns]` only changes how named properties
-        // resolve against built-ins; on an interface without a named getter
-        // it is unobservable, so the scope is accepted. An interface that
-        // pairs it with a named getter needs the override semantics first.
+        // `[SecureContext]` is a resolved exposure, not scope syntax. A
+        // `[LegacyOverrideBuiltIns]` scope only changes how named properties
+        // resolve against built-ins; on an interface without a named getter it
+        // is unobservable. Any other scope attribute needs a lowering.
         if let Some(scope) = self.scopes.iter().find(|scope| {
             !scope.body.list.is_empty()
                 && !scope.body.list.iter().all(|attribute| {
                     matches!(
                         attribute,
-                        weedle::attribute::ExtendedAttribute::NoArgs(attribute)
-                            if attribute.0.0 == "LegacyOverrideBuiltIns"
+                        ExtendedAttribute::NoArgs(attribute)
+                            if matches!(attribute.0.0, "LegacyOverrideBuiltIns" | "SecureContext")
                     )
                 })
         }) {
@@ -59,6 +91,14 @@ impl Member<'_> {
         }
         Ok(())
     }
+}
+
+pub(crate) fn has_no_args(list: Option<&ExtendedAttributeList<'_>>, name: &str) -> bool {
+    list.is_some_and(|list| weedle::attribute::has_no_args(list, name))
+}
+
+pub(crate) fn exposed_in(list: Option<&ExtendedAttributeList<'_>>, target: &str) -> bool {
+    list.is_some_and(|list| weedle::attribute::exposed_in(list, target))
 }
 
 impl<'idl> Database<'idl> {
