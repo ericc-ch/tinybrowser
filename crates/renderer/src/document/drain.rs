@@ -174,7 +174,7 @@ impl Document {
                         crate::engine::decode_data_url_bounded(dial.req.url.as_str())
                     {
                         drop(delay);
-                        let final_url = dial.req.url.to_string();
+                        let final_url = dial.req.url.clone();
                         self.finish_dial(super::CompletedDial {
                             context: dial.context,
                             req: dial.req,
@@ -183,7 +183,7 @@ impl Document {
                             outcome: crate::protocol::DialOutcome {
                                 status: 200,
                                 status_text: "OK".to_owned(),
-                                final_url,
+                                final_url: Some(final_url),
                                 content_type: Some(content_type.clone()),
                                 // Scheme fetch serves the data: MIME type
                                 // as the response's `Content-Type` header

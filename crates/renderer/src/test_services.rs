@@ -72,8 +72,8 @@ impl BrowsingContextHost for NullServices {
         _url: &str,
         _name: &str,
         _opener: crate::protocol::OpenerPolicy,
-        _initiator: &str,
-        _referrer: &str,
+        _initiator: &crate::protocol::SerializedOrigin,
+        _referrer: &Url,
         _referrer_policy: net::ReferrerPolicy,
     ) -> Option<crate::protocol::WindowId> {
         None

@@ -125,7 +125,9 @@ enum DialProgress {
 struct DialHead {
     status: u16,
     status_text: String,
-    final_url: String,
+    /// `None` for a filtered opaque response, whose URL list is empty
+    /// (<https://fetch.spec.whatwg.org/#concept-filtered-response-opaque>).
+    final_url: Option<Url>,
     content_type: Option<String>,
     /// The response's header list, minus the forbidden response-header names:
     /// cookies live in the browser's jar, and an `HttpOnly` one must not reach
@@ -148,7 +150,7 @@ impl DialHead {
         Self {
             status: response.status(),
             status_text: response.status_text().to_owned(),
-            final_url: response.final_url().to_string(),
+            final_url: Some(response.final_url().clone()),
             content_type: content_type_header(response.internal_headers().iter()),
             headers: internal_headers(response),
             response_type: response.response_type(),
@@ -173,7 +175,7 @@ impl DialHead {
         Self {
             status: filtered.status(),
             status_text: filtered.status_text().to_owned(),
-            final_url: filtered.url().map(ToString::to_string).unwrap_or_default(),
+            final_url: filtered.url().cloned(),
             content_type,
             headers,
             response_type: filtered.response_type(),
@@ -204,7 +206,16 @@ impl DialHead {
     /// becomes policy, endpoints, or the nosniff flag: both read the header
     /// list here and hand it to one derivation
     /// (<https://html.spec.whatwg.org/multipage/document-lifecycle.html#initialise-the-document-object>).
-    fn into_document_head(self, final_url: Url) -> renderer::ResponseHead {
+    ///
+    /// # Panics
+    ///
+    /// When the head is the page-fetch view of an opaque response, which names
+    /// no document to mount.
+    fn into_document_head(self) -> renderer::ResponseHead {
+        let final_url = self
+            .final_url
+            .clone()
+            .expect("a document mounts a response that names its URL");
         renderer::ResponseHead::http(self.status, final_url, self.content_type, &self.headers)
     }
 
@@ -415,7 +426,7 @@ fn etag(outcome: &DialOutcome) -> Option<String> {
 fn merge_not_modified(cached: &DialOutcome, response: &net::Response) -> DialOutcome {
     let mut merged = cached.clone();
     merged.status = 200;
-    merged.final_url = response.final_url().to_string();
+    merged.final_url = Some(response.final_url().clone());
     merged.referrer = response.referrer().cloned();
     merged.crossed_origin = response.crossed_origin();
     for (name, value) in response.filtered().headers() {
@@ -699,7 +710,7 @@ impl TabNetworkHandle {
             }
         };
         let status = response.status();
-        let final_url = response.final_url().clone();
+        let final_url = response.final_url();
         logging::trace!(
             target: "browser::net",
             "nav head {url} -> {status} {final_url} in {:?}",
@@ -709,7 +720,7 @@ impl TabNetworkHandle {
         // fetch outcome cannot disagree about which header becomes policy,
         // endpoints, or the nosniff flag
         // (<https://html.spec.whatwg.org/multipage/document-lifecycle.html#initialise-the-document-object>).
-        let head = DialHead::internal(&response).into_document_head(final_url);
+        let head = DialHead::internal(&response).into_document_head();
         let body = response.into_body().await;
         Ok(NavOutcome {
             head,
@@ -783,7 +794,7 @@ impl TabNetworkHandle {
         }
         .await;
         if let Ok(outcome) = &result {
-            self.remember_sheet(request, outcome.status, &outcome.final_url);
+            self.remember_sheet(request, outcome.status, outcome.final_url.as_ref());
         }
         trace_dial_result(request, started, result.as_ref());
         result
@@ -1025,7 +1036,7 @@ impl TabNetworkHandle {
         let hit = match (mode, cached) {
             (RequestCache::OnlyIfCached, None) => return Err(DialFailure::Connect),
             (RequestCache::OnlyIfCached, Some(cached)) => {
-                if let Ok(final_url) = Url::parse(&cached.outcome.final_url)
+                if let Some(final_url) = &cached.outcome.final_url
                     && request.url.origin() != final_url.origin()
                 {
                     return Err(DialFailure::Connect);
@@ -1082,7 +1093,7 @@ impl TabNetworkHandle {
     /// referrer naming the sheet can be authorized. A sheet that failed or
     /// never arrived is not recorded: nothing it contained can issue a request
     /// (<https://w3c.github.io/webappsec-referrer-policy/#integration-with-css>).
-    fn remember_sheet(&self, request: &DialRequest, status: u16, final_url: &str) {
+    fn remember_sheet(&self, request: &DialRequest, status: u16, final_url: Option<&Url>) {
         if request.policy.kind() != DialKind::Stylesheet || !(200..300).contains(&status) {
             return;
         }
@@ -1090,14 +1101,13 @@ impl TabNetworkHandle {
             .sheets
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for spec in [request.url.as_str(), final_url] {
-            if let Ok(mut url) = Url::parse(spec) {
-                // A referrer never carries a fragment, and the sheet URL the
-                // renderer names is the one it was loaded from
-                // (<https://w3c.github.io/webappsec-referrer-policy/#strip-url>).
-                url.set_fragment(None);
-                sheets.insert(url);
-            }
+        for url in [Some(&request.url), final_url].into_iter().flatten() {
+            // A referrer never carries a fragment, and the sheet URL the
+            // renderer names is the one it was loaded from
+            // (<https://w3c.github.io/webappsec-referrer-policy/#strip-url>).
+            let mut url = url.clone();
+            url.set_fragment(None);
+            sheets.insert(url);
         }
     }
 
@@ -1453,7 +1463,7 @@ fn refused_redirect(blocked: &std::sync::Mutex<Option<Url>>) -> Option<DialOutco
     Some(DialOutcome {
         status: 0,
         status_text: String::new(),
-        final_url: url.to_string(),
+        final_url: Some(url),
         content_type: None,
         headers: Vec::new(),
         body: ResponseBody::Bytes(Vec::new()),
@@ -1567,7 +1577,8 @@ mod tests {
 
     fn dial(policy: RequestPolicy, url: &str) -> DialRequest {
         let url = Url::parse(url).expect("dial URL");
-        DialRequest::new(policy, &url, "http://a.test/page")
+        let initiator = Url::parse("http://a.test/page").expect("page URL");
+        DialRequest::new(policy, &url, &initiator.origin())
     }
 
     fn js_fetch(mode: renderer::CorsMode, url: &str) -> DialRequest {
@@ -1586,7 +1597,7 @@ mod tests {
             outcome: DialOutcome {
                 status: 200,
                 status_text: "OK".to_owned(),
-                final_url: "http://a.test/".to_owned(),
+                final_url: Some(Url::parse("http://a.test/").expect("url")),
                 content_type: None,
                 headers: Vec::new(),
                 body: ResponseBody::Bytes(Vec::new()),
@@ -1837,7 +1848,7 @@ mod tests {
             DialFailure::Connect
         );
         let mut cross_origin = entry.clone();
-        cross_origin.outcome.final_url = "http://b.test/data".to_owned();
+        cross_origin.outcome.final_url = Some(Url::parse("http://b.test/data").expect("url"));
         assert!(
             TabNetworkHandle::cached_response(
                 &request,
@@ -1930,7 +1941,7 @@ mod tests {
         let owner = RendererAssignmentId::new(1);
         let mut stream_request =
             js_fetch(renderer::CorsMode::SameOrigin, &format!("{origin}/stream"));
-        stream_request.initiator = initiator.origin().ascii_serialization();
+        stream_request.initiator = renderer::SerializedOrigin::from(&initiator.origin());
         stream_request.referrer = renderer::ReferrerRequest::Client {
             url: initiator.clone(),
         };
@@ -1957,7 +1968,7 @@ mod tests {
         .expect("cancelling the stream releases the permit");
 
         let mut next_request = js_fetch(renderer::CorsMode::SameOrigin, &format!("{origin}/done"));
-        next_request.initiator = initiator.origin().ascii_serialization();
+        next_request.initiator = renderer::SerializedOrigin::from(&initiator.origin());
         next_request.referrer = renderer::ReferrerRequest::Client {
             url: initiator.clone(),
         };
@@ -2165,7 +2176,7 @@ mod tests {
         let initiator = Url::parse(&format!("{origin}/page")).expect("page URL");
         let owner = RendererAssignmentId::new(1);
         let mut request = js_fetch(renderer::CorsMode::SameOrigin, &format!("{origin}/etag"));
-        request.initiator = initiator.origin().ascii_serialization();
+        request.initiator = renderer::SerializedOrigin::from(&initiator.origin());
         request.referrer = renderer::ReferrerRequest::Client {
             url: initiator.clone(),
         };

@@ -694,8 +694,12 @@ pub struct DialRequest {
     pub policy: RequestPolicy,
     /// Absolute request URL.
     pub url: Url,
-    /// Document URL used as the `SameSite`/`Sec-Fetch-*` initiator.
-    pub initiator: String,
+    /// The origin the request runs under: the calling document's serialized
+    /// origin, which the browser authorizes against the renderer's site lock
+    /// before it becomes the request's `Origin`, `SameSite`, and
+    /// `Sec-Fetch-*` source
+    /// (<https://fetch.spec.whatwg.org/#concept-request-origin>).
+    pub initiator: SerializedOrigin,
     /// Whether and how the browser delivers the response body.
     pub delivery: BodyDelivery,
     /// HTTP method
@@ -743,13 +747,14 @@ pub struct DialRequest {
 impl DialRequest {
     /// A fresh GET dial: buffered body, no body bytes, no CSP gate, default
     /// cache mode, and no referrer. Callers with more to say set the fields
-    /// their request adds.
+    /// their request adds. The initiator is the calling document's origin,
+    /// captured as the serialized origin the browser authorizes.
     #[must_use]
-    pub fn new(policy: RequestPolicy, url: &Url, initiator: &str) -> Self {
+    pub fn new(policy: RequestPolicy, url: &Url, initiator: &url::Origin) -> Self {
         Self {
             policy,
             url: url.clone(),
-            initiator: initiator.to_owned(),
+            initiator: SerializedOrigin::from(initiator),
             delivery: BodyDelivery::Buffer,
             method: net::Method::GET,
             body: Vec::new(),
@@ -1099,8 +1104,12 @@ pub struct DialOutcome {
     pub status: u16,
     /// HTTP reason phrase, or `"OK"` for scheme fetches.
     pub status_text: String,
-    /// Final URL after redirects.
-    pub final_url: String,
+    /// The response's URL after redirects, or `None` for a filtered opaque
+    /// response, whose URL list is empty
+    /// (<https://fetch.spec.whatwg.org/#concept-filtered-response-opaque>).
+    /// Only page script reads that view ([`RequestPolicy::exposes_response`]);
+    /// every engine consumer names its URL and reads [`Self::internal_url`].
+    pub final_url: Option<Url>,
     /// Every `Content-Type` response header value joined with `", "`, when
     /// the response sent any
     /// (<https://fetch.spec.whatwg.org/#concept-header-list-get-decode-split>).
@@ -1138,7 +1147,7 @@ impl DialOutcome {
     #[must_use]
     pub fn basic(
         status: u16,
-        final_url: String,
+        final_url: Url,
         content_type: Option<String>,
         headers: Vec<(String, String)>,
         body: Vec<u8>,
@@ -1146,7 +1155,7 @@ impl DialOutcome {
         Self {
             status,
             status_text: String::new(),
-            final_url,
+            final_url: Some(final_url),
             content_type,
             headers,
             body: ResponseBody::Bytes(body),
@@ -1155,6 +1164,24 @@ impl DialOutcome {
             redirect_count: 0,
             referrer: None,
         }
+    }
+
+    /// The response URL an engine consumer reads.
+    ///
+    /// A response hides its URL only when it is opaque *and* page script is
+    /// the consumer, which is the [`RequestPolicy::exposes_response`] view. A
+    /// document, script, style sheet, or frame reads the unsafe response,
+    /// where the URL is always there.
+    ///
+    /// # Panics
+    ///
+    /// When a page-fetch view reaches an engine consumer, which would mean the
+    /// dial ran under a policy that hides what its consumer reads.
+    #[must_use]
+    pub fn internal_url(&self) -> &Url {
+        self.final_url
+            .as_ref()
+            .expect("an engine consumer reads a response that names its URL")
     }
 }
 
@@ -1306,9 +1333,9 @@ pub trait BrowsingContextHost: Send + Sync + 'static {
     /// to open a window. `url` is absolute, or empty for `about:blank`.
     ///
     /// `initiator` is the calling document's serialized origin, which the
-    /// navigation request runs under and `Sec-Fetch-Site` is computed from;
-    /// `referrer` is its `"client"` referrer source (the document URL, walked
-    /// out of an `srcdoc` chain) and `referrer_policy` the policy that decides
+    /// navigation request runs under and `Sec-Fetch-Site` is computed from, and
+    /// `referrer` is its `"client"` referrer source: the document URL, walked
+    /// out of an `srcdoc` chain. `referrer_policy` is the policy that decides
     /// the header. `noreferrer` is not applied here: the browser folds it into
     /// the policy it receives, because it owns the feature's meaning
     /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#window-open-steps>,
@@ -1318,8 +1345,8 @@ pub trait BrowsingContextHost: Send + Sync + 'static {
         url: &str,
         name: &str,
         opener: OpenerPolicy,
-        initiator: &str,
-        referrer: &str,
+        initiator: &SerializedOrigin,
+        referrer: &Url,
         referrer_policy: net::ReferrerPolicy,
     ) -> Option<WindowId>;
 
@@ -1363,6 +1390,24 @@ impl SerializedOrigin {
             return Some(Self::Opaque);
         }
         Url::parse(spec).ok().map(|url| Self::from(&url.origin()))
+    }
+
+    /// Whether this origin has no tuple to authorize or fetch under.
+    #[must_use]
+    pub fn is_opaque(&self) -> bool {
+        matches!(self, Self::Opaque)
+    }
+
+    /// The URL the request seams carry for this origin. Fetch's request
+    /// initiator is a URL, and every reader takes only its origin; an opaque
+    /// origin has none to carry
+    /// (<https://fetch.spec.whatwg.org/#concept-request-origin>).
+    #[must_use]
+    pub fn to_url(&self) -> Option<Url> {
+        match self {
+            Self::Opaque => None,
+            Self::Tuple(origin) => Url::parse(&origin.ascii_serialization()).ok(),
+        }
     }
 }
 
@@ -1720,5 +1765,45 @@ mod response_head_tests {
             !gate.allows(&document, &url("https://example.test/app.js"), 0),
             "the header's policy is enforced, parsed at the head"
         );
+    }
+}
+
+#[cfg(test)]
+mod serialized_origin_tests {
+    use super::SerializedOrigin;
+    use url::Url;
+
+    fn url(spec: &str) -> Url {
+        Url::parse(spec).expect("URL")
+    }
+
+    /// A serialized origin is the claim itself, not a URL that happens to
+    /// carry one: a path, query, or fragment is dropped, a blob URL names the
+    /// tuple its entry wraps, and `null` stays opaque
+    /// (<https://html.spec.whatwg.org/multipage/browsers.html#serialized-origins>,
+    /// <https://fetch.spec.whatwg.org/#concept-request-origin>).
+    #[test]
+    fn a_serialized_origin_keeps_only_its_origin() {
+        let tuple = SerializedOrigin::parse("https://a.test/x?q#f").expect("origin");
+        assert_eq!(
+            tuple.to_url(),
+            Some(url("https://a.test/")),
+            "the path and query do not survive"
+        );
+        assert!(!tuple.is_opaque());
+
+        assert_eq!(
+            SerializedOrigin::parse("blob:https://a.test/uuid").expect("origin"),
+            SerializedOrigin::Tuple(url("blob:https://a.test/uuid").origin()),
+            "a blob URL names the origin its entry was created in"
+        );
+        assert_eq!(
+            SerializedOrigin::parse("null"),
+            Some(SerializedOrigin::Opaque)
+        );
+        assert!(SerializedOrigin::parse("garbage").is_none());
+        let opaque = SerializedOrigin::Opaque;
+        assert!(opaque.is_opaque());
+        assert_eq!(opaque.to_url(), None);
     }
 }

@@ -1422,7 +1422,7 @@ impl Engine {
                     let mut request = crate::protocol::DialRequest::new(
                         crate::protocol::RequestPolicy::FrameLoad,
                         url,
-                        &origin.ascii_serialization(),
+                        &origin,
                     );
                     request.referrer = referrer;
                     request.method.clone_from(&navigation.method);

@@ -282,7 +282,7 @@ impl NetworkHost for HostServices {
                 call: ServiceCall::Network(NetworkCall::Dial(Box::new(request))),
             },
             move |reply| match reply {
-                Ok(ServiceReply::Dial(outcome)) => completion(outcome),
+                Ok(ServiceReply::Dial(outcome)) => completion(*outcome),
                 Ok(_) | Err(_) => completion(Err(renderer::DialFailure::Connect)),
             },
         );
@@ -321,7 +321,7 @@ impl NetworkHost for HostServices {
         request: renderer::DialRequest,
     ) -> Result<renderer::DialOutcome, renderer::DialFailure> {
         match self.call(ServiceCall::Network(NetworkCall::Dial(Box::new(request)))) {
-            Some(ServiceReply::Dial(outcome)) => outcome,
+            Some(ServiceReply::Dial(outcome)) => *outcome,
             _ => Err(renderer::DialFailure::Connect),
         }
     }
@@ -432,8 +432,8 @@ impl BrowsingContextHost for HostServices {
         url: &str,
         name: &str,
         opener: OpenerPolicy,
-        initiator: &str,
-        referrer: &str,
+        initiator: &renderer::SerializedOrigin,
+        referrer: &Url,
         referrer_policy: net::ReferrerPolicy,
     ) -> Option<WindowId> {
         match self.call(ServiceCall::BrowsingContext(
@@ -441,8 +441,8 @@ impl BrowsingContextHost for HostServices {
                 url: url.to_owned(),
                 name: name.to_owned(),
                 opener,
-                initiator: initiator.to_owned(),
-                referrer: referrer.to_owned(),
+                initiator: initiator.clone(),
+                referrer: referrer.clone(),
                 referrer_policy,
             },
         )) {

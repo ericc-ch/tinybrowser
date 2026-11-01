@@ -101,7 +101,7 @@ pub(super) fn load_module<'js>(ctx: &Ctx<'js>, name: &str) -> Result<Module<'js,
             .unwrap_or_default();
         (
             world.runtime.services.clone(),
-            world.origin.ascii_serialization(),
+            world.origin.clone(),
             world.referrer_url.clone(),
             options
                 .referrer_policy
@@ -144,17 +144,15 @@ pub(super) fn load_module<'js>(ctx: &Ctx<'js>, name: &str) -> Result<Module<'js,
         cancel();
         return Err(Error::new_loading(name));
     };
-    if outcome.final_url != name
-        && let Ok(final_url) = url::Url::parse(&outcome.final_url)
-        && let Ok(request_url) = url::Url::parse(name)
-    {
+    let final_url = outcome.internal_url();
+    if final_url != &url {
         let violations = {
             let world = world_rc.borrow();
             world.policy.csp.check_redirected_request(
                 &world.origin,
                 &world.document_url,
-                &final_url,
-                &request_url,
+                final_url,
+                &url,
                 crate::csp::Destination::Script,
             )
         };

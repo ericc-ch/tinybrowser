@@ -591,7 +591,16 @@ impl JsRealm {
                 if let Some(outcome) = outcome {
                     callback.set("status", i32::from(outcome.status))?;
                     callback.set("statusText", outcome.status_text)?;
-                    callback.set("url", outcome.final_url)?;
+                    // A filtered opaque response has an empty URL list, so
+                    // `Response.url` is the empty string
+                    // (<https://fetch.spec.whatwg.org/#concept-filtered-response-opaque>).
+                    callback.set(
+                        "url",
+                        outcome
+                            .final_url
+                            .as_ref()
+                            .map_or_else(String::new, Url::to_string),
+                    )?;
                     callback.set("contentType", outcome.content_type.unwrap_or_default())?;
                     callback.set(
                         "headers",
@@ -1415,8 +1424,8 @@ fn install_window_host_functions(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> R
                     .ok()
                     .map(|url| url.to_string())
             };
-            let initiator = world.origin_string();
-            let referrer = world.referrer_url.to_string();
+            let initiator = crate::protocol::SerializedOrigin::from(&world.origin);
+            let referrer = world.referrer_url.clone();
             let referrer_policy = world.policy.referrer_policy.unwrap_or_default();
             drop(world);
             spec.and_then(|spec| {
@@ -1990,7 +1999,7 @@ fn sync_page_fetch(world: &World, request: SyncPageFetch) -> Option<SyncFetchLis
             redirect: net::cors::RedirectMode::Follow,
         }),
         &parsed,
-        &world.origin.ascii_serialization(),
+        &world.origin,
     );
     dial.method = request.method;
     dial.body = request.body;
@@ -2004,13 +2013,14 @@ fn sync_page_fetch(world: &World, request: SyncPageFetch) -> Option<SyncFetchLis
         // The header list stays as served; nothing is sniffed into it
         // (<https://fetch.spec.whatwg.org/#concept-response-header-list>).
         Ok(outcome) => {
+            let url = outcome.internal_url().to_string();
             let crate::protocol::ResponseBody::Bytes(body) = outcome.body else {
                 return None;
             };
             Some(sync_fetch_value(
                 i32::from(outcome.status),
                 body,
-                outcome.final_url,
+                url,
                 outcome
                     .headers
                     .into_iter()
