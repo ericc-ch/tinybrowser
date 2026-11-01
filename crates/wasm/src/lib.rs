@@ -654,6 +654,9 @@ impl BrowsingContextHost for WasmServices {
         _url: &str,
         _name: &str,
         _opener: renderer::OpenerPolicy,
+        _initiator: &str,
+        _referrer: &str,
+        _referrer_policy: net::ReferrerPolicy,
     ) -> Option<renderer::WindowId> {
         None
     }

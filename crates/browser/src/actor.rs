@@ -88,6 +88,15 @@ impl fmt::Display for TabId {
     }
 }
 
+/// One [`TabHandle`] navigation request.
+struct GotoRequest {
+    url: String,
+    /// The document that started the navigation. `None` for a
+    /// browser-initiated navigation (`CDP`, `WebDriver`, history), which sends
+    /// no referrer and `Sec-Fetch-Site: none`.
+    initiator: Option<NavigationInitiator>,
+}
+
 /// One tab operation. The typed reply channel lives in the variant, so the
 /// coordinator cannot answer with another operation's result and the caller
 /// never matches a shared reply enum.
@@ -97,7 +106,9 @@ enum Command {
         reply: ReplySender<()>,
     },
     Goto {
-        url: String,
+        /// The URL and, for a renderer-initiated navigation, the document that
+        /// asked for it.
+        request: GotoRequest,
         reply: ReplySender<()>,
     },
     Execute {
@@ -279,7 +290,30 @@ impl TabHandle {
     /// [`TabError::InvalidUrl`] or [`TabError::ActorStopped`].
     pub async fn goto(&self, url: &str) -> Result<(), TabError> {
         self.ask(|reply| Command::Goto {
-            url: url.to_owned(),
+            request: GotoRequest {
+                url: url.to_owned(),
+                initiator: None,
+            },
+            reply,
+        })
+        .await
+    }
+
+    /// Starts a navigation a renderer asked for, carrying the calling
+    /// document's origin, referrer source, and policy. `window.open` uses it
+    /// for the browser-hosted popup; a browser-initiated navigation calls
+    /// [`Self::goto`] instead
+    /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#window-open-steps>).
+    pub(crate) async fn goto_from(
+        &self,
+        url: &str,
+        initiator: NavigationInitiator,
+    ) -> Result<(), TabError> {
+        self.ask(|reply| Command::Goto {
+            request: GotoRequest {
+                url: url.to_owned(),
+                initiator: Some(initiator),
+            },
             reply,
         })
         .await
@@ -601,9 +635,32 @@ impl Drop for TabTask {
     }
 }
 
+/// The document a navigation starts from: the request origin, the referrer
+/// source, and the policy that decides the `Referer` header.
+///
+/// A browser-initiated navigation has none: it sends no `Referer` and
+/// `Sec-Fetch-Site: none`. An opaque origin is carried as a URL whose origin
+/// is opaque (`data:,`), the same sentinel renderer dials use.
+/// (<https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
+#[derive(Clone, Debug)]
+pub(crate) struct NavigationInitiator {
+    /// The initiating document's origin; a URL only so the network seam keeps
+    /// one shape for tuple and opaque origins. Only [`Url::origin`] is read,
+    /// and the browser authorized it against the renderer's site lock before
+    /// constructing this.
+    pub(crate) origin: Url,
+    /// The `"client"` referrer source, walked out of any `srcdoc` chain, when
+    /// the browser authorized it against the renderer's site lock.
+    pub(crate) referrer: Option<Url>,
+    /// The concrete policy main fetch determines under.
+    pub(crate) referrer_policy: net::ReferrerPolicy,
+}
+
 struct ActiveNavigation {
     url: Url,
-    initiator: Url,
+    /// The document the navigation started from. `None` when the browser
+    /// started it, which sends no referrer and `Sec-Fetch-Site: none`.
+    initiator: Option<NavigationInitiator>,
     epoch: u64,
     submitted: bool,
 }
@@ -731,7 +788,7 @@ impl Tab {
         }
     }
 
-    fn goto(&mut self, spec: &str) -> Result<(), TabError> {
+    fn goto(&mut self, spec: &str, initiator: Option<NavigationInitiator>) -> Result<(), TabError> {
         let url = self.resolve_url(spec)?;
         self.traversal = None;
         // Monotonic across the tab's life, never derived from the live
@@ -744,7 +801,7 @@ impl Tab {
         self.navigation_failed = false;
         self.nav = Some(ActiveNavigation {
             url,
-            initiator: self.document_url.clone(),
+            initiator,
             epoch,
             submitted: false,
         });
@@ -1012,12 +1069,24 @@ impl Tab {
         }
         let epoch = nav.epoch;
         let url = nav.url.clone();
+        // A browser-initiated navigation runs with the tab's own document as
+        // its request origin, as it always has, but sends no referrer and
+        // `Sec-Fetch-Site: none`: no document asked for it.
+        let origin = nav
+            .initiator
+            .as_ref()
+            .map_or_else(|| self.document_url.clone(), |source| source.origin.clone());
         let initiator = nav.initiator.clone();
         self.cancel_dial();
         let (cancel, cancel_rx) = watch::channel(false);
-        let guard =
-            self.network
-                .dial_navigation(epoch, url, initiator, self.dial_tx.clone(), cancel_rx);
+        let guard = self.network.dial_navigation(
+            epoch,
+            url,
+            origin,
+            initiator,
+            self.dial_tx.clone(),
+            cancel_rx,
+        );
         self.dial_cancel = Some(cancel);
         self.dial_guard = Some(guard);
         if let Some(nav) = self.nav.as_mut() {
@@ -1179,7 +1248,7 @@ impl Tab {
         // (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-history-go>).
         if delta == 0 {
             let url = self.document_url.to_string();
-            if self.goto(&url).is_ok() {
+            if self.goto(&url, None).is_ok() {
                 self.traversal = Some(self.history.current_entry());
             }
             return;
@@ -1209,7 +1278,7 @@ impl Tab {
             }
             return;
         }
-        if self.goto(&url).is_ok() {
+        if self.goto(&url, None).is_ok() {
             self.traversal = Some(entry);
         }
     }
@@ -1438,8 +1507,8 @@ impl Command {
             Command::LoadHtml { html, reply } => {
                 let _result = reply.send(tab.load_html(&html).await);
             }
-            Command::Goto { url, reply } => {
-                let _result = reply.send(tab.goto(&url));
+            Command::Goto { request, reply } => {
+                let _result = reply.send(tab.goto(&request.url, request.initiator));
             }
             Command::Execute {
                 frame,

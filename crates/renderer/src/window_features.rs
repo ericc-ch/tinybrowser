@@ -112,10 +112,24 @@ impl WindowFeatures {
     /// this call opens. `noreferrer` implies `noopener`, so the three states
     /// are exhaustive by construction
     /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#get-noopener-for-window-open>).
-    pub(crate) fn opener_policy(&self) -> OpenerPolicy {
+    ///
+    /// `blob_origin` is the origin of `url`'s blob URL entry, when `url` is a
+    /// blob URL this renderer's store knows. Step 1 of "get noopener" severs
+    /// the opener for a blob from another site *before* it reads the feature,
+    /// against `top_level_origin` rather than the calling frame's origin, so a
+    /// same-origin blob opened from a cross-site iframe still severs it. Both
+    /// origins being opaque is not same-site: an opaque blob can never be
+    /// attributed to the top-level document's site.
+    pub(crate) fn opener_policy(
+        &self,
+        blob_origin: Option<&url::Origin>,
+        top_level_origin: &url::Origin,
+    ) -> OpenerPolicy {
+        let blob_severs =
+            blob_origin.is_some_and(|origin| !net::origins_same_site(origin, top_level_origin));
         if self.boolean("noreferrer") {
             OpenerPolicy::NoReferrer
-        } else if self.boolean("noopener") {
+        } else if blob_severs || self.boolean("noopener") {
             OpenerPolicy::NoOpener
         } else {
             OpenerPolicy::Keep
@@ -125,11 +139,19 @@ impl WindowFeatures {
 
 #[cfg(test)]
 mod tests {
+    use url::Url;
+
     use super::WindowFeatures;
     use crate::protocol::OpenerPolicy;
 
+    fn origin(raw: &str) -> url::Origin {
+        Url::parse(raw).expect("test URL").origin()
+    }
+
+    /// The feature list alone, from a document whose top level is
+    /// `https://a.test`.
     fn policy(features: &str) -> OpenerPolicy {
-        WindowFeatures::parse(features).opener_policy()
+        WindowFeatures::parse(features).opener_policy(None, &origin("https://a.test/"))
     }
 
     /// The four disagreements between the shim's comma split and the browser's
@@ -154,6 +176,52 @@ mod tests {
             policy("noopener=0,noopener=1"),
             OpenerPolicy::NoOpener,
             "a repeated feature keeps its last value"
+        );
+    }
+
+    /// Step 1 of "get noopener": a blob URL whose entry is from another site
+    /// severs the opener even when the feature list says nothing, and even
+    /// when `noopener=0` asks to keep it
+    /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#get-noopener-for-window-open>).
+    #[test]
+    fn a_blob_from_another_site_severs_the_opener() {
+        let top = origin("https://a.test/");
+        let cross_site = origin("https://b.test/");
+        let same_site = origin("https://sub.a.test/");
+        assert_eq!(
+            WindowFeatures::parse("").opener_policy(Some(&cross_site), &top),
+            OpenerPolicy::NoOpener
+        );
+        assert_eq!(
+            WindowFeatures::parse("noopener=0").opener_policy(Some(&cross_site), &top),
+            OpenerPolicy::NoOpener
+        );
+        assert_eq!(
+            WindowFeatures::parse("").opener_policy(Some(&same_site), &top),
+            OpenerPolicy::Keep
+        );
+        // The blob rule returns before the feature list is read, so
+        // `noreferrer` still keeps its stronger answer.
+        assert_eq!(
+            WindowFeatures::parse("noreferrer").opener_policy(Some(&cross_site), &top),
+            OpenerPolicy::NoReferrer
+        );
+    }
+
+    /// The blob branch compares against the top-level origin, not the calling
+    /// frame's: a blob same-origin with a cross-site iframe still severs the
+    /// opener, because the top-level document is what keeps it.
+    #[test]
+    fn a_blob_must_match_the_top_level_origin() {
+        let frame = origin("https://frame.test/");
+        let top = origin("https://top.test/");
+        assert_eq!(
+            WindowFeatures::parse("").opener_policy(Some(&frame), &top),
+            OpenerPolicy::NoOpener
+        );
+        assert_eq!(
+            WindowFeatures::parse("").opener_policy(Some(&top), &top),
+            OpenerPolicy::Keep
         );
     }
 

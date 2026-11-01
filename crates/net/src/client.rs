@@ -505,6 +505,7 @@ impl Agent {
             }
             cross_site_redirect |= !cookies::schemeful_same_site(&url, &next);
             apply_redirect_policy(hop_status, &url, &next, &mut hop);
+            Self::widen_fetch_site(&mut hop.headers, &request.cors.origin, &next);
             // Main fetch runs "determine request's referrer" again for the
             // redirect hop, with the referrer the previous hop sent as the
             // source; a `no referrer` result stops the chain
@@ -535,6 +536,30 @@ impl Agent {
             None => headers.remove("referer"),
         }
         Ok(())
+    }
+
+    /// Rewrites `Sec-Fetch-Site` for a redirect hop. The header covers the
+    /// request's whole URL list, so it only ever widens: a chain that touched
+    /// a cross-site URL stays cross-site even when it redirects back, and a
+    /// user-agent navigation's `none` survives every hop
+    /// (<https://w3c.github.io/webappsec-fetch-metadata/#abstract-opdef-set-site>).
+    ///
+    /// The browser writes the first hop's value, because only it knows whether
+    /// a document or the user agent started the navigation; a caller that sent
+    /// no header keeps none.
+    fn widen_fetch_site(headers: &mut HeaderMap, origin: &url::Origin, target: &Url) {
+        let Some(current) = headers.get("sec-fetch-site") else {
+            return;
+        };
+        let Some(current) = FetchSite::parse(current) else {
+            // `none`, or a token the page cannot have written.
+            return;
+        };
+        let widened = current.max(FetchSite::between(origin, target));
+        headers.set(
+            header::HeaderName::from_static("sec-fetch-site"),
+            HeaderValue::from_static(widened.token()),
+        );
     }
 
     /// One HTTP hop: the response-tainting gate, the CORS request rules, the
@@ -819,6 +844,60 @@ enum HopOutcome {
     Final(Box<Response>),
     /// The response redirects; fetch `next`.
     Redirect { next: Url },
+}
+
+/// `Sec-Fetch-Site`'s three computed values, ordered from narrowest to widest
+/// so a redirect chain can only widen the answer
+/// (<https://w3c.github.io/webappsec-fetch-metadata/#abstract-opdef-set-site>).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum FetchSite {
+    SameOrigin,
+    SameSite,
+    CrossSite,
+}
+
+impl FetchSite {
+    /// The token `headers` carries, when it is one this engine computed.
+    /// `none` is not here: it means no site is responsible, and no redirect
+    /// gives one a site to be responsible for.
+    fn parse(value: &[u8]) -> Option<Self> {
+        match value {
+            b"same-origin" => Some(Self::SameOrigin),
+            b"same-site" => Some(Self::SameSite),
+            b"cross-site" => Some(Self::CrossSite),
+            _ => None,
+        }
+    }
+
+    /// The relationship between a request's origin and one URL in its list.
+    fn between(origin: &url::Origin, target: &Url) -> Self {
+        let target = target.origin();
+        if *origin == target {
+            Self::SameOrigin
+        } else if cookies::origins_same_site(origin, &target) {
+            Self::SameSite
+        } else {
+            Self::CrossSite
+        }
+    }
+
+    const fn token(self) -> &'static str {
+        match self {
+            Self::SameOrigin => "same-origin",
+            Self::SameSite => "same-site",
+            Self::CrossSite => "cross-site",
+        }
+    }
+}
+
+/// The `Sec-Fetch-Site` token a request from `origin` to `target` carries when
+/// a document started it, covering the first URL of the request's list. A
+/// browser-issued navigation sends `none` instead, and [`Agent::send`] widens
+/// the token as redirects add URLs
+/// (<https://w3c.github.io/webappsec-fetch-metadata/#abstract-opdef-set-site>).
+#[must_use]
+pub fn sec_fetch_site(origin: &url::Origin, target: &Url) -> &'static str {
+    FetchSite::between(origin, target).token()
 }
 
 /// Writes the headers one hop carries after the CORS decision: the
@@ -1406,7 +1485,7 @@ impl Response {
 
 #[cfg(test)]
 mod redirect_policy_tests {
-    use super::{HeaderMap, Hop, Method, Url, apply_redirect_policy};
+    use super::{Agent, HeaderMap, Hop, Method, Url, apply_redirect_policy};
     use crate::cors::ResponseType;
 
     fn url(value: &str) -> Url {
@@ -1441,6 +1520,79 @@ mod redirect_policy_tests {
             &mut hop,
         );
         assert_eq!(hop.headers.get("sec-ch-prefers-color-scheme"), None);
+    }
+
+    fn fetch_site_headers(token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("sec-fetch-site", token).expect("header");
+        headers
+    }
+
+    /// `Sec-Fetch-Site` covers the whole URL list, so a chain widens and never
+    /// narrows: a redirect back to the request's origin keeps the worst
+    /// relationship any hop had
+    /// (<https://w3c.github.io/webappsec-fetch-metadata/#abstract-opdef-set-site>).
+    #[test]
+    fn sec_fetch_site_widens_along_a_redirect_chain() {
+        let origin = url("https://a.test/page").origin();
+        let mut headers = fetch_site_headers("same-origin");
+        Agent::widen_fetch_site(&mut headers, &origin, &url("https://b.a.test/"));
+        assert_eq!(headers.get("sec-fetch-site"), Some(b"same-site".as_slice()));
+        Agent::widen_fetch_site(&mut headers, &origin, &url("https://c.test/"));
+        assert_eq!(
+            headers.get("sec-fetch-site"),
+            Some(b"cross-site".as_slice())
+        );
+        Agent::widen_fetch_site(&mut headers, &origin, &url("https://a.test/back"));
+        assert_eq!(
+            headers.get("sec-fetch-site"),
+            Some(b"cross-site".as_slice()),
+            "a same-origin hop cannot narrow the chain back"
+        );
+    }
+
+    /// A navigation the user agent started keeps `none`: no site is
+    /// responsible, and no redirect gives one a site to be responsible for.
+    /// A request that never carried the header keeps not carrying it.
+    #[test]
+    fn sec_fetch_site_none_and_absent_survive_redirects() {
+        let origin = url("https://a.test/").origin();
+        let mut none = fetch_site_headers("none");
+        Agent::widen_fetch_site(&mut none, &origin, &url("https://b.test/"));
+        assert_eq!(none.get("sec-fetch-site"), Some(b"none".as_slice()));
+
+        let mut absent = HeaderMap::new();
+        Agent::widen_fetch_site(&mut absent, &origin, &url("https://b.test/"));
+        assert_eq!(absent.get("sec-fetch-site"), None);
+    }
+
+    /// The first hop's token names the relationship between the request's
+    /// origin and the target: origin first, then site, then nothing shared.
+    #[test]
+    fn sec_fetch_site_names_the_first_hop_relationship() {
+        let origin = url("https://a.test/page").origin();
+        assert_eq!(
+            super::sec_fetch_site(&origin, &url("https://a.test/other")),
+            "same-origin"
+        );
+        assert_eq!(
+            super::sec_fetch_site(&origin, &url("https://sub.a.test/")),
+            "same-site"
+        );
+        assert_eq!(
+            super::sec_fetch_site(&origin, &url("https://b.test/")),
+            "cross-site"
+        );
+        assert_eq!(
+            super::sec_fetch_site(&origin, &url("http://a.test/")),
+            "cross-site",
+            "a scheme change is a site change"
+        );
+        assert_eq!(
+            super::sec_fetch_site(&url("about:blank").origin(), &url("https://a.test/")),
+            "cross-site",
+            "an opaque origin is not same-site with anything"
+        );
     }
 }
 

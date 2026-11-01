@@ -1382,13 +1382,20 @@ fn random_bytes(ctx: Ctx<'_>, length: usize) -> rquickjs::Result<TypedArray<'_, 
 fn install_window_host_functions(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<(), JsError> {
     // The shim parses the feature string once through `__tbOpenerPolicy` and
     // hands the answer back here, so the engine never re-reads a grammar the
-    // page wrote
-    // (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#concept-window-open-features-tokenize>).
+    // page wrote. The blob-URL step of "get noopener" needs the resolved URL
+    // and the top-level origin, which the shim cannot see
+    // (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#concept-window-open-features-tokenize>,
+    // <https://html.spec.whatwg.org/multipage/nav-history-apis.html#get-noopener-for-window-open>).
+    let opener_policy = world.clone();
     bridge::object(ctx)?.set(
         "__tbOpenerPolicy",
-        Func::from(|features: String| {
+        Func::from(move |features: String, url: String| {
+            let world = opener_policy.borrow();
+            let blob_origin = (!url.is_empty())
+                .then(|| world.object_url_origin(&url))
+                .flatten();
             crate::window_features::WindowFeatures::parse(&features)
-                .opener_policy()
+                .opener_policy(blob_origin.as_ref(), &world.top_level_origin())
                 .token()
         }),
     )?;
@@ -1398,22 +1405,26 @@ fn install_window_host_functions(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> R
         "__tbWindowOpen",
         Func::from(move |url: String, name: String, opener: String| {
             let opener = crate::protocol::OpenerPolicy::parse(&opener)?;
+            let world = window_open.borrow();
             let spec = if url.is_empty() {
                 Some(String::new())
             } else {
-                window_open
-                    .borrow()
+                world
                     .document_url
                     .join(&url)
                     .ok()
                     .map(|url| url.to_string())
             };
+            let initiator = world.origin_string();
+            let referrer = world.referrer_url.to_string();
+            let referrer_policy = world.policy.referrer_policy.unwrap_or_default();
+            drop(world);
             spec.and_then(|spec| {
                 window_open
                     .borrow()
                     .runtime
                     .services
-                    .window_open(&spec, &name, opener)
+                    .window_open(&spec, &name, opener, &initiator, &referrer, referrer_policy)
                     .map(|window| crate::js::js_number(window.get()))
             })
         }),

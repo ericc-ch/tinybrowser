@@ -2061,6 +2061,25 @@ impl World {
         self.frame
     }
 
+    /// The origin of this frame's top-level traversable
+    /// (<https://html.spec.whatwg.org/multipage/webappapis.html#concept-environment-top-level-origin>).
+    ///
+    /// A top-level frame answers its own origin. A child whose top-level realm
+    /// this renderer does not host (it always does today) falls back to its
+    /// own origin, which errs toward keeping the opener rather than severing
+    /// it on a guess.
+    pub(crate) fn top_level_origin(&self) -> url::Origin {
+        let frame = self.frame();
+        let top = self.runtime.shared.borrow().tree.top_level(frame);
+        if top == frame {
+            return self.origin.clone();
+        }
+        self.frame_world(top).map_or_else(
+            || self.origin.clone(),
+            |world| world.borrow().origin.clone(),
+        )
+    }
+
     /// Whether this realm's environment is a secure context. The model is
     /// Chromium's, not HTML's text; the disagreement is in
     /// `docs/upstream.md`.
