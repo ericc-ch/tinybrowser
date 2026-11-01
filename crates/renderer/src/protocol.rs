@@ -1266,9 +1266,8 @@ pub trait StorageHost: Send + Sync + 'static {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OpenerPolicy {
     /// Keep the opener relationship. The referrer is not decided here: a
-    /// renderer-hosted auxiliary context resolves it from its creator, while a
-    /// browser-hosted tab currently starts from `about:blank` and sends none
-    /// (#198).
+    /// renderer-hosted auxiliary context resolves it from its creator, and a
+    /// browser-hosted tab from the calling document the wire carries (#198).
     Keep,
     /// Drop the opener relationship and return no `WindowProxy`.
     NoOpener,
@@ -1305,7 +1304,24 @@ impl OpenerPolicy {
 pub trait BrowsingContextHost: Send + Sync + 'static {
     /// `window.open(url, target, features)`; `None` when the browser refused
     /// to open a window. `url` is absolute, or empty for `about:blank`.
-    fn window_open(&self, url: &str, name: &str, opener: OpenerPolicy) -> Option<WindowId>;
+    ///
+    /// `initiator` is the calling document's serialized origin, which the
+    /// navigation request runs under and `Sec-Fetch-Site` is computed from;
+    /// `referrer` is its `"client"` referrer source (the document URL, walked
+    /// out of an `srcdoc` chain) and `referrer_policy` the policy that decides
+    /// the header. `noreferrer` is not applied here: the browser folds it into
+    /// the policy it receives, because it owns the feature's meaning
+    /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#window-open-steps>,
+    /// <https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
+    fn window_open(
+        &self,
+        url: &str,
+        name: &str,
+        opener: OpenerPolicy,
+        initiator: &str,
+        referrer: &str,
+        referrer_policy: net::ReferrerPolicy,
+    ) -> Option<WindowId>;
 
     /// `window.close()` on a window this realm opened.
     fn window_close(&self, window: WindowId);

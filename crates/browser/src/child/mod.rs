@@ -427,12 +427,23 @@ impl StorageHost for HostServices {
 }
 
 impl BrowsingContextHost for HostServices {
-    fn window_open(&self, url: &str, name: &str, opener: OpenerPolicy) -> Option<WindowId> {
+    fn window_open(
+        &self,
+        url: &str,
+        name: &str,
+        opener: OpenerPolicy,
+        initiator: &str,
+        referrer: &str,
+        referrer_policy: net::ReferrerPolicy,
+    ) -> Option<WindowId> {
         match self.call(ServiceCall::BrowsingContext(
             BrowsingContextCall::WindowOpen {
                 url: url.to_owned(),
                 name: name.to_owned(),
                 opener,
+                initiator: initiator.to_owned(),
+                referrer: referrer.to_owned(),
+                referrer_policy,
             },
         )) {
             Some(ServiceReply::Window(tab)) => tab,

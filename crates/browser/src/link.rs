@@ -605,6 +605,28 @@ fn opaque_initiator() -> url::Url {
     url::Url::parse("data:,").expect("data:, is a valid URL")
 }
 
+/// The origin URL a renderer names as a navigation's initiator, when this
+/// renderer's site lock authorizes it.
+///
+/// The renderer sends `Origin::ascii_serialization`, so the claim is only a
+/// scheme, host, and port. [`Site::authorize`] reads document URLs and accepts
+/// `blob:`, `about:`, and `data:` URLs under an opaque lock; those URLs' origins
+/// belong to whichever tuple they wrap, which an opaque lock never granted, and
+/// a path or query would ride into the request's initiator as if it named a
+/// document. Both are forgeries, so only an origin-shaped HTTP(S) URL whose
+/// origin the lock covers passes
+/// (<https://w3c.github.io/webappsec-fetch-metadata/#abstract-opdef-set-site>).
+fn authorized_initiator(site: &Site, spec: &str) -> Option<url::Url> {
+    let url = url::Url::parse(spec).ok()?;
+    let names_an_origin = matches!(url.scheme(), "http" | "https")
+        && url.path() == "/"
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && url.username().is_empty()
+        && url.password().is_none();
+    (names_an_origin && site.allows_origin(&url.origin())).then_some(url)
+}
+
 /// Routes one browser service call from a renderer. This is a dispatch table:
 /// each arm validates and forwards one call shape.
 #[expect(
@@ -639,7 +661,7 @@ async fn route_service_call(
             // credentials it would not otherwise send and no referrer, so it
             // cannot claim the renderer's own site
             // (<https://fetch.spec.whatwg.org/#concept-request-origin>).
-            let initiator = match assignment.site.authorize(&request.initiator) {
+            let initiator = match authorized_initiator(&assignment.site, &request.initiator) {
                 Some(initiator) => initiator,
                 None if is_opaque_initiator(&request.initiator) => opaque_initiator(),
                 None => return Err(RendererViolation),
@@ -804,7 +826,14 @@ async fn route_window_call(
     call: BrowsingContextCall,
 ) -> Result<(), RendererViolation> {
     match call {
-        BrowsingContextCall::WindowOpen { url, opener, .. } => {
+        BrowsingContextCall::WindowOpen {
+            url,
+            opener,
+            initiator,
+            referrer,
+            referrer_policy,
+            ..
+        } => {
             let spec = if url.is_empty() || url == "about:blank" {
                 Some(String::new())
             } else {
@@ -812,6 +841,28 @@ async fn route_window_call(
                     .ok()
                     .filter(|url| matches!(url.scheme(), "http" | "https"))
                     .map(|url| url.to_string())
+            };
+            // The calling document's origin must belong to this renderer's
+            // site lock; an opaque document may still open a window, but its
+            // origin stays opaque. The referrer is the document's own URL, so
+            // it must be same-origin with that claim and inside the lock: a
+            // URL that is neither is not this document's to name, and the
+            // popup goes out without one rather than leaking it. The dial seam
+            // makes the same check
+            // (<https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
+            let origin = match authorized_initiator(&assignment.site, &initiator) {
+                Some(origin) => origin,
+                None if is_opaque_initiator(&initiator) => opaque_initiator(),
+                None => return Err(RendererViolation),
+            };
+            let referrer = assignment
+                .site
+                .authorize(&referrer)
+                .filter(|referrer| referrer.origin() == origin.origin());
+            let initiator = crate::actor::NavigationInitiator {
+                origin,
+                referrer,
+                referrer_policy,
             };
             let source = Some(assignment.tab);
             let tab = match spec {
@@ -821,6 +872,7 @@ async fn route_window_call(
                         url: spec,
                         source,
                         opener,
+                        initiator,
                     })
                     .await
                     .ok()

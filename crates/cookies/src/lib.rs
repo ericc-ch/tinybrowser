@@ -17,7 +17,7 @@ use std::fmt;
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use url::{Host, Url};
+use url::{Host, Origin, Url};
 
 // https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#name-cookie-lifetime-limits
 const MAX_LIFETIME: Duration = Duration::from_hours(9600);
@@ -808,6 +808,23 @@ pub fn schemeful_same_site(a: &Url, b: &Url) -> bool {
     }
 }
 
+/// Whether two origins share a site: same scheme and registrable domain.
+///
+/// The origin form of [`schemeful_same_site`], for the places that compare
+/// origins rather than URLs: `Sec-Fetch-Site`
+/// (<https://w3c.github.io/webappsec-fetch-metadata/#abstract-opdef-set-site>)
+/// and the blob-URL opener rule
+/// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#get-noopener-for-window-open>).
+/// An opaque origin is same-site with nothing, including another opaque
+/// origin: opaque origins are never equal unless they come from one document.
+#[must_use]
+pub fn origins_same_site(a: &Origin, b: &Origin) -> bool {
+    match (origin_site_tuple(a), origin_site_tuple(b)) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    }
+}
+
 /// Site identity for renderer isolation: scheme plus registrable domain.
 ///
 /// Returns `None` for opaque URLs and for schemes outside the HTTP family;
@@ -820,16 +837,31 @@ pub fn site(url: &Url) -> Option<String> {
 }
 
 fn site_tuple(url: &Url) -> Option<(String, String)> {
-    // `ws` and `wss` name the http and https sites.
-    let scheme = match url.scheme() {
-        "http" | "ws" => "http",
-        "https" | "wss" => "https",
-        _ => return None,
-    };
+    let scheme = site_scheme(url.scheme())?;
     Some((
         scheme.to_owned(),
         registrable_domain(&canonicalize_host(url)?),
     ))
+}
+
+fn origin_site_tuple(origin: &Origin) -> Option<(String, String)> {
+    let Origin::Tuple(scheme, host, _) = origin else {
+        return None;
+    };
+    Some((
+        site_scheme(scheme)?.to_owned(),
+        registrable_domain(&canonical_host(host)),
+    ))
+}
+
+/// The HTTP-family scheme whose site `scheme` names, per the `SameSite`
+/// definition: `ws` and `wss` name the `http` and `https` sites.
+fn site_scheme(scheme: &str) -> Option<&'static str> {
+    match scheme {
+        "http" | "ws" => Some("http"),
+        "https" | "wss" => Some("https"),
+        _ => None,
+    }
 }
 
 fn registrable_domain(host: &str) -> String {
@@ -946,10 +978,14 @@ fn default_path(uri_path: &str) -> String {
 }
 
 fn canonicalize_host(url: &Url) -> Option<String> {
-    match url.host()? {
-        Host::Domain(d) => Some(d.to_ascii_lowercase()),
-        Host::Ipv4(ip) => Some(ip.to_string()),
-        Host::Ipv6(ip) => Some(ip.to_string()),
+    url.host().map(|host| canonical_host(&host))
+}
+
+fn canonical_host<T: AsRef<str>>(host: &Host<T>) -> String {
+    match host {
+        Host::Domain(domain) => domain.as_ref().to_ascii_lowercase(),
+        Host::Ipv4(ip) => ip.to_string(),
+        Host::Ipv6(ip) => ip.to_string(),
     }
 }
 
@@ -1165,9 +1201,9 @@ mod tests {
     use url::Url;
 
     use super::{
-        CookieJar, CookieOp, CookieRecord, CookieSameSite, InitiatorKind, RetrievalKind, site,
+        CookieJar, CookieOp, CookieRecord, CookieSameSite, InitiatorKind, RetrievalKind,
+        schemeful_same_site, site,
     };
-
     /// 2026-10-12T00:00:00Z.
     const NOW: u64 = 1_791_763_200;
     const DAY: Duration = Duration::from_hours(24);
@@ -1265,6 +1301,48 @@ mod tests {
             jar.cookie_string(http(&url("https://b.www.ck/"), at(NOW))),
             "a=1"
         );
+    }
+
+    /// The origin form agrees with the URL form, including the tuple fields a
+    /// URL keeps but an origin drops: path, query, and fragment never decide a
+    /// site, and a non-default port does not either.
+    #[test]
+    fn origins_share_a_site_exactly_when_their_urls_do() {
+        use super::origins_same_site;
+
+        let cases = [
+            ("https://a.test/", "https://a.test/other?q#f", true),
+            ("https://a.test/", "https://b.a.test/", true),
+            ("https://a.test/", "http://a.test/", false),
+            ("https://a.test/", "https://a.test:8443/", true),
+            ("https://a.test/", "https://a.other/", false),
+            ("http://127.0.0.1:1/", "http://127.0.0.1:2/", true),
+            ("http://127.0.0.1/", "http://127.0.0.2/", false),
+        ];
+        for (left, right, same) in cases {
+            assert_eq!(
+                origins_same_site(&url(left).origin(), &url(right).origin()),
+                same,
+                "{left} vs {right}"
+            );
+            assert_eq!(schemeful_same_site(&url(left), &url(right)), same);
+        }
+    }
+
+    /// Opaque origins are never same-site, not even with themselves: the
+    /// `Origin::Opaque` identity is unique per document.
+    #[test]
+    fn an_opaque_origin_is_same_site_with_nothing() {
+        use super::origins_same_site;
+
+        let opaque = url("about:blank").origin();
+        let other = url("data:,").origin();
+        assert!(!origins_same_site(&opaque, &opaque));
+        assert!(!origins_same_site(&opaque, &other));
+        assert!(!origins_same_site(
+            &opaque,
+            &url("https://a.test/").origin()
+        ));
     }
 
     #[test]

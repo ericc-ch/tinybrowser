@@ -374,6 +374,18 @@ pub enum BrowsingContextCall {
         /// What the `noopener` and `noreferrer` features asked for, already
         /// parsed by the renderer that read the feature string.
         opener: OpenerPolicy,
+        /// Serialized origin of the calling document: the navigation request's
+        /// origin and the source of its `Sec-Fetch-Site`
+        /// (<https://w3c.github.io/webappsec-fetch-metadata/#abstract-opdef-set-site>).
+        /// `null` for an opaque document.
+        initiator: String,
+        /// The calling document's `"client"` referrer source: its URL, walked
+        /// out of an `srcdoc` chain
+        /// (<https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
+        referrer: String,
+        /// The calling document's referrer policy; the browser applies
+        /// `noreferrer` on top of it.
+        referrer_policy: net::ReferrerPolicy,
     },
     /// `window.close()` on a window this renderer opened.
     WindowClose {

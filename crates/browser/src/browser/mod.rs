@@ -13,7 +13,7 @@ use std::sync::Arc;
 use url::Url;
 
 use self::task::BrowserTask;
-use crate::actor::{TabHandle, TabId};
+use crate::actor::{NavigationInitiator, TabHandle, TabId};
 use crate::context::BrowserContext;
 use crate::exchange;
 use crate::network::NetworkContext;
@@ -94,6 +94,11 @@ pub(crate) struct OpenWindowOptions {
     pub(crate) source: Option<TabId>,
     /// What the call's `noopener` and `noreferrer` features asked for.
     pub(crate) opener: renderer::OpenerPolicy,
+    /// The calling document, already authorized against its renderer's site
+    /// lock. The browser-hosted popup navigates as if that document had done
+    /// it, which is what carries its referrer and `Sec-Fetch-Site`
+    /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#window-open-steps>).
+    pub(crate) initiator: NavigationInitiator,
 }
 
 pub(super) enum Command {

@@ -243,7 +243,15 @@ impl BrowserTask {
             url,
             source,
             opener,
+            mut initiator,
         } = request;
+        // `noreferrer` is the opener feature's referrer half, and the browser
+        // owns the feature's meaning: the renderer sends the document's policy
+        // and this overrides it
+        // (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#window-open-steps>).
+        if opener == renderer::OpenerPolicy::NoReferrer {
+            initiator.referrer_policy = net::ReferrerPolicy::NoReferrer;
+        }
         let handle = self.create_tab()?;
         let id = handle.id();
         if let (Some(source), renderer::OpenerPolicy::Keep) = (source, opener) {
@@ -252,7 +260,7 @@ impl BrowserTask {
         }
         if !url.is_empty() && url != "about:blank" {
             tokio::spawn(async move {
-                let _result = handle.goto(&url).await;
+                let _result = handle.goto_from(&url, initiator).await;
             });
         }
         Ok(id)

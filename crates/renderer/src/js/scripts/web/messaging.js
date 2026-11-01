@@ -1116,9 +1116,10 @@ Object.defineProperty(globalThis, 'name', {
     const name = target === undefined || target === null ? '' : String(target);
     const featureString = features === undefined || features === null ? '' : String(features);
     // The engine tokenizes and parses the features argument; this shim only
-    // reads the answer, so the grammar lives in one place
+    // reads the answer, so the grammar lives in one place. The engine also
+    // needs the resolved URL for the blob-URL opener rule
     // (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#concept-window-open-features-tokenize>).
-    const opener = host.__tbOpenerPolicy(featureString);
+    const opener = host.__tbOpenerPolicy(featureString, spec);
     const noopener = opener !== 'keep';
     // `noopener` withholds the `WindowProxy` only when the call did not target
     // this context or one of its ancestors
