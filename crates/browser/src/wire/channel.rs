@@ -466,7 +466,9 @@ mod tests {
             RequestPolicy::CspReportUri,
         ] {
             let url = url::Url::parse("https://a.test/x").expect("URL");
-            let initiator = url::Url::parse("https://a.test/").expect("origin");
+            // A different origin from the request URL, so the round trip
+            // proves the initiator travels on its own field
+            let initiator = url::Url::parse("https://b.test/").expect("origin");
             let request = renderer::DialRequest::new(policy, &url, &initiator.origin());
             let message: crate::wire::FromRenderer = crate::exchange::Frame::Call {
                 id: crate::exchange::RequestId::new(1),
@@ -497,8 +499,8 @@ mod tests {
             assert_eq!(request.policy, policy, "the policy survives the wire");
             assert_eq!(
                 request.initiator,
-                renderer::SerializedOrigin::Tuple(url.origin()),
-                "the initiator is an origin, not the URL text the renderer had"
+                renderer::SerializedOrigin::Tuple(initiator.origin()),
+                "the initiator is the caller's origin, not the request URL"
             );
         }
     }
