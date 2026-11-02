@@ -134,6 +134,48 @@ def sources_for(
     return sorted(set(kept))
 
 
+def run_batch(
+    binary: Path,
+    wpt: Path,
+    batch: list[tuple[str, str]],
+    tools: Path,
+    scratch: Path,
+) -> dict[str, list[str]]:
+    """Records one process's profile and attributes it to each test in it.
+
+    A batch shares one profile, so every test gets the union: a superset of
+    what it alone executed. That over-selects, never under-selects. The fixed
+    cost of an instrumented process (~19 s here) is paid once per batch
+    instead of once per test.
+    """
+    raw = scratch / profile_name(batch[0][1] + f"-b{len(batch)}")
+    env = dict(os.environ, LLVM_PROFILE_FILE=str(raw))
+    run = subprocess.run(
+        [
+            str(binary),
+            "--wpt-root",
+            str(wpt),
+            *[relative for _, relative in batch],
+            "--jobs",
+            "1",
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    if run.returncode == 0 and raw.exists():
+        sources = sources_for(binary, raw, tools, scratch)
+        return {f"/{relative}": sources for _, relative in batch}
+    if len(batch) == 1:
+        print(f"deps: /{batch[0][1]} produced no profile", file=sys.stderr)
+        return {f"/{batch[0][1]}": []}
+    # A crash took the whole batch's profile with it; split and retry.
+    half = len(batch) // 2
+    merged = run_batch(binary, wpt, batch[:half], tools, scratch)
+    merged.update(run_batch(binary, wpt, batch[half:], tools, scratch))
+    return merged
+
+
 def build(args: argparse.Namespace) -> int:
     binary = Path(args.binary).resolve()
     wpt = Path(args.wpt_root).resolve()
@@ -151,30 +193,25 @@ def build(args: argparse.Namespace) -> int:
         print("deps: no testharness or crashtest files selected", file=sys.stderr)
         return 2
     print(f"deps: {len(tests)} tests, {args.jobs} at a time", file=sys.stderr)
+    batches = [
+        tests[index : index + args.batch]
+        for index in range(0, len(tests), args.batch)
+    ]
+    print(f"deps: {len(batches)} batches of up to {args.batch}", file=sys.stderr)
     with tempfile.TemporaryDirectory(prefix="wpt-deps-") as scratch_dir:
         scratch = Path(scratch_dir)
-
-        def one(test: tuple[str, str]) -> tuple[str, list[str]]:
-            _, relative = test
-            raw = scratch / profile_name(relative)
-            env = dict(os.environ, LLVM_PROFILE_FILE=str(raw))
-            run = subprocess.run(
-                [str(binary), "--wpt-root", str(wpt), relative, "--jobs", "1"],
-                env=env,
-                capture_output=True,
-                text=True,
-            )
-            if run.returncode != 0 or not raw.exists():
-                print(f"deps: {relative} produced no profile", file=sys.stderr)
-                return f"/{relative}", []
-            return f"/{relative}", sources_for(binary, raw, tools, scratch)
-
         tests_map: dict[str, list[str]] = {}
         with concurrent.futures.ThreadPoolExecutor(args.jobs) as pool:
-            for index, (test, sources) in enumerate(pool.map(one, tests), 1):
-                tests_map[test] = sources
+            futures = [
+                pool.submit(run_batch, binary, wpt, batch, tools, scratch)
+                for batch in batches
+            ]
+            for index, future in enumerate(
+                concurrent.futures.as_completed(futures), 1
+            ):
+                tests_map.update(future.result())
                 if index % 25 == 0:
-                    print(f"deps: {index}/{len(tests)}", file=sys.stderr)
+                    print(f"deps: {index}/{len(batches)} batches", file=sys.stderr)
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -196,6 +233,13 @@ def main() -> int:
     build_parser.add_argument("--out", required=True)
     build_parser.add_argument("--llvm-tools", default=None)
     build_parser.add_argument("--jobs", type=int, default=os.cpu_count() or 1)
+    build_parser.add_argument(
+        "--batch",
+        type=int,
+        default=1,
+        help="tests per instrumented process (default 1; larger is far cheaper "
+        "and records a superset of each test's sources)",
+    )
     build_parser.add_argument("paths", nargs="+")
     args = parser.parse_args()
     if args.command == "build":

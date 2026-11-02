@@ -87,13 +87,16 @@ blast radius, so every selected test runs. A file's own bytes are still an
 input through `--cache`, so editing a test reruns it even when the map is
 stale.
 
-Building a full map is not yet a per-push job: `-C instrument-coverage` makes
-this engine pay ~19 s of per-process setup (fontconfig through instrumented
-Rust) plus ~0.2 s per test, so one process per test is hours, and per-test
-profiles in one process need `__llvm_profile_reset_counters`, which is an
-FFI exception to the no-`unsafe` rule. A map for three dom/nodes files was
-recorded and verified: the known-file probe selected exactly those three, and
-an unknown path fell back to all 386.
+Building a full map is a scheduled job, not a per-push step: `-C
+instrument-coverage` makes process setup cost ~19 s here (fontconfig through
+instrumented Rust) and each test ~0.2 s. `--batch N` pays that setup once per
+N tests and gives every test in the batch the union of what the batch
+executed, which over-selects and never under-selects. Measured: dom/nodes
+(374 tests) at `--batch 50 --jobs 4` took 1 m 47 s and yields a 50-test
+granularity floor; a change to `window_features.rs` selected 24 tests and ran
+in 1.5 s against 10.9 s for the directory, while a core file such as `xml.rs`
+selected all 374 and ran in 11.0 s. Larger `--batch` is cheaper to record and
+coarser to select.
 
 Known gap: an async listener that leaves a host object borrowed makes
 rquickjs panic with `AlreadyBorrowed` in `Class::borrow_mut`; rquickjs
