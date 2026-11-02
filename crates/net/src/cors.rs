@@ -535,47 +535,32 @@ pub fn cors_check(headers: &HeaderMap, origin: &str, credentials_include: bool) 
         .is_some_and(|value| value.trim().eq_ignore_ascii_case("true"))
 }
 
-/// A `token` per RFC 9110 §5.6.2, also the header-name grammar.
-fn is_token(text: &str) -> bool {
-    !text.is_empty()
-        && text.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric()
-                || matches!(
-                    byte,
-                    b'!' | b'#'
-                        | b'$'
-                        | b'%'
-                        | b'&'
-                        | b'\''
-                        | b'*'
-                        | b'+'
-                        | b'-'
-                        | b'.'
-                        | b'^'
-                        | b'_'
-                        | b'`'
-                        | b'|'
-                        | b'~'
-                )
-        })
+/// The non-empty items of a list header
+/// (<https://fetch.spec.whatwg.org/#header-value-get-decode-and-split>).
+fn list_items(headers: &HeaderMap, name: &str) -> Vec<String> {
+    crate::get_decode_split(headers, name)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|item| !item.is_empty())
+        .collect()
 }
 
-/// Extracts a `#token` list header, `None` on a malformed item
-/// (<https://fetch.spec.whatwg.org/#header-value-get-decode-and-split>). Used
-/// for `Access-Control-Allow-Methods` and `-Headers`, whose invalid items make
-/// the preflight fail.
-fn list_tokens(headers: &HeaderMap, name: &str) -> Option<Vec<String>> {
-    let mut tokens = Vec::new();
-    for item in crate::get_decode_split(headers, name).unwrap_or_default() {
-        if item.is_empty() {
-            continue;
-        }
-        if !is_token(&item) {
-            return None;
-        }
-        tokens.push(item);
-    }
-    Some(tokens)
+/// Extracts a `#method` list header, `None` on an item that is not an HTTP
+/// token.
+fn list_methods(headers: &HeaderMap, name: &str) -> Option<Vec<hyper::Method>> {
+    list_items(headers, name)
+        .into_iter()
+        .map(|item| hyper::Method::from_bytes(item.as_bytes()).ok())
+        .collect()
+}
+
+/// Extracts a `#field-name` list header, `None` on an item that is not an
+/// HTTP token.
+fn list_header_names(headers: &HeaderMap, name: &str) -> Option<Vec<header::HeaderName>> {
+    list_items(headers, name)
+        .into_iter()
+        .map(|item| header::HeaderName::from_bytes(item.as_bytes()).ok())
+        .collect()
 }
 
 /// Validates a preflight response
@@ -599,13 +584,13 @@ pub fn preflight_ok(
     // named, or `*` when credentials are not included. A malformed
     // `Access-Control-Allow-Methods` fails the preflight
     // (<https://fetch.spec.whatwg.org/#cors-preflight-fetch>, steps 6, 12).
-    let Some(methods) = list_tokens(headers, "access-control-allow-methods") else {
+    let Some(methods) = list_methods(headers, "access-control-allow-methods") else {
         return false;
     };
     let wildcard_ok = !credentials_include;
-    let method_allowed = methods.iter().any(|value| value == method.as_str())
+    let method_allowed = methods.iter().any(|value| value == method.as_http())
         || is_cors_safelisted_method(method)
-        || (wildcard_ok && methods.iter().any(|value| value == "*"));
+        || (wildcard_ok && methods.iter().any(|value| value.as_str() == "*"));
     if !method_allowed {
         return false;
     }
@@ -614,13 +599,9 @@ pub fn preflight_ok(
     // when credentials are not included. A malformed
     // `Access-Control-Allow-Headers` fails the preflight
     // (<https://fetch.spec.whatwg.org/#cors-preflight-fetch>, steps 7, 13-14).
-    let Some(allowed) = list_tokens(headers, "access-control-allow-headers") else {
+    let Some(allowed) = list_header_names(headers, "access-control-allow-headers") else {
         return false;
     };
-    let allowed: Vec<String> = allowed
-        .into_iter()
-        .map(|value| value.to_ascii_lowercase())
-        .collect();
     let listed = |name: &str| allowed.iter().any(|value| value == name);
     if unsafe_names.iter().any(|name| name == "authorization") && !listed("authorization") {
         return false;
