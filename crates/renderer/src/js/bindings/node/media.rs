@@ -572,7 +572,7 @@ impl JsNode {
             .images
             .current_request
             .get(&self.handle.0)
-            .map(|request| request.url.clone())
+            .map(|request| request.url.to_string())
             .unwrap_or_default())
     }
 }

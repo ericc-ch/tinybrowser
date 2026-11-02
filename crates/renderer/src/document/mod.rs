@@ -476,17 +476,15 @@ struct SubresourceBody {
     origin_clean: bool,
 }
 
-/// One filed Blitz subresource request: its handler, the URL it went out
-/// under, the CORS settings state it was created with, and the element that
-/// initiated it. The element is carried, not recovered from the URL, so two
-/// elements on one URL keep their own `crossorigin`, `referrerpolicy`, and
-/// `error` behavior
+/// One filed Blitz subresource request: its handler, the request key it went
+/// out under, and the element that initiated it. The element is carried, not
+/// recovered from the URL, so two elements on one URL keep their own
+/// `crossorigin`, `referrerpolicy`, and `error` behavior
 /// (<https://fetch.spec.whatwg.org/#concept-request-client>).
 struct BlitzRequest {
     handler: crate::render::CountingHandler,
-    /// The request URL Blitz dialed under, parsed. `key` carries the same URL
-    /// as text, because Blitz's cache and settlement keyed it that way.
-    url: Url,
+    /// The URL and CORS settings state the request went out under, as Blitz
+    /// keys its cache and settlements.
     key: blitz_dom::ImageKey,
     referrer_policy: Option<String>,
     node: Option<crate::dom::tree::NodeId>,
@@ -558,10 +556,12 @@ pub(crate) struct Document {
     /// (<https://html.spec.whatwg.org/multipage/images.html#update-the-image-data>).
     deferred_image_events: VecDeque<Task>,
     /// `<img>` requests Blitz started for this document, each with the token
-    /// that delays the document's `load` event until it settles
+    /// that delays the document's `load` event until it settles. The key is
+    /// absent for a source that named no absolute URL
     /// (<https://html.spec.whatwg.org/multipage/images.html#update-the-image-data>,
     /// <https://html.spec.whatwg.org/multipage/parsing.html#delay-the-load-event>).
-    image_requests: HashMap<crate::dom::tree::NodeId, (blitz_dom::ImageKey, LoadDelayGuard)>,
+    image_requests:
+        HashMap<crate::dom::tree::NodeId, (Option<blitz_dom::ImageKey>, LoadDelayGuard)>,
     /// Connected `<img>` elements the last lifecycle scan saw, so removal
     /// drops their state
     /// (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>).
@@ -3414,7 +3414,7 @@ impl Document {
         let destination = request.destination;
         let blocked = redirected
             && destination.is_some_and(|destination| {
-                self.response_url_blocked(&outcome.final_url, &request.url, destination, None)
+                self.response_url_blocked(&outcome.final_url, &request.key.url, destination, None)
             });
         let body = match &outcome.body {
             crate::protocol::ResponseBody::Bytes(body) => Some(body.as_slice()),
@@ -3464,8 +3464,9 @@ impl Document {
             .unwrap_or(inherited);
             let final_url = &outcome.final_url;
             self.style_policies.insert(final_url.to_string(), policy);
-            if &request.url != final_url {
-                self.style_policies.insert(request.url.to_string(), policy);
+            if &request.key.url != final_url {
+                self.style_policies
+                    .insert(request.key.url.to_string(), policy);
             }
         }
         if !succeeded {
@@ -3799,7 +3800,7 @@ impl Document {
         while let Ok((fetch, handler)) = self.blitz_fetch_rx.try_recv() {
             let incoming = fetch.request;
             let key = blitz_dom::ImageKey {
-                url: incoming.url.as_str().to_owned(),
+                url: incoming.url.clone(),
                 crossorigin: incoming.crossorigin,
             };
             let element = self.subresource_element(incoming.node);
@@ -3812,7 +3813,7 @@ impl Document {
                     self.image_taint.insert(key.clone(), cached.origin_clean);
                 }
                 Box::new(handler).bytes(
-                    key.url.clone(),
+                    key.url.to_string(),
                     blitz_traits::net::Bytes::from(cached.bytes),
                 );
                 self.settle_blitz_layout();
@@ -3820,7 +3821,6 @@ impl Document {
             }
             let request = BlitzRequest {
                 handler,
-                url: incoming.url.clone(),
                 key,
                 referrer_policy: incoming.referrer_policy,
                 node: element,
@@ -4071,15 +4071,19 @@ impl Document {
                     else {
                         continue;
                     };
-                    if settlement.outcome == blitz_dom::ImageOutcome::Loaded
-                        && let Some((width, height)) = self.blitz_image_dims(element)
-                    {
+                    // Only a request that named a URL can have pixels; a
+                    // source with no absolute URL settles without a key.
+                    let loaded = match (&settlement.outcome, &key) {
+                        (blitz_dom::ImageOutcome::Loaded, Some(key)) => self
+                            .blitz_image_dims(element)
+                            .map(|dims| (key.clone(), dims)),
+                        _ => None,
+                    };
+                    if let Some((key, (width, height))) = loaded {
                         let origin_clean =
                             self.image_taint.get(&key).copied().unwrap_or_else(|| {
                                 let world = self.world.borrow();
-                                Url::parse(&key.url).is_ok_and(|url| {
-                                    url.scheme() == "data" || url.origin() == world.origin
-                                })
+                                key.url.scheme() == "data" || key.url.origin() == world.origin
                             });
                         self.world.borrow_mut().image_settled(
                             element,

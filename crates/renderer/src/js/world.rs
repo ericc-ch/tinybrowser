@@ -2872,12 +2872,16 @@ impl World {
         self.images.origin_clean.insert(element, origin_clean);
     }
 
-    /// The element's current request finished without usable pixels
+    /// The element's current request finished without usable pixels. A request
+    /// keyed by no URL leaves no current request behind
     /// (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>).
-    pub(crate) fn image_failed(&mut self, element: NodeId, request: blitz_dom::ImageKey) {
+    pub(crate) fn image_failed(&mut self, element: NodeId, request: Option<blitz_dom::ImageKey>) {
         self.images.loading.remove(&element);
         self.images.sizes.remove(&element);
-        self.images.current_request.insert(element, request);
+        match request {
+            Some(request) => self.images.current_request.insert(element, request),
+            None => self.images.current_request.remove(&element),
+        };
         self.images.origin_clean.insert(element, false);
         self.images.broken.insert(element);
     }
