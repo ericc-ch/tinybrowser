@@ -1411,7 +1411,16 @@ impl Engine {
                     } else {
                         (None, None, Vec::new())
                     };
+                // The environment's creator bit travels with the navigation:
+                // a frame's document inherits it even when its own URL is
+                // trustworthy
+                // (<https://html.spec.whatwg.org/multipage/webappapis.html#secure-contexts>).
+                let creator_secure = self
+                    .frames
+                    .get(&initiator)
+                    .map(|document| document.world().borrow().policy.secure_context);
                 if let Some(document) = self.frames.get_mut(&child) {
+                    document.set_creator_secure_context(creator_secure);
                     let mut request = crate::protocol::DialRequest::new(
                         crate::protocol::RequestPolicy::FrameLoad,
                         url,

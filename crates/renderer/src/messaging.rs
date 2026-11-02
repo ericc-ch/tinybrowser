@@ -72,8 +72,6 @@ pub(crate) struct FrameTree {
     /// Browsing context names (`window.name`)
     /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-name>).
     names: HashMap<FrameId, String>,
-    /// Each frame's secure-context bit, recorded when its document commits.
-    secure_contexts: HashMap<FrameId, bool>,
 }
 
 impl FrameTree {
@@ -150,18 +148,6 @@ impl FrameTree {
         self.names.insert(frame, name);
     }
 
-    /// Records whether `frame`'s current document environment is a secure
-    /// context. The bit is fixed when the document commits.
-    pub(crate) fn set_secure_context(&mut self, frame: FrameId, secure: bool) {
-        self.secure_contexts.insert(frame, secure);
-    }
-
-    /// The secure-context bit `frame`'s current document recorded. The main
-    /// frame has no tree entry but does record its bit.
-    pub(crate) fn secure_context(&self, frame: FrameId) -> Option<bool> {
-        self.secure_contexts.get(&frame).copied()
-    }
-
     /// Removes one frame and returns how it came to exist.
     pub(crate) fn remove(&mut self, child: FrameId) -> Option<FrameOrigin> {
         let origin = self.origins.remove(&child)?;
@@ -173,7 +159,6 @@ impl FrameTree {
         }
         self.children.remove(&child);
         self.names.remove(&child);
-        self.secure_contexts.remove(&child);
         Some(origin)
     }
 

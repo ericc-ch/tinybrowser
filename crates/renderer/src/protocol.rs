@@ -347,6 +347,14 @@ pub struct PolicyContainer {
     pub csp: crate::csp::List,
     /// The document's referrer policy, when it has one.
     pub referrer_policy: Option<net::ReferrerPolicy>,
+    /// Whether the document's environment is a secure context
+    /// (<https://html.spec.whatwg.org/multipage/webappapis.html#secure-contexts>).
+    ///
+    /// The bit is part of the container because it inherits exactly like the
+    /// rest of it: a local-scheme document clones its initiator's container, so
+    /// the opener of a popup is its creator. Chromium carries the same field on
+    /// `PolicyContainerPolicies` and computes it at navigation commit.
+    pub secure_context: bool,
 }
 
 /// The document state a response installs: URL, content type, and the
@@ -513,6 +521,10 @@ impl ResponseHead {
                             .filter(|(name, _)| name.eq_ignore_ascii_case("referrer-policy"))
                             .map(|(_, value)| value.as_str()),
                     ),
+                    // Only the environment knows its creator, so the renderer
+                    // computes the bit when it installs this head
+                    // (<https://html.spec.whatwg.org/multipage/webappapis.html#secure-contexts>).
+                    secure_context: false,
                 },
                 reporting_endpoints: crate::csp::combined_header(headers, "reporting-endpoints"),
                 refresh: headers.iter().find_map(|(name, value)| {

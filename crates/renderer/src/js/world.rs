@@ -1811,7 +1811,8 @@ impl World {
         runtime: &FrameRuntime,
         init_scripts: Rc<RefCell<Vec<(u64, String)>>>,
     ) -> Self {
-        let world = Self {
+        let secure_context = secure_context::is_secure_environment(&document_url, None);
+        Self {
             runtime: runtime.clone(),
             frame,
             init_scripts,
@@ -1827,7 +1828,10 @@ impl World {
             document_referrer: None,
             document_url,
             base_url: None,
-            policy: PolicyContainer::default(),
+            policy: PolicyContainer {
+                secure_context,
+                ..PolicyContainer::default()
+            },
             sandbox: SandboxFlags::default(),
             history: crate::protocol::HistorySnapshot::default(),
             outbox: Rc::new(RefCell::new(VecDeque::new())),
@@ -1855,9 +1859,7 @@ impl World {
             weak_references: None,
             deliver_mutations_fn: None,
             images: ImageState::default(),
-        };
-        world.commit_secure_context();
-        world
+        }
     }
 
     pub(crate) fn clear_observers(&mut self) {
@@ -2099,32 +2101,7 @@ impl World {
     /// Chromium's, not HTML's text; the disagreement is in
     /// `docs/upstream.md`.
     pub(crate) fn is_secure_context(&self) -> bool {
-        self.runtime
-            .shared
-            .borrow()
-            .tree
-            .secure_context(self.frame)
-            .expect("a live frame records its secure-context bit")
-    }
-
-    /// Records this environment's secure-context bit when its document
-    /// commits. Only a child navigable inherits; a popup is its own top-level
-    /// environment.
-    pub(crate) fn commit_secure_context(&self) {
-        let secure = {
-            let shared = self.runtime.shared.borrow();
-            let creator = shared.tree.parent(self.frame).map(|parent| {
-                shared.tree.secure_context(parent).expect(
-                    "a parent frame records its secure-context bit before its child commits",
-                )
-            });
-            secure_context::is_secure_environment(&self.document_url, creator)
-        };
-        self.runtime
-            .shared
-            .borrow_mut()
-            .tree
-            .set_secure_context(self.frame, secure);
+        self.policy.secure_context
     }
 
     /// Whether this realm's frame is still attached to its document. A
@@ -2432,7 +2409,18 @@ impl World {
     /// cross-origin context
     /// (<https://html.spec.whatwg.org/multipage/browsers.html#concept-origin>).
     fn may_host_auxiliary(&self, url: Option<&Url>) -> bool {
-        url.is_none_or(|url| url.scheme() == "about" || url.origin() == self.origin)
+        url.is_none_or(|url| {
+            if url.scheme() == "about" {
+                return true;
+            }
+            if url.scheme() == "blob" {
+                // A blob's origin is its store entry's, which re-parsing the
+                // URL cannot recover for an opaque creator. The store already
+                // answers only for an entry this document may use.
+                return self.object_url_origin(url.as_str()).is_some();
+            }
+            url.origin() == self.origin
+        })
     }
 
     /// Queues a classic inline script that could not run in the realm that

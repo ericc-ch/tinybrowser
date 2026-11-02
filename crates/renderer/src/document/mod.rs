@@ -650,6 +650,14 @@ pub(crate) struct Document {
     /// `Referrer-Policy` from the response being parsed, applied after the
     /// parser installs the new document (the state reset clears the realm).
     response_referrer_policy: Option<net::ReferrerPolicy>,
+    /// Whether the response being parsed is a secure context, computed at
+    /// the head from its URL and its creator's bit
+    /// (<https://html.spec.whatwg.org/multipage/webappapis.html#secure-contexts>).
+    response_secure_context: bool,
+    /// The creator's secure-context bit for the next navigation this document
+    /// commits. `None` when the browser started the navigation, which has no
+    /// creator (`is_secure_environment` then reads the URL alone).
+    creator_secure_context: Option<bool>,
     /// The policy container a local-scheme document inherits, installed
     /// atomically after the parser replaces the document's state
     /// (<https://html.spec.whatwg.org/multipage/browsers.html#policy-containers>).
@@ -892,6 +900,8 @@ impl Document {
             response_content_type: None,
             response_policy: crate::csp::List::default(),
             response_referrer_policy: None,
+            response_secure_context: false,
+            creator_secure_context: None,
             inherited_policy: None,
             embedder_csp_reports: Vec::new(),
             csp_from_response: false,
@@ -1345,6 +1355,14 @@ impl Document {
         });
     }
 
+    /// Records the creator's secure-context bit for the navigation this
+    /// document is about to commit. `None` when the browser started the
+    /// navigation, which has no creator
+    /// (<https://html.spec.whatwg.org/multipage/webappapis.html#secure-contexts>).
+    pub(crate) fn set_creator_secure_context(&mut self, creator: Option<bool>) {
+        self.creator_secure_context = creator;
+    }
+
     /// Gives a blank document the URL `about:blank` and the creator's base
     /// URL for relative resolution.
     fn apply_blank_url(
@@ -1530,13 +1548,12 @@ impl Document {
         self.url = url;
     }
 
-    /// Commits a new document at `url`: writes the URL and captured origin,
-    /// then records the environment's secure-context bit. A same-document
-    /// history update keeps the bit its document already has
+    /// Commits a new document at `url`: writes the URL and captured origin. A
+    /// same-document history update keeps the secure-context bit its document
+    /// already has
     /// (<https://html.spec.whatwg.org/multipage/webappapis.html#secure-contexts>).
     fn commit_document_url(&mut self, url: Url, origin: Option<url::Origin>) {
         self.set_document_url(url, origin);
-        self.world.borrow().commit_secure_context();
     }
 
     fn apply_document_url_same_origin(&mut self, url: &str) {
@@ -1841,6 +1858,7 @@ impl Document {
         self.response_content_type = None;
         self.response_policy = crate::csp::List::default();
         self.response_referrer_policy = None;
+        self.response_secure_context = false;
         self.csp_from_response = false;
         self.sniff_header.clear();
         self.apply_mime_sniff = false;
@@ -1908,6 +1926,17 @@ impl Document {
         let policy = head.source.policy();
         self.response_policy = policy.csp.clone();
         self.response_referrer_policy = policy.referrer_policy;
+        // A local-scheme document clones its creator's whole container; an
+        // HTTP document starts from its headers and adds its creator's bit,
+        // which the navigation carried
+        // (<https://html.spec.whatwg.org/multipage/browsers.html#determining-navigation-params-policy-container>).
+        let creator = match &head.source {
+            crate::protocol::ResponseSource::Http(_) => self.creator_secure_context,
+            crate::protocol::ResponseSource::Local { inherited } => {
+                inherited.as_ref().map(|policy| policy.secure_context)
+            }
+        };
+        self.response_secure_context = secure_context::is_secure_environment(&head.url, creator);
         self.csp_from_response = true;
         self.apply_mime_sniff = true;
         self.mime_guard = crate::sniff::MimeGuard {
@@ -2388,6 +2417,7 @@ impl Document {
             self.world.borrow_mut().policy = PolicyContainer {
                 csp: self.response_policy.clone(),
                 referrer_policy: self.response_referrer_policy,
+                secure_context: self.response_secure_context,
             };
             return;
         }

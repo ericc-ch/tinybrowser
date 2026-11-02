@@ -42,8 +42,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// every page and CDP answer reports the same product as the request headers.
 /// Version 16 typed the values a navigation and a window open carry (origins,
 /// the window-open target and URL) and added the named-tab lookup and
-/// navigation calls.
-pub const PROTOCOL_VERSION: u8 = 16;
+/// navigation calls. Version 17 put the secure-context bit on the policy
+/// container.
+pub const PROTOCOL_VERSION: u8 = 17;
 
 /// Fixed frame header size in bytes.
 pub const HEADER_BYTES: usize = 16;
