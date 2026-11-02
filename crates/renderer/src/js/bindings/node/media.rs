@@ -536,22 +536,25 @@ impl JsNode {
         }
         let world = world(&ctx)?;
         let world = world.borrow();
-        if world.images.loading.contains(&self.handle.0) {
-            return Ok(false);
-        }
-        if world.images.sizes.contains_key(&self.handle.0) {
+        // The first two conditions are attribute-only: a source-less element
+        // is complete whether or not a request is still settling
+        // (<https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-complete>).
+        let (src_empty, srcset_present) =
+            world
+                .document(self.handle.0)
+                .map_or((true, false), |parsed| {
+                    let base = &parsed.document.base;
+                    (
+                        attr(base, self.handle.0.node, "src").is_none_or(str::is_empty),
+                        attr(base, self.handle.0.node, "srcset").is_some(),
+                    )
+                });
+        if src_empty && !srcset_present {
             return Ok(true);
         }
-        if world.images.broken.contains(&self.handle.0) {
-            return Ok(true);
-        }
-        let src = world.document(self.handle.0).and_then(|parsed| {
-            attr(&parsed.document.base, self.handle.0.node, "src").map(str::to_owned)
-        });
-        if src.as_deref().is_none_or(str::is_empty) {
-            return Ok(true);
-        }
-        Ok(world.images.broken.contains(&self.handle.0))
+        Ok(world
+            .image_request(self.handle.0)
+            .is_some_and(|request| request.status != blitz_dom::ImageRequestStatus::Pending))
     }
 
     // https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-currentsrc
@@ -569,10 +572,15 @@ impl JsNode {
         let world = world(&ctx)?;
         Ok(world
             .borrow()
-            .images
-            .current_request
-            .get(&self.handle.0)
-            .map(|request| request.url.to_string())
+            .image_request(self.handle.0)
+            .map(|request| {
+                request
+                    .final_url
+                    .as_ref()
+                    .or(request.key.as_ref().map(|key| &key.url))
+                    .map(ToString::to_string)
+                    .unwrap_or_default()
+            })
             .unwrap_or_default())
     }
 }
@@ -585,7 +593,7 @@ pub(super) fn img_size(ctx: &Ctx<'_>, id: NodeId) -> Result<Option<(u32, u32)>> 
         return Ok(None);
     }
     let world = world(ctx)?;
-    Ok(world.borrow().images.sizes.get(&id).copied())
+    Ok(world.borrow().image_size(id))
 }
 
 /// Whether the input is in the image button state (`type=image`, ASCII

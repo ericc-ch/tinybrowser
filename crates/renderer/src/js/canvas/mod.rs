@@ -2597,14 +2597,16 @@ fn source_image<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> Result<ImageLookup> {
         canvas_host_node(ctx, &value)?.or_else(|| crate::js::bindings::host_node_id(ctx, &value));
     if let Some(id) = node_id {
         let world = world(ctx)?;
-        let (loading, broken, size) = {
+        let (request, size) = {
             let world = world.borrow();
-            (
-                world.images.loading.contains(&id),
-                world.images.broken.contains(&id),
-                world.images.sizes.get(&id).copied(),
-            )
+            (world.image_request(id), world.image_size(id))
         };
+        let loading = request
+            .as_ref()
+            .is_some_and(|request| request.status == blitz_dom::ImageRequestStatus::Pending);
+        let broken = request
+            .as_ref()
+            .is_some_and(|request| request.status == blitz_dom::ImageRequestStatus::Failed);
         let zero_size = size.is_some_and(|(width, height)| width == 0 || height == 0);
         // A pending request is not fully decodable, so `drawImage` draws
         // nothing: reassigning `src` starts a new request whose state is
@@ -2632,7 +2634,7 @@ fn source_image<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> Result<ImageLookup> {
                 });
             }
         }
-        let tracked_origin_clean = world.borrow().images.origin_clean.get(&id).copied();
+        let tracked_origin_clean = request.as_ref().map(|request| request.origin_clean);
         let lookup = world
             .borrow()
             .with_document(id, |parsed| {

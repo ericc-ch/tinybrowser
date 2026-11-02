@@ -468,13 +468,11 @@ enum ParseStep {
     Script(crate::dom::tree::NodeId),
 }
 
-/// Raw subresource bytes by URL, with the canvas taint the response settled
-/// with, so a repeat Blitz fetch for a URL reuses both instead of dialing.
-#[derive(Clone)]
-struct SubresourceBody {
-    bytes: Vec<u8>,
-    origin_clean: bool,
-}
+/// The cache key a repeated Blitz subresource request is filed under: the URL
+/// the element asked for and the CORS settings state it asked with. Image
+/// bodies are not cached here: Blitz keys its own image cache by request and
+/// owns the decoded pixels.
+type SubresourceKey = (Url, Option<blitz_traits::net::CorsSetting>);
 
 /// One filed Blitz subresource request: its handler, the request key it went
 /// out under, and the element that initiated it. The element is carried, not
@@ -513,18 +511,17 @@ pub(crate) struct Document {
     blitz_shell: std::sync::Arc<crate::render::TinyShell>,
     /// Image settlements from Blitz, drained on this document's thread.
     image_settle_rx: std::sync::mpsc::Receiver<blitz_dom::ImageSettlement>,
-    /// Taint of each settled image request, so an element answered from
-    /// Blitz's cache keeps the taint its own request settled with
-    /// (<https://html.spec.whatwg.org/multipage/canvas.html#the-image-argument>).
-    image_taint: HashMap<blitz_dom::ImageKey, bool>,
     /// Blitz subresource fetches awaiting carrier dials.
     blitz_fetch_rx:
         std::sync::mpsc::Receiver<(crate::render::BlitzFetch, crate::render::CountingHandler)>,
     /// Filed Blitz subresource requests by fetch id, delivered on completion.
     blitz_requests: HashMap<u64, BlitzRequest>,
-    /// Subresource bodies by request, with the canvas taint each settled with,
-    /// so a repeat Blitz fetch reuses both instead of dialing again.
-    subresource_bytes: HashMap<blitz_dom::ImageKey, SubresourceBody>,
+    /// Stylesheet and font bodies by request, so a repeat Blitz fetch reuses
+    /// the response instead of dialing again. Images are absent: Blitz's own
+    /// cache answers a repeat request with no dial
+    /// (<https://html.spec.whatwg.org/multipage/links.html#link-type-stylesheet>,
+    /// <https://drafts.csswg.org/css-fonts-4/#font-face-rule>).
+    subresource_bytes: HashMap<SubresourceKey, Vec<u8>>,
     /// Referrer policy each fetched CSS style sheet's response carried, keyed
     /// by the URL the sheet was located at. A request the sheet initiates uses
     /// it and the sheet's URL, not the document's own
@@ -551,13 +548,11 @@ pub(crate) struct Document {
     /// installs later still sees them
     /// (<https://html.spec.whatwg.org/multipage/images.html#update-the-image-data>).
     deferred_image_events: VecDeque<Task>,
-    /// `<img>` requests Blitz started for this document, each with the token
-    /// that delays the document's `load` event until it settles. The key is
-    /// absent for a source that named no absolute URL
+    /// The token that delays this document's `load` event for each connected
+    /// `<img>` whose current request has not settled
     /// (<https://html.spec.whatwg.org/multipage/images.html#update-the-image-data>,
     /// <https://html.spec.whatwg.org/multipage/parsing.html#delay-the-load-event>).
-    image_requests:
-        HashMap<crate::dom::tree::NodeId, (Option<blitz_dom::ImageKey>, LoadDelayGuard)>,
+    image_load_delays: HashMap<crate::dom::tree::NodeId, LoadDelayGuard>,
     /// Connected `<img>` elements the last lifecycle scan saw, so removal
     /// drops their state
     /// (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>).
@@ -865,8 +860,7 @@ impl Document {
             next_timer_id: TimerId::default(),
             dials: DialLedger::new(Arc::clone(&runtime.stop), Arc::clone(&runtime.wake)),
             deferred_image_events: VecDeque::new(),
-            image_requests: HashMap::new(),
-            image_taint: HashMap::new(),
+            image_load_delays: HashMap::new(),
             connected_images: HashSet::new(),
             linked_sheets: HashMap::new(),
             stylesheet_generation: 0,
@@ -1249,8 +1243,9 @@ impl Document {
         self.adopt_js_work();
     }
 
-    /// Drops a disconnected `<img>`'s decoded state. Its request still settles
-    /// through Blitz, which fires `load` or `error` on the element
+    /// Drops a disconnected `<img>`'s creator stack entry. Its request still
+    /// settles through Blitz, which fires `load` or `error` on the element and
+    /// owns every piece of request state
     /// (<https://html.spec.whatwg.org/multipage/images.html#update-the-image-data>).
     pub(crate) fn disconnect_image(&mut self, element: crate::dom::tree::NodeId) {
         // A re-insertion starts a new load: drop the old trigger so the move
@@ -1260,7 +1255,6 @@ impl Document {
             .state
             .creator_stacks
             .remove(&element);
-        self.world.borrow_mut().forget_image(element);
     }
 
     /// Applies CSP `upgrade-insecure-requests` to the request URL of one queued
@@ -2235,10 +2229,8 @@ impl Document {
         while self.image_settle_rx.try_recv().is_ok() {}
         self.subresource_bytes.clear();
         self.style_policies.clear();
-        self.world.borrow_mut().clear_images();
         self.deferred_image_events.clear();
-        self.image_requests.clear();
-        self.image_taint.clear();
+        self.image_load_delays.clear();
         self.connected_images.clear();
         self.timers.retain(|_, timer| timer.js_id.is_none());
         self.js_timers.clear();
@@ -3457,13 +3449,17 @@ impl Document {
         // (<https://fetch.spec.whatwg.org/#concept-request-response-tainting>,
         // <https://html.spec.whatwg.org/multipage/canvas.html#the-image-argument>).
         let origin_clean = cors_clean || !outcome.crossed_origin;
-        if succeeded && let Some(body) = body {
+        // An image request's response taint travels with the delivery: Blitz
+        // keeps it on the element's request record, which canvas reads. A
+        // stylesheet or font body is cached to answer a repeat fetch without
+        // another dial.
+        if succeeded
+            && let Some(body) = body
+            && !destination.is_some_and(crate::csp::Destination::is_image)
+        {
             self.subresource_bytes.insert(
-                request.key.clone(),
-                SubresourceBody {
-                    bytes: body.to_vec(),
-                    origin_clean,
-                },
+                (request.key.url.clone(), request.key.crossorigin),
+                body.to_vec(),
             );
         }
         // A style sheet's response is the policy source for every request the
@@ -3501,14 +3497,10 @@ impl Document {
             self.fail_blitz_request(request);
             return;
         }
-        if destination.is_some_and(crate::csp::Destination::is_image) {
-            // The taint a cached request of this key carries
-            // (<https://html.spec.whatwg.org/multipage/canvas.html#the-image-argument>).
-            self.image_taint.insert(request.key.clone(), origin_clean);
-        }
-        Box::new(request.handler).bytes(
+        Box::new(request.handler).response(
             outcome.final_url.to_string(),
             blitz_traits::net::Bytes::from(body.unwrap_or_default().to_vec()),
+            blitz_traits::net::ResponseInfo { origin_clean },
         );
         // The arrival changes style or layout; apply it now so the tree is
         // current for the next capture instead of waiting for one to pump
@@ -3561,6 +3553,18 @@ impl Document {
         drop(world);
         self.note_linked_stylesheets();
         self.drain_image_settlements();
+    }
+
+    /// Delivers Blitz's queued document messages without resolving layout, so
+    /// a settlement that does not change the tree (a source-less image
+    /// failure) still reaches the drain that releases its load token
+    /// (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>).
+    fn pump_blitz_messages(&mut self) {
+        let world = self.world.borrow();
+        let Some(mut parsed) = world.main_document_mut() else {
+            return;
+        };
+        parsed.document.base.handle_messages();
     }
 
     /// Fires `load` on connected `<link rel=stylesheet>` elements whose sheet
@@ -3778,6 +3782,10 @@ impl Document {
     /// consulted
     /// (<https://html.spec.whatwg.org/multipage/parsing.html#the-end>).
     pub(crate) fn check_load(&mut self) -> bool {
+        // A queued document message (a failed image source, a landed
+        // stylesheet) must reach the settlement drain even when no redraw is
+        // pending; a full settle only runs when the tree changed.
+        self.pump_blitz_messages();
         // Blitz starts image requests from DOM mutations and settles them
         // from resource messages, so resolving the pending redraw here is
         // what turns a post-load `src` write into an event; without it the
@@ -3836,13 +3844,15 @@ impl Document {
                 incoming.kind,
                 crate::protocol::cross_origin(incoming.crossorigin),
             );
-            if let Some(cached) = self.subresource_bytes.get(&key).cloned() {
-                if destination.is_some_and(crate::csp::Destination::is_image) {
-                    self.image_taint.insert(key.clone(), cached.origin_clean);
-                }
+            if !destination.is_some_and(crate::csp::Destination::is_image)
+                && let Some(cached) = self
+                    .subresource_bytes
+                    .get(&(incoming.url.clone(), incoming.crossorigin))
+                    .cloned()
+            {
                 Box::new(handler).bytes(
-                    key.url.to_string(),
-                    blitz_traits::net::Bytes::from(cached.bytes),
+                    incoming.url.to_string(),
+                    blitz_traits::net::Bytes::from(cached),
                 );
                 self.settle_blitz_layout();
                 continue;
@@ -4067,9 +4077,10 @@ impl Document {
     }
 
     /// Applies Blitz's image settlements. Blitz owns request identity, so the
-    /// event says which node and which request; this records the outcome and
-    /// fires the element's event instead of recomputing a key
-    /// (<https://html.spec.whatwg.org/multipage/images.html#update-the-image-data>).
+    /// event says which node settled how; this attaches or releases the
+    /// node's load-delay token and queues the element's event. Every getter
+    /// reads Blitz state directly, so nothing has to be copied or validated
+    /// here (<https://html.spec.whatwg.org/multipage/images.html#update-the-image-data>).
     fn drain_image_settlements(&mut self) {
         let document = self.world.borrow().main_document().map(|parsed| parsed.id);
         while let Ok(settlement) = self.image_settle_rx.try_recv() {
@@ -4085,59 +4096,22 @@ impl Document {
             match settlement.outcome {
                 blitz_dom::ImageOutcome::Started => {
                     let delay = self.load_delay.guard();
-                    self.image_requests.insert(element, (settlement.key, delay));
-                    self.world.borrow_mut().image_started(element);
+                    self.image_load_delays.insert(element, delay);
                 }
-                blitz_dom::ImageOutcome::Loaded | blitz_dom::ImageOutcome::Failed => {
-                    // A request the element no longer displays settles
-                    // nothing: a later request replaced it
-                    // (<https://html.spec.whatwg.org/multipage/images.html#update-the-image-data>).
-                    let current = self.image_requests.remove(&element);
-                    let Some((key, _delay)) = current.filter(|(key, _)| *key == settlement.key)
-                    else {
-                        continue;
-                    };
-                    // Only a request that named a URL can have pixels; a
-                    // source with no absolute URL settles without a key.
-                    let loaded = match (&settlement.outcome, &key) {
-                        (blitz_dom::ImageOutcome::Loaded, Some(key)) => self
-                            .blitz_image_dims(element)
-                            .map(|dims| (key.clone(), dims)),
-                        _ => None,
-                    };
-                    if let Some((key, (width, height))) = loaded {
-                        let origin_clean =
-                            self.image_taint.get(&key).copied().unwrap_or_else(|| {
-                                let world = self.world.borrow();
-                                key.url.scheme() == "data" || key.url.origin() == world.origin
-                            });
-                        self.world.borrow_mut().image_settled(
-                            element,
-                            key,
-                            (width, height),
-                            origin_clean,
-                        );
-                        self.queue_image_event(Task::NodeLoad(element));
-                    } else {
-                        self.world.borrow_mut().image_failed(element, key);
-                        self.queue_image_event(Task::NodeError(element));
-                    }
+                blitz_dom::ImageOutcome::Loaded => {
+                    self.image_load_delays.remove(&element);
+                    self.queue_image_event(Task::NodeLoad(element));
+                }
+                blitz_dom::ImageOutcome::Failed => {
+                    self.image_load_delays.remove(&element);
+                    self.queue_image_event(Task::NodeError(element));
+                }
+                blitz_dom::ImageOutcome::Aborted => {
+                    // The element lost its source; it is complete and no
+                    // event is due, but the request no longer holds `load`.
+                    self.image_load_delays.remove(&element);
                 }
             }
-        }
-    }
-
-    /// Decoded dimensions Blitz holds for `element`'s current request, if it
-    /// decoded one. Blitz decodes synchronously on delivery, so after
-    /// [`Self::settle_blitz_layout`] this is settled for every delivered URL.
-    fn blitz_image_dims(&self, element: crate::dom::tree::NodeId) -> Option<(u32, u32)> {
-        let world = self.world.borrow();
-        let parsed = world.main_document()?;
-        let node = parsed.document.base.get_node(element.node)?;
-        match node.element_data()?.image_data()? {
-            blitz_dom::node::ImageData::Raster(raster) => Some((raster.width, raster.height)),
-            blitz_dom::node::ImageData::Svg(svg) => Some(crate::render::svg_natural_size(svg)),
-            blitz_dom::node::ImageData::None => None,
         }
     }
 

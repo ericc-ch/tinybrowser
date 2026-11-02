@@ -31,6 +31,19 @@ impl blitz_traits::net::NetHandler for CountingHandler {
         self.in_flight.fetch_sub(1, Ordering::SeqCst);
         inner.bytes(resolved_url, bytes);
     }
+
+    fn response(
+        mut self: Box<Self>,
+        resolved_url: String,
+        bytes: blitz_traits::net::Bytes,
+        info: blitz_traits::net::ResponseInfo,
+    ) {
+        let Some(inner) = self.inner.take() else {
+            return;
+        };
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        inner.response(resolved_url, bytes, info);
+    }
 }
 
 impl CountingHandler {

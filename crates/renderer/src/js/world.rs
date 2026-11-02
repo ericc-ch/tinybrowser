@@ -1458,45 +1458,6 @@ pub(crate) struct World {
     /// The realm's own mutation-delivery entry point, so scheduling never
     /// depends on a page-deletable global.
     pub(crate) deliver_mutations_fn: Option<Persistent<Function<'static>>>,
-    /// Every per-element map an `<img>` request writes.
-    pub(crate) images: ImageState,
-}
-
-/// Per-element `<img>` loading state for the realm.
-///
-/// Written only by the image update steps, so the concern owns every map an
-/// image request touches and drops them together when the document that
-/// owned the elements goes away; no clear list can forget the next field
-/// (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>).
-#[derive(Default)]
-pub(crate) struct ImageState {
-    /// Decoded dimensions for script geometry (`naturalWidth/Height`). Blitz
-    /// owns the pixels; this only records the settled size.
-    pub(crate) sizes: HashMap<NodeId, (u32, u32)>,
-    /// Elements whose current request has not finished
-    /// (<https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-complete>).
-    pub(crate) loading: HashSet<NodeId>,
-    /// The request each element's `currentSrc` and displayed pixels belong to
-    /// (<https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-currentsrc>).
-    pub(crate) current_request: HashMap<NodeId, blitz_dom::ImageKey>,
-    /// Current request is broken and there is no pending request
-    /// (<https://html.spec.whatwg.org/multipage/images.html#img-error>).
-    pub(crate) broken: HashSet<NodeId>,
-    /// Whether each element's displayed request is origin-clean for canvas
-    /// (<https://html.spec.whatwg.org/multipage/canvas.html#the-image-argument>).
-    pub(crate) origin_clean: HashMap<NodeId, bool>,
-}
-
-impl ImageState {
-    /// Drops every element's state; called when the document that owned the
-    /// elements is replaced or forgotten.
-    fn clear(&mut self) {
-        self.sizes.clear();
-        self.loading.clear();
-        self.current_request.clear();
-        self.broken.clear();
-        self.origin_clean.clear();
-    }
 }
 
 /// The realm's event-target graph.
@@ -1858,7 +1819,6 @@ impl World {
             event_ctors: HashMap::new(),
             weak_references: None,
             deliver_mutations_fn: None,
-            images: ImageState::default(),
         }
     }
 
@@ -1883,7 +1843,6 @@ impl World {
         // must not fire in the new document
         // (<https://html.spec.whatwg.org/multipage/webappapis.html#event-handlers>).
         self.events.reset_for_navigation();
-        self.images.clear();
         // A new realm owns fresh observers; navigation drops the old ones.
         self.clear_observers();
         id
@@ -2826,64 +2785,25 @@ impl World {
         self.input_files.get(&id).map(Vec::as_slice)
     }
 
-    /// Starts a `src` update for `url`. The stale image data stays on the
-    /// element so layout keeps painting it, but the current request is now
-    /// unavailable: `drawImage` and `naturalWidth` see nothing until it
-    /// settles, and the canvas taint belongs to the new request, not the old
-    /// pixels
-    /// (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>,
-    /// <https://html.spec.whatwg.org/multipage/images.html#img-not-fully-decodable>).
-    /// The element's current request started. Its `currentSrc` and pixels stay
-    /// with the previous request until this one settles, but the element is no
-    /// longer `complete` and `drawImage` refuses those pixels
-    /// (<https://html.spec.whatwg.org/multipage/images.html#update-the-image-data>,
-    /// <https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-complete>).
-    pub(crate) fn image_started(&mut self, element: NodeId) {
-        self.images.loading.insert(element);
-        self.images.broken.remove(&element);
-        self.images.origin_clean.remove(&element);
-    }
-
-    /// Records the settled request, its decoded dimensions, and its canvas
-    /// taint.
-    pub(crate) fn image_settled(
-        &mut self,
-        element: NodeId,
-        request: blitz_dom::ImageKey,
-        size: (u32, u32),
-        origin_clean: bool,
-    ) {
-        self.images.loading.remove(&element);
-        self.images.broken.remove(&element);
-        self.images.current_request.insert(element, request);
-        self.images.sizes.insert(element, size);
-        self.images.origin_clean.insert(element, origin_clean);
-    }
-
-    /// The element's current request finished without usable pixels. A request
-    /// keyed by no URL leaves no current request behind
+    /// The `<img>` request `id`'s pixels belong to, cloned out of Blitz's
+    /// per-node record. Blitz owns request identity, so `currentSrc`,
+    /// `complete`, `naturalWidth`, and `drawImage` read this instead of
+    /// keeping parallel maps
     /// (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>).
-    pub(crate) fn image_failed(&mut self, element: NodeId, request: Option<blitz_dom::ImageKey>) {
-        self.images.loading.remove(&element);
-        self.images.sizes.remove(&element);
-        match request {
-            Some(request) => self.images.current_request.insert(element, request),
-            None => self.images.current_request.remove(&element),
-        };
-        self.images.origin_clean.insert(element, false);
-        self.images.broken.insert(element);
+    pub(crate) fn image_request(&self, id: NodeId) -> Option<blitz_dom::ImageRequestState> {
+        let parsed = self.document(id)?;
+        parsed.document.base.image_request(id.node).cloned()
     }
 
-    pub(crate) fn forget_image(&mut self, element: NodeId) {
-        self.images.loading.remove(&element);
-        self.images.current_request.remove(&element);
-        self.images.broken.remove(&element);
-        self.images.origin_clean.remove(&element);
-        self.images.sizes.remove(&element);
-    }
-
-    pub(crate) fn clear_images(&mut self) {
-        self.images.clear();
+    /// The decoded size Blitz holds for `id`, when its current request loaded.
+    pub(crate) fn image_size(&self, id: NodeId) -> Option<(u32, u32)> {
+        let parsed = self.document(id)?;
+        let node = parsed.document.base.get_node(id.node)?;
+        match node.element_data()?.image_data()? {
+            blitz_dom::node::ImageData::Raster(raster) => Some((raster.width, raster.height)),
+            blitz_dom::node::ImageData::Svg(svg) => Some(crate::render::svg_natural_size(svg)),
+            blitz_dom::node::ImageData::None => None,
+        }
     }
 
     pub(crate) fn queue_document_stream(&mut self, command: DocumentStreamCommand) {
