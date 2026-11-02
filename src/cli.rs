@@ -3,7 +3,7 @@
 //! Tokens scan once, left to right, so `--version` and `--help` short-circuit
 //! where they appear and value errors surface in order. Behavior parity with
 //! the removed clap surface (exit codes, streams, rejected forms) is pinned by
-//! `tests/modes.rs`.
+//! `tests/browser/modes.rs`.
 //!
 //! Every flag becomes the typed value its consumer uses: `--proxy` a [`Proxy`],
 //! `--resolve` a [`ResolveRule`], `--tls-ca` a parsed [`TrustedCa`]. The scanner

@@ -700,18 +700,6 @@ fn policy_inline_violation(policy: &Policy, inline: &InlineScript<'_>) -> bool {
     false
 }
 
-/// Joins every occurrence of `name` with `", "`, the way a list header is
-/// extracted (<https://fetch.spec.whatwg.org/#concept-header-list-get-decode-split>).
-#[must_use]
-pub(crate) fn combined_header(headers: &[(String, String)], name: &str) -> Option<String> {
-    net::combined_header_in(
-        headers
-            .iter()
-            .map(|(header, value)| (header.as_str(), value.as_str())),
-        name,
-    )
-}
-
 /// `meta http-equiv=content-security-policy` content when the element is in
 /// `head` and has a `content` attribute. Other metas return `None`.
 #[must_use]

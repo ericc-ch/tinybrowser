@@ -333,22 +333,20 @@ fn has_page_conditional(request: &DialRequest) -> bool {
     })
 }
 
+/// Whether the response's `Cache-Control` carries the `no-store` directive
+/// (<https://www.rfc-editor.org/rfc/rfc9111#section-5.2>).
 fn response_forbids_storage(outcome: &DialOutcome) -> bool {
-    outcome.headers.iter().any(|(name, value)| {
-        name.eq_ignore_ascii_case("cache-control")
-            && value.to_ascii_lowercase().contains("no-store")
+    net::get_decode_split_decoded(&outcome.headers, "cache-control").is_some_and(|directives| {
+        directives.iter().any(|directive| {
+            let (name, _) = directive.split_once('=').unwrap_or((directive, ""));
+            name.trim_matches([' ', '\t'])
+                .eq_ignore_ascii_case("no-store")
+        })
     })
 }
 
 fn vary_matches(entry: &CachedResponse, request: &DialRequest) -> bool {
-    let vary = net::get_decode_split_decoded(
-        entry
-            .outcome
-            .headers
-            .iter()
-            .map(|(name, value)| (name.as_str(), value.as_str())),
-        "vary",
-    );
+    let vary = net::get_decode_split_decoded(&entry.outcome.headers, "vary");
     let Some(vary) = vary else {
         return true;
     };
@@ -356,34 +354,15 @@ fn vary_matches(entry: &CachedResponse, request: &DialRequest) -> bool {
         if field == "*" {
             return false;
         }
-        let stored = combined_request_header(&entry.request_headers, field);
-        stored == combined_request_header(&request.headers, field)
+        let stored = net::combined_header_in(&entry.request_headers, field);
+        stored == net::combined_header_in(&request.headers, field)
     })
-}
-
-/// Every value of `name` in a decoded header list joined with `", "`, the way
-/// getting a header does
-/// (<https://fetch.spec.whatwg.org/#concept-header-list-get>).
-fn combined_request_header(headers: &[(String, String)], name: &str) -> Option<String> {
-    net::combined_header(
-        headers
-            .iter()
-            .filter(|(header, _)| header.eq_ignore_ascii_case(name))
-            .map(|(_, value)| value.as_str()),
-    )
 }
 
 fn fresh(entry: &CachedResponse) -> bool {
     let age = entry.stored_at.elapsed().as_secs();
     let mut saw_max_age = false;
-    let cache_control = net::get_decode_split_decoded(
-        entry
-            .outcome
-            .headers
-            .iter()
-            .map(|(name, value)| (name.as_str(), value.as_str())),
-        "cache-control",
-    );
+    let cache_control = net::get_decode_split_decoded(&entry.outcome.headers, "cache-control");
     for directive in cache_control.iter().flatten() {
         let Some((name, value)) = directive.split_once('=') else {
             continue;
@@ -2373,5 +2352,32 @@ mod tests {
         );
         assert!(insecure_request.headers.get("sec-fetch-mode").is_some());
         assert!(insecure_request.headers.get("accept").is_some());
+    }
+
+    /// `no-store` is a directive name, not a substring: a lookalike directive
+    /// must not keep a response out of the cache, and a real one among others
+    /// must
+    /// (<https://www.rfc-editor.org/rfc/rfc9111#section-5.2.2.5>).
+    #[test]
+    fn only_the_no_store_directive_forbids_storage() {
+        let mut outcome = cached(net::cors::ResponseType::Cors).outcome;
+        for (cache_control, forbids) in [
+            ("no-cache", false),
+            ("no-store-ish=1", false),
+            ("max-age=60", false),
+            ("no-store", true),
+            ("NO-STORE", true),
+            ("private, no-store, max-age=0", true),
+            ("no-store=1", true),
+        ] {
+            outcome.headers = vec![("Cache-Control".to_owned(), cache_control.to_owned())];
+            assert_eq!(
+                response_forbids_storage(&outcome),
+                forbids,
+                "{cache_control:?}"
+            );
+        }
+        outcome.headers = Vec::new();
+        assert!(!response_forbids_storage(&outcome), "no header at all");
     }
 }

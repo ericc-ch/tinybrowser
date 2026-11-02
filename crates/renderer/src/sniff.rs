@@ -299,13 +299,7 @@ pub fn nosniff(value: &str) -> bool {
 /// `X-Content-Type-Options: nosniff` on a header list.
 #[must_use]
 pub(crate) fn headers_nosniff(headers: &[(String, String)]) -> bool {
-    net::combined_header_in(
-        headers
-            .iter()
-            .map(|(name, value)| (name.as_str(), value.as_str())),
-        "x-content-type-options",
-    )
-    .is_some_and(|value| nosniff(&value))
+    net::combined_header_in(headers, "x-content-type-options").is_some_and(|value| nosniff(&value))
 }
 
 /// "extract a MIME type" from one combined `Content-Type` value, serialized,

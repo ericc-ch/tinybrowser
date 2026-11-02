@@ -26,15 +26,12 @@ pub fn combined_header<'a>(values: impl Iterator<Item = &'a str>) -> Option<Stri
 /// `None` when the header is absent
 /// (<https://fetch.spec.whatwg.org/#concept-header-list-get>).
 #[must_use]
-pub fn combined_header_in<'a>(
-    headers: impl IntoIterator<Item = (&'a str, &'a str)>,
-    name: &str,
-) -> Option<String> {
+pub fn combined_header_in(headers: &[(String, String)], name: &str) -> Option<String> {
     combined_header(
         headers
-            .into_iter()
+            .iter()
             .filter(|(header, _)| header.eq_ignore_ascii_case(name))
-            .map(|(_, value)| value),
+            .map(|(_, value)| value.as_str()),
     )
 }
 
@@ -135,10 +132,7 @@ pub fn get_decode_split(headers: &HeaderMap, name: &str) -> Option<Vec<String>> 
 ///
 /// `None` means the header is absent.
 #[must_use]
-pub fn get_decode_split_decoded<'a>(
-    headers: impl IntoIterator<Item = (&'a str, &'a str)>,
-    name: &str,
-) -> Option<Vec<String>> {
+pub fn get_decode_split_decoded(headers: &[(String, String)], name: &str) -> Option<Vec<String>> {
     combined_header_in(headers, name).map(|value| split_header_value(&value))
 }
 

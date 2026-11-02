@@ -348,6 +348,15 @@ mod tests {
 
     use super::*;
 
+    /// One message through the real frame codec and back.
+    fn round_trip<T: serde::Serialize + serde::de::DeserializeOwned>(message: &T) -> T {
+        let mut bytes = Vec::new();
+        write_control(&mut bytes, message).expect("write");
+        read_control(&mut Cursor::new(bytes), &mut Vec::new())
+            .expect("read")
+            .expect("one frame")
+    }
+
     fn header(kind: u8, flags: u16, request: u64, length: u32) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(HEADER_BYTES);
         bytes.push(PROTOCOL_VERSION);
@@ -367,13 +376,7 @@ mod tests {
                 reply: crate::wire::Reply::Value(Ok(renderer::RemoteValue::Number(f64::NAN))),
             },
         };
-        let mut bytes = Vec::new();
-        write_control(&mut bytes, &message).expect("write");
-        let mut reader = Cursor::new(bytes);
-        let mut buffer = Vec::new();
-        let back: crate::wire::FromRenderer = read_control(&mut reader, &mut buffer)
-            .expect("read")
-            .expect("one frame");
+        let back: crate::wire::FromRenderer = round_trip(&message);
         let crate::exchange::Frame::Reply {
             body: crate::wire::RendererReply { reply, .. },
             ..
@@ -419,12 +422,7 @@ mod tests {
                     reply: crate::wire::Reply::Value(Ok(value)),
                 },
             };
-            let mut bytes = Vec::new();
-            write_control(&mut bytes, &message).expect("write");
-            let back: crate::wire::FromRenderer =
-                read_control(&mut Cursor::new(bytes), &mut Vec::new())
-                    .expect("read")
-                    .expect("one frame");
+            let back: crate::wire::FromRenderer = round_trip(&message);
             let crate::exchange::Frame::Reply {
                 body: crate::wire::RendererReply { reply, .. },
                 ..
@@ -483,12 +481,7 @@ mod tests {
                     )),
                 },
             };
-            let mut bytes = Vec::new();
-            write_control(&mut bytes, &message).expect("write");
-            let back: crate::wire::FromRenderer =
-                read_control(&mut Cursor::new(bytes), &mut Vec::new())
-                    .expect("read")
-                    .expect("one frame");
+            let back: crate::wire::FromRenderer = round_trip(&message);
             let crate::exchange::Frame::Call {
                 body: crate::wire::BrowserCall { call, .. },
                 ..
@@ -542,12 +535,7 @@ mod tests {
                     },
                 },
             };
-            let mut bytes = Vec::new();
-            write_control(&mut bytes, &message).expect("write");
-            let back: crate::wire::ToRenderer =
-                read_control(&mut Cursor::new(bytes), &mut Vec::new())
-                    .expect("read")
-                    .expect("one frame");
+            let back: crate::wire::ToRenderer = round_trip(&message);
             let crate::exchange::Frame::Call {
                 body: crate::wire::RendererCall::Response { response },
                 ..
@@ -623,12 +611,7 @@ mod tests {
                     ),
                 },
             };
-            let mut bytes = Vec::new();
-            write_control(&mut bytes, &sent).expect("write");
-            let back: crate::wire::FromRenderer =
-                read_control(&mut Cursor::new(bytes), &mut Vec::new())
-                    .expect("read")
-                    .expect("one frame");
+            let back: crate::wire::FromRenderer = round_trip(&sent);
             let crate::exchange::Frame::Call {
                 body:
                     crate::wire::BrowserCall {
@@ -689,11 +672,7 @@ mod tests {
             crate::exchange::Frame::Notify(crate::wire::HostNotice::Hello {
                 identity: Box::new(identity.clone()),
             });
-        let mut bytes = Vec::new();
-        write_control(&mut bytes, &message).expect("write");
-        let back: crate::wire::ToRenderer = read_control(&mut Cursor::new(bytes), &mut Vec::new())
-            .expect("read")
-            .expect("one frame");
+        let back: crate::wire::ToRenderer = round_trip(&message);
         let crate::exchange::Frame::Notify(crate::wire::HostNotice::Hello { identity: back }) =
             back
         else {
@@ -715,13 +694,7 @@ mod tests {
                 },
             },
         };
-        let mut bytes = Vec::new();
-        write_control(&mut bytes, &message).expect("write");
-        let mut reader = Cursor::new(bytes);
-        let mut buffer = Vec::new();
-        let back: crate::wire::ToRenderer = read_control(&mut reader, &mut buffer)
-            .expect("read")
-            .expect("one frame");
+        let back: crate::wire::ToRenderer = round_trip(&message);
         assert!(matches!(
             back,
             crate::exchange::Frame::Call { id, .. } if id.get() == 7
@@ -901,12 +874,7 @@ mod tests {
                     call,
                 },
             };
-            let mut bytes = Vec::new();
-            write_control(&mut bytes, &message).expect("write");
-            let back: crate::wire::FromRenderer =
-                read_control(&mut Cursor::new(bytes), &mut Vec::new())
-                    .expect("read")
-                    .expect("one frame");
+            let back: crate::wire::FromRenderer = round_trip(&message);
             let crate::exchange::Frame::Call { body, .. } = back else {
                 panic!("expected a call frame");
             };

@@ -531,8 +531,8 @@ impl ResponseHead {
                 status,
                 policy: PolicyContainer {
                     csp: crate::csp::List::from_headers(
-                        crate::csp::combined_header(headers, "content-security-policy").as_deref(),
-                        crate::csp::combined_header(headers, "content-security-policy-report-only")
+                        net::combined_header_in(headers, "content-security-policy").as_deref(),
+                        net::combined_header_in(headers, "content-security-policy-report-only")
                             .as_deref(),
                     ),
                     // The policy parser needs the field values one by one:
@@ -550,7 +550,7 @@ impl ResponseHead {
                     // (<https://html.spec.whatwg.org/multipage/webappapis.html#secure-contexts>).
                     secure_context: false,
                 },
-                reporting_endpoints: crate::csp::combined_header(headers, "reporting-endpoints"),
+                reporting_endpoints: net::combined_header_in(headers, "reporting-endpoints"),
                 refresh: headers.iter().find_map(|(name, value)| {
                     name.eq_ignore_ascii_case("refresh").then(|| value.clone())
                 }),
