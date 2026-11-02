@@ -759,9 +759,13 @@ pub struct DialRequest {
     pub url: Url,
     /// The origin the request runs under: the calling document's serialized
     /// origin, which the browser authorizes against the renderer's site lock
-    /// before it becomes the request's `Origin`, `SameSite`, and
-    /// `Sec-Fetch-*` source
-    /// (<https://fetch.spec.whatwg.org/#concept-request-origin>).
+    /// before it becomes the request's `Origin`, `Sec-Fetch-*` source, and
+    /// cookie `SameSite` input
+    /// (<https://fetch.spec.whatwg.org/#concept-request-origin>). The claim is
+    /// bounded by the site, not by the top-level document, because one renderer
+    /// hosts every same-site frame (`Site::authorize_origin`); cookie
+    /// `SameSite` only compares sites, so which same-site origin is named
+    /// cannot change it.
     pub initiator: SerializedOrigin,
     /// Whether and how the browser delivers the response body.
     pub delivery: BodyDelivery,

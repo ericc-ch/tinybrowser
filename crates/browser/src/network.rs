@@ -1222,12 +1222,19 @@ fn outbound_request(
         return Err(DialFailure::Connect);
     }
     let mut outbound = Request::new(request.method.clone(), url);
-    // The origin comes from the site-authorized initiator, so a compromised
-    // renderer cannot claim an origin outside its renderer's site lock
-    // (<https://fetch.spec.whatwg.org/#concept-request-origin>). It can still
-    // name a different origin *within* that site, which shares the renderer
-    // process; deriving the origin from a per-frame record the browser owns is
-    // a known gap.
+    // The origin is the renderer's claim, authorized against the renderer's
+    // site lock at the dial boundary (`route_service_call`), so nothing outside
+    // that site can be named. Inside it, one origin is not distinguishable from
+    // another: the only frame record the browser could consult is the one the
+    // same renderer reports, so a per-frame table would add a leaky invariant
+    // without adding authority. The site lock *is* the trust boundary, the same
+    // one `postMessage`, `BroadcastChannel`, and storage use
+    // (`Site::authorize_origin`), and the one Chromium's process model draws
+    // (<https://chromium.googlesource.com/chromium/src/+/main/docs/process_model_and_site_isolation.md#process-locks>).
+    //
+    // `SameSite` cannot be affected by which same-site origin is claimed,
+    // because the cookie jar compares sites, not origins
+    // (`cookies::CookieOp::is_same_site_request`).
     outbound.cors = cors.with_origin(initiator.clone());
     if let Some(content_type) = &request.content_type {
         let content_type = isomorphic_encode(content_type).ok_or(DialFailure::Connect)?;

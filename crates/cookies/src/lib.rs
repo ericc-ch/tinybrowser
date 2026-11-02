@@ -1663,6 +1663,50 @@ mod tests {
         assert_eq!(jar.cookie_string(cross_site(false)), "");
     }
 
+    /// `SameSite` compares sites, so which same-site origin the renderer names
+    /// as the initiator cannot change the decision. That is why the browser
+    /// bounding that claim by the site lock is enough for cookies: every origin
+    /// it can name is either same-site with the target or not, alike
+    /// (<https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#name-same-site-and-cross-site>).
+    #[test]
+    fn samesite_reads_the_initiators_site_not_its_origin() {
+        let page = url("https://api.example.com/");
+        let mut jar = CookieJar::default();
+        assert!(jar.store("strict=1; SameSite=Strict", http(&page, at(NOW))));
+        for initiator in [
+            None,
+            Some(url("https://example.com/").origin()),
+            Some(url("https://www.example.com/").origin()),
+            Some(url("https://www.example.com:8443/").origin()),
+            Some(url("https://api.example.com/").origin()),
+        ] {
+            let request = CookieOp {
+                initiator: initiator.as_ref(),
+                ..http(&page, at(NOW))
+            };
+            assert_eq!(
+                jar.cookie_string(request),
+                "strict=1",
+                "{initiator:?} is same-site with the target"
+            );
+        }
+        for initiator in [
+            url("https://other.test/").origin(),
+            url("http://example.com/").origin(),
+        ] {
+            let request = CookieOp {
+                initiator: Some(&initiator),
+                ..http(&page, at(NOW))
+            };
+            assert_eq!(
+                jar.cookie_string(request),
+                "",
+                "{}",
+                initiator.ascii_serialization()
+            );
+        }
+    }
+
     #[test]
     fn domain_cookie_matches_subdomains_but_not_lookalikes() {
         let page = url("https://www.example.com/");
