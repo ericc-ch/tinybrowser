@@ -1,12 +1,14 @@
 # WPT harness
 
 tools/wpt/cli.py is the whole harness (run | score | rerun | merge | profile |
-failures | baseline | manifest | overnight | selftest). It needs a dev-shell
-Python, so call it through `nix develop --command`. Builds the wpt-profile
-binary via cargo each run; --binary PATH uses a prebuilt binary as-is.
+failures | baseline | manifest | fast | overnight | selftest). It needs a
+dev-shell Python, so call it through `nix develop --command`. Builds the
+wpt-profile binary via cargo each run; --binary PATH uses a prebuilt binary
+as-is.
 
     nix develop --command python3 tools/wpt/cli.py run dom/events/ --exclude=worker
     nix develop --command python3 tools/wpt/cli.py run --score dom/nodes/ -- --processes 4
+    nix develop --command python3 tools/wpt/cli.py fast test/language --jobs 12
 
 Paths and our flags first; literal -- starts upstream flags.
 --exclude=worker skips Worker variants too. Prove with `... selftest`.
@@ -22,6 +24,18 @@ the wptreport; rerun feeds attention-tests back (TIMEOUTs excluded
 unless --include-timeout); --dry-run lists the selection. profile
 ranks tests by wall time with --report, or runs a path and prints the
 browser's navigation/request timeline.
+
+`fast` is the native test262 lane: tools/wpt-fast runs each `.js` file in a
+fresh QuickJS context with the test262 harness, no HTML, testharness.js,
+wptserve, or WebDriver. The suite is read-only; strict variants are a
+`"use strict";` prefix added in memory. It emits a wptreport with
+`--report FILE`; `--baseline FILE` diffs the next run against that report
+and exits 1 on a regression. The report has no WPT metadata, so every
+failure in it reads as unexpected to `cli.py`; it is a native baseline, not
+a replacement for the full score. Module tests load through QuickJS's module
+loader; import attributes (JSON/text) and `$262.agent` are not implemented
+yet. On this machine the 53,640 test262 files take ~27 s wall across 12 jobs
+(~2m25s CPU) versus 20,587 s in the harness.
 
 A conformance change is a failure-list diff: failures prints the
 canonical list of a --score log, baseline runs both sides in a detached

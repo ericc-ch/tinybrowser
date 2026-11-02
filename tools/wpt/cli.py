@@ -11,6 +11,7 @@ scheduling, driving, and reporting. This file owns the phases around it:
 * `failures` — print the canonical failure list from a `--score` log.
 * `baseline` — run a slice at two revisions, diff the failure lists.
 * `manifest` — one manifest walk for a chunked CI run (build job).
+* `fast`    — native test262 lane: no HTML, testharness, or wptserve.
 * `overnight` — full-suite run + score (needs explicit approval per AGENTS.md).
 
 `tinybrowser_wpt.py` stays separate: upstream imports it as the
@@ -1559,8 +1560,17 @@ def build_binary(options: Options) -> Path:
             f"wpt: using the --binary override without a freshness check: {override}"
         )
         return Path(override)
+    return build_profile_binary("tinybrowser")
+
+
+def build_fast_binary() -> Path:
+    """Builds and returns the native test262 runner."""
+    return build_profile_binary("wpt-fast")
+
+
+def build_profile_binary(name: str) -> Path:
     out = subprocess.run(
-        [str(ROOT / "tools" / "binary-path"), "--profile", "wpt"],
+        [str(ROOT / "tools" / "binary-path"), "--profile", "wpt", name],
         cwd=str(ROOT),
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
@@ -1570,18 +1580,21 @@ def build_binary(options: Options) -> Path:
     # The `wpt` profile (see the root Cargo.toml) keeps dev's assertions but
     # optimizes the code: file timeouts must measure the engine, not a `-O0`
     # build spending the budget inside QuickJS.
-    eprint("wpt: building tinybrowser (cargo no-ops when fresh)")
+    eprint(f"wpt: building {name} (cargo no-ops when fresh)")
     # cargo's fingerprint tracks every compiled input; a failure means the
     # binary would be stale, so refuse instead of running against it.
+    build = ["cargo", "build", "-q"]
+    if name != "tinybrowser":
+        build.extend(["-p", name])
     ret = subprocess.run(
-        ["cargo", "build", "-q", "--profile", "wpt", "--offline"], cwd=str(ROOT)
+        [*build, "--profile", "wpt", "--offline"], cwd=str(ROOT)
     ).returncode
     if ret != 0:
         ret = subprocess.run(
-            ["cargo", "build", "-q", "--profile", "wpt"], cwd=str(ROOT)
+            [*build, "--profile", "wpt"], cwd=str(ROOT)
         ).returncode
     if ret != 0:
-        eprint("wpt: cargo build failed; refusing to run against a stale binary")
+        eprint(f"wpt: cargo build failed; refusing to run against a stale {name}")
         raise SystemExit(1)
     return binary
 
@@ -1838,6 +1851,38 @@ def run_main(options: Options, argv: list[str]) -> int:
     if error:
         return die("run", error, 2)
     return run_wpt(wpt, venv, exe, binary, [*paths, *final], manifest, record, options)
+
+
+# --- `fast` (native test262 lane) ---
+
+
+def fast_main(options: Options, argv: list[str]) -> int:
+    """`fast` — run test262 natively, without HTML, testharness, or wptserve.
+
+    The runner reads `third_party/wpt/third_party/test262` and never writes
+    into it. It emits a wptreport with `--report`, and `--baseline` diffs the
+    next run against that report. Strict variants are a prefix added in
+    memory, so the checkout stays exactly at the pinned submodule revision.
+    """
+    wpt = resolve_wpt_root(options)
+    if not (wpt / "wpt").is_file():
+        eprint(f"WPT checkout not found at {wpt}")
+        eprint("Initialize it with: git submodule update --init third_party/wpt")
+        eprint("or pass --wpt-root with an initialized checkout.")
+        return 1
+    wpt = Path(os.path.realpath(wpt))
+    if check_pin(wpt, options) != 0:
+        return 1
+    test262 = wpt / "third_party" / "test262"
+    if not test262.is_dir():
+        return die("fast", f"no test262 suite at {test262}", 1)
+    binary = build_fast_binary()
+    command = [str(binary), "--test262-root", str(test262), *argv]
+    eprint("wpt: " + " ".join(command))
+    try:
+        return subprocess.run(command, cwd=str(ROOT), check=False).returncode
+    except OSError as error:
+        return die("fast", f"cannot run {binary}: {error}")
 
 
 # --- `manifest` (one walk for a whole chunked CI run) ---
@@ -2875,7 +2920,7 @@ def _selftest_merge() -> None:
             assert merge_main([str(empty)]) == 1
 
 
-TOP_HELP = """tinybrowser WPT harness: run | score | rerun | merge | profile | failures | baseline | manifest | overnight | selftest
+TOP_HELP = """tinybrowser WPT harness: run | score | rerun | merge | profile | failures | baseline | manifest | fast | overnight | selftest
 
   run PATH... [--score] [--dry-run] [-- upstream-flags...]
     Run WPT. Upstream flags follow `--` (or start implicitly at the first
@@ -2911,6 +2956,11 @@ TOP_HELP = """tinybrowser WPT harness: run | score | rerun | merge | profile | f
   manifest
     Build MANIFEST.json plus its stamp once per chunked CI run, so chunk
     jobs can skip the tree walk. The stamp only ever makes runs faster.
+  fast [FILTER...] [--jobs N] [--report FILE] [--baseline FILE]
+    Run test262 in-process with QuickJS, without HTML, testharness.js,
+    wptserve, or WebDriver. The suite is read-only. --report writes a
+    wptreport the other readers understand; --baseline compares with an
+    earlier --report and exits 1 on a regression.
   overnight [--save-report FILE] [--dry-run] [-- runner...]
     Full-suite run + score. Long; needs explicit approval per AGENTS.md.
   selftest
@@ -2968,6 +3018,8 @@ def main(argv: list[str] | None = None) -> int:
         return baseline_main(options, args)
     if command == "manifest":
         return manifest_main(options, args)
+    if command == "fast":
+        return fast_main(options, args)
     if command == "overnight":
         return overnight_main(options, args)
     if command == "_inner":
@@ -2980,7 +3032,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     return die(
         "wpt",
-        f"unknown command {command}; expected run | score | rerun | merge | profile | failures | baseline | manifest | overnight | selftest",
+        f"unknown command {command}; expected run | score | rerun | merge | profile | failures | baseline | manifest | fast | overnight | selftest",
         2,
     )
 

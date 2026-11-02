@@ -1,0 +1,506 @@
+//! One test262 file, run in a fresh `QuickJS` context.
+//!
+//! The harness follows TC39's INTERPRETING.md and the WPT reporter's existing
+//! choices: `assert.js` and `sta.js` first, then the declared includes, then
+//! the test. Async tests use `print`/`$DONE`, and negative tests check the
+//! constructor name of the uncaught value.
+
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::time::{Duration, Instant};
+
+use rquickjs::{
+    ArrayBuffer, CaughtError, Context, Ctx, Function, Module, Object, Runtime, Value,
+    context::EvalOptions,
+};
+
+use crate::meta::{Meta, Phase};
+
+/// The verdict for one file.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Status {
+    /// The test harness reported success.
+    Pass,
+    /// An assertion, expected error, or harness step failed.
+    Fail,
+    /// The runner cannot execute this test yet.
+    Skip,
+}
+
+impl Status {
+    /// The status spelling a wptreport uses.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pass => "PASS",
+            Self::Fail => "FAIL",
+            Self::Skip => "SKIP",
+        }
+    }
+}
+
+/// One file selected from the suite.
+#[derive(Clone, Debug)]
+pub struct TestCase {
+    /// Path relative to the test262 root, with `/` separators.
+    pub relative: String,
+    /// Whether this is the strict variant.
+    pub strict: bool,
+    /// Source text, read once before workers start.
+    pub source: String,
+    /// Parsed frontmatter.
+    pub meta: Meta,
+}
+
+impl TestCase {
+    /// The identifier WPT uses for this test.
+    ///
+    /// WPT replaces the `.js` extension with the wrapper suffix; it does not
+    /// append to it. The manifest must agree with the report or a baseline
+    /// diff cannot match a single test.
+    #[must_use]
+    pub fn wpt_id(&self) -> String {
+        let stem = self
+            .relative
+            .strip_suffix(".js")
+            .unwrap_or(&self.relative);
+        let suffix = if self.strict {
+            ".test262.strict.html"
+        } else {
+            ".test262.html"
+        };
+        format!("/third_party/test262/{stem}{suffix}")
+    }
+}
+
+/// The outcome of one file.
+#[derive(Clone, Debug)]
+pub struct Outcome {
+    /// wptreport test identifier.
+    pub id: String,
+    /// Harness verdict.
+    pub status: Status,
+    /// Failure or skip reason.
+    pub message: Option<String>,
+    /// Wall time spent in this file.
+    pub duration: Duration,
+}
+
+/// Sources every test can ask for, read once per process.
+pub struct Harness {
+    /// Test262 root, used by the module loader.
+    pub root: PathBuf,
+    /// `harness/**/*.js`, keyed by the name test262 includes.
+    pub scripts: BTreeMap<String, String>,
+}
+
+impl Harness {
+    /// Reads every harness script below `root/harness`.
+    ///
+    /// # Errors
+    ///
+    /// The harness directory or one of its scripts cannot be read.
+    pub fn load(root: &Path) -> std::io::Result<Self> {
+        let harness_root = root.join("harness");
+        let mut scripts = BTreeMap::new();
+        collect_scripts(&harness_root, &harness_root, &mut scripts)?;
+        Ok(Self {
+            root: root.to_path_buf(),
+            scripts,
+        })
+    }
+}
+
+/// Reads every `.js` below `directory`, keyed relative to `base`.
+fn collect_scripts(
+    base: &Path,
+    directory: &Path,
+    scripts: &mut BTreeMap<String, String>,
+) -> std::io::Result<()> {
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_scripts(base, &path, scripts)?;
+        } else if path.extension().is_some_and(|extension| extension == "js") {
+            let name = path
+                .strip_prefix(base)
+                .map_err(std::io::Error::other)?
+                .to_string_lossy()
+                .replace('\\', "/");
+            scripts.insert(name, fs::read_to_string(&path)?);
+        }
+    }
+    Ok(())
+}
+
+/// Runs one case. The caller owns the runtime, so a worker reuses it across
+/// files.
+#[must_use]
+pub fn run(runtime: &Runtime, harness: &Harness, case: &TestCase) -> Outcome {
+    let started = Instant::now();
+    let verdict = if case.meta.is_module() {
+        run_module(runtime, harness, case)
+    } else if case.meta.is_only_strict() && !case.strict || case.meta.is_no_strict() && case.strict
+    {
+        Verdict::Skip("variant excluded by strict flags".into())
+    } else {
+        run_file(runtime, harness, case)
+    };
+    let (status, message) = match verdict {
+        Verdict::Pass => (Status::Pass, None),
+        Verdict::Fail(message) => (Status::Fail, Some(message)),
+        Verdict::Skip(message) => (Status::Skip, Some(message)),
+    };
+    Outcome {
+        id: case.wpt_id(),
+        status,
+        message,
+        duration: started.elapsed(),
+    }
+}
+
+/// What one file produced.
+enum Verdict {
+    Pass,
+    Fail(String),
+    Skip(String),
+}
+
+/// The error a test raised.
+enum Failure {
+    /// A parse or early error, reported as a `SyntaxError`.
+    Syntax(String),
+    /// A module import did not resolve or load.
+    Resolution(String),
+    /// A thrown JavaScript value.
+    Runtime {
+        name: Option<String>,
+        message: String,
+    },
+    /// The harness itself or the host rejected the test.
+    Host(String),
+}
+
+impl Failure {
+    fn message(&self) -> String {
+        match self {
+            Self::Syntax(message) | Self::Resolution(message) | Self::Host(message) => {
+                message.clone()
+            }
+            Self::Runtime { name, message, .. } => match name {
+                Some(name) => format!("{name}: {message}"),
+                None => message.clone(),
+            },
+        }
+    }
+
+    fn matches(&self, expected: Option<&str>) -> bool {
+        let Some(expected) = expected else {
+            return true;
+        };
+        match self {
+            Self::Runtime { name, .. } => name.as_deref() == Some(expected),
+            Self::Syntax(_) => expected == "SyntaxError",
+            Self::Resolution(_) | Self::Host(_) => false,
+        }
+    }
+}
+
+fn run_file(runtime: &Runtime, harness: &Harness, case: &TestCase) -> Verdict {
+    let async_result: Rc<RefCell<Option<Result<(), String>>>> = Rc::new(RefCell::new(None));
+    let context = match Context::full(runtime) {
+        Ok(context) => context,
+        Err(error) => return Verdict::Fail(format!("context: {error}")),
+    };
+    let mut failure = None;
+    context.with(|ctx| {
+        failure = prepare(&ctx, harness, case, Rc::clone(&async_result));
+        if failure.is_some() {
+            return;
+        }
+        let body = if case.strict {
+            format!("\"use strict\";\n{}", case.source)
+        } else {
+            case.source.clone()
+        };
+        if let Err(error) = eval(&ctx, &body) {
+            failure = Some(error);
+        }
+    });
+    if let Some(failure) = failure {
+        return classify_failure(&case.meta, &failure);
+    }
+    finish_async(runtime, &case.meta, &async_result)
+}
+
+/// Runs a `flags: [module]` file through `QuickJS`'s module loader.
+///
+/// Modules are strict by definition. Top-level await resolves through
+/// `Promise::finish`, which drives pending jobs until the module settles.
+fn run_module(runtime: &Runtime, harness: &Harness, case: &TestCase) -> Verdict {
+    let async_result: Rc<RefCell<Option<Result<(), String>>>> = Rc::new(RefCell::new(None));
+    let context = match Context::full(runtime) {
+        Ok(context) => context,
+        Err(error) => return Verdict::Fail(format!("context: {error}")),
+    };
+    let mut failure = None;
+    context.with(|ctx| {
+        failure = prepare(&ctx, harness, case, Rc::clone(&async_result));
+        if failure.is_some() {
+            return;
+        }
+        let promise = match Module::evaluate(ctx.clone(), case.relative.clone(), case.source.clone())
+        {
+            Ok(promise) => promise,
+            Err(error) => {
+                failure = Some(failure_from_error(&ctx, error));
+                return;
+            }
+        };
+        let settled = promise.finish::<()>();
+        while ctx.execute_pending_job() {}
+        if let Err(error) = settled {
+            failure = Some(failure_from_error(&ctx, error));
+        }
+    });
+    if let Some(failure) = failure {
+        return classify_failure(&case.meta, &failure);
+    }
+    finish_async(runtime, &case.meta, &async_result)
+}
+
+/// Installs the host and runs the harness scripts a test is built on.
+fn prepare(
+    ctx: &Ctx<'_>,
+    harness: &Harness,
+    case: &TestCase,
+    async_result: Rc<RefCell<Option<Result<(), String>>>>,
+) -> Option<Failure> {
+    if let Err(error) = install_host(ctx, async_result) {
+        return Some(Failure::Host(error));
+    }
+    for name in ["assert.js", "sta.js"] {
+        let Some(source) = harness.scripts.get(name) else {
+            return Some(Failure::Host(format!("missing harness {name}")));
+        };
+        if let Err(error) = eval(ctx, source) {
+            return Some(Failure::Host(format!("harness {name}: {}", error.message())));
+        }
+    }
+    for include in &case.meta.includes {
+        let Some(source) = harness.scripts.get(include) else {
+            return Some(Failure::Host(format!("missing include {include}")));
+        };
+        if let Err(error) = eval(ctx, source) {
+            return Some(Failure::Host(format!(
+                "include {include}: {}",
+                error.message()
+            )));
+        }
+    }
+    if case.meta.is_async()
+        && let Some(source) = harness.scripts.get("doneprintHandle.js")
+        && let Err(error) = eval(ctx, source)
+    {
+        return Some(Failure::Host(format!(
+            "doneprintHandle.js: {}",
+            error.message()
+        )));
+    }
+    None
+}
+
+/// Applies the async result after a test that declared `async`.
+fn finish_async(
+    runtime: &Runtime,
+    meta: &Meta,
+    async_result: &Rc<RefCell<Option<Result<(), String>>>>,
+) -> Verdict {
+    if !meta.is_async() {
+        return Verdict::Pass;
+    }
+    if let Err(error) = drain_jobs(runtime) {
+        return Verdict::Fail(format!("pending job: {error}"));
+    }
+    match async_result.borrow_mut().take() {
+        Some(Ok(())) => Verdict::Pass,
+        Some(Err(error)) => Verdict::Fail(error),
+        None => Verdict::Fail("async test never called $DONE".into()),
+    }
+}
+
+/// Applies `negative:` metadata to the error the file raised.
+fn classify_failure(meta: &Meta, failure: &Failure) -> Verdict {
+    let Some(negative) = &meta.negative else {
+        return Verdict::Fail(failure.message());
+    };
+    let expected = negative.error_type.as_deref();
+    if negative.phase != Phase::Runtime
+        && matches!(failure, Failure::Syntax(_) | Failure::Resolution(_))
+    {
+        return Verdict::Pass;
+    }
+    if failure.matches(expected) {
+        return Verdict::Pass;
+    }
+    let expected = expected.unwrap_or("an exception");
+    Verdict::Fail(format!("expected {expected}, got {}", failure.message()))
+}
+
+/// Installs `print` and `$262` into a fresh context.
+fn install_host(
+    ctx: &Ctx<'_>,
+    async_result: Rc<RefCell<Option<Result<(), String>>>>,
+) -> Result<(), String> {
+    let print = Function::new(ctx.clone(), move |message: String| {
+        if message == "Test262:AsyncTestComplete" {
+            *async_result.borrow_mut() = Some(Ok(()));
+        } else if let Some(reason) = message.strip_prefix("Test262:AsyncTestFailure:") {
+            *async_result.borrow_mut() = Some(Err(reason.to_owned()));
+        }
+    })
+    .map_err(|error| error.to_string())?;
+    ctx.globals()
+        .set("print", print)
+        .map_err(|error| error.to_string())?;
+
+    let host = Object::new(ctx.clone()).map_err(|error| error.to_string())?;
+    host.set("global", ctx.globals())
+        .map_err(|error| error.to_string())?;
+    let eval_script = Function::new(ctx.clone(), |ctx: Ctx<'_>, source: String| {
+        let mut options = EvalOptions::default();
+        options.strict = false;
+        ctx.eval_with_options::<(), _>(source, options)
+    })
+    .map_err(|error| error.to_string())?;
+    host.set("evalScript", eval_script)
+        .map_err(|error| error.to_string())?;
+    let detach = Function::new(ctx.clone(), |mut buffer: ArrayBuffer<'_>| {
+        buffer.detach();
+    })
+    .map_err(|error| error.to_string())?;
+    host.set("detachArrayBuffer", detach)
+        .map_err(|error| error.to_string())?;
+    // `Ctx::run_gc` calls QuickJS directly and does not take the runtime lock
+    // the callback already holds, unlike `Runtime::run_gc`.
+    let gc = Function::new(ctx.clone(), |ctx: Ctx<'_>| ctx.run_gc())
+        .map_err(|error| error.to_string())?;
+    host.set("gc", gc).map_err(|error| error.to_string())?;
+    ctx.globals()
+        .set("$262", host)
+        .map_err(|error| error.to_string())
+}
+
+/// Evaluates one script in sloppy mode and maps a thrown value to a
+/// [`Failure`].
+///
+/// test262 runs non-strict tests in sloppy mode, and a strict variant adds its
+/// own `"use strict";` prefix. `Ctx::eval` defaults to strict, so every script
+/// goes through `EvalOptions` explicitly.
+fn eval(ctx: &Ctx<'_>, source: &str) -> Result<(), Failure> {
+    let mut options = EvalOptions::default();
+    options.strict = false;
+    ctx.eval_with_options::<(), _>(source, options)
+        .map_err(|error| failure_from_error(ctx, error))
+}
+
+/// Maps a `QuickJS` error to a [`Failure`], taking the pending JS value when
+/// there is one.
+fn failure_from_error(ctx: &Ctx<'_>, error: rquickjs::Error) -> Failure {
+    match CaughtError::from_error(ctx, error) {
+        CaughtError::Exception(exception) => exception_failure(&exception),
+        CaughtError::Value(value) => value_failure(&value),
+        CaughtError::Error(error) => match error {
+            rquickjs::Error::Resolving { .. } | rquickjs::Error::Loading { .. } => {
+                Failure::Resolution(error.to_string())
+            }
+            other => Failure::Host(other.to_string()),
+        },
+    }
+}
+
+/// Maps a JavaScript exception object to a [`Failure`].
+fn exception_failure(exception: &rquickjs::Exception<'_>) -> Failure {
+    let name = constructor_name(exception.as_object());
+    let message = exception.message().unwrap_or_default();
+    if name.as_deref() == Some("SyntaxError") {
+        Failure::Syntax(message)
+    } else {
+        Failure::Runtime { name, message }
+    }
+}
+
+/// The `constructor.name` a thrown object reports.
+fn constructor_name(object: &Object<'_>) -> Option<String> {
+    object
+        .get::<_, Function<'_>>("constructor")
+        .and_then(|constructor| constructor.get::<_, String>("name"))
+        .ok()
+}
+
+/// Maps a thrown non-`Error` value to a [`Failure`].
+///
+/// `Test262Error` is deliberately not an `Error` subclass, so the harness's
+/// own assertion failure arrives here as a plain object.
+fn value_failure(value: &Value<'_>) -> Failure {
+    let Some(object) = value.as_object() else {
+        return Failure::Runtime {
+            name: None,
+            message: value
+                .as_string()
+                .and_then(|value| value.to_string().ok())
+                .unwrap_or_else(|| format!("{value:?}")),
+        };
+    };
+    let name = constructor_name(object);
+    let message = object
+        .get::<_, Option<String>>("message")
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| format!("{value:?}"));
+    Failure::Runtime { name, message }
+}
+
+/// Runs promise jobs until none remain.
+fn drain_jobs(runtime: &Runtime) -> Result<(), String> {
+    loop {
+        match runtime.execute_pending_job() {
+            Ok(true) => {}
+            Ok(false) => return Ok(()),
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::meta::Meta;
+
+    use super::TestCase;
+
+    #[test]
+    fn the_wpt_id_replaces_the_js_extension() {
+        let case = TestCase {
+            relative: "test/language/arguments-object/10.5-1-s.js".into(),
+            strict: true,
+            source: String::new(),
+            meta: Meta::default(),
+        };
+        assert_eq!(
+            case.wpt_id(),
+            "/third_party/test262/test/language/arguments-object/10.5-1-s.test262.strict.html"
+        );
+        let case = TestCase {
+            strict: false,
+            ..case
+        };
+        assert_eq!(
+            case.wpt_id(),
+            "/third_party/test262/test/language/arguments-object/10.5-1-s.test262.html"
+        );
+    }
+}

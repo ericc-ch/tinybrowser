@@ -1,0 +1,297 @@
+//! Native test262 runner: the fast lane for the 53k pure-JavaScript tests.
+//!
+//! The WPT harness wraps every test262 file in an HTML page with
+//! testharness.js and a document realm. That costs ~384 ms per file in the
+//! nightly. This runner evaluates the same file in a fresh `QuickJS` context
+//! with the test262 harness, under a millisecond per file, and emits a
+//! wptreport the existing readers understand.
+//!
+//! The suite is read-only. Strict variants are a `"use strict";` prefix added
+//! while evaluating, never a generated file in the checkout.
+
+mod meta;
+mod modules;
+mod report;
+mod runner;
+mod suite;
+
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
+use std::time::Instant;
+
+use rquickjs::Runtime;
+
+use runner::{Harness, Outcome, Status, TestCase};
+
+/// Parsed command line.
+struct Options {
+    root: PathBuf,
+    filters: Vec<String>,
+    jobs: usize,
+    report: Option<PathBuf>,
+    baseline: Option<PathBuf>,
+    verbose: bool,
+    list: bool,
+    limit: Option<usize>,
+}
+
+fn main() {
+    let options = match parse_args() {
+        Ok(options) => options,
+        Err(message) => {
+            eprintln!("wpt-fast: {message}");
+            eprintln!("{HELP}");
+            std::process::exit(2);
+        }
+    };
+    if !options.root.is_dir() {
+        eprintln!(
+            "wpt-fast: {} is not a test262 checkout; pass --test262-root",
+            options.root.display()
+        );
+        std::process::exit(2);
+    }
+    let cases = match suite::select(&options.root, &options.filters) {
+        Ok(cases) => cases,
+        Err(error) => {
+            eprintln!("wpt-fast: cannot read suite: {error}");
+            std::process::exit(2);
+        }
+    };
+    let cases = match options.limit {
+        Some(limit) => &cases[..cases.len().min(limit)],
+        None => &cases[..],
+    };
+    if cases.is_empty() {
+        eprintln!("wpt-fast: no tests selected");
+        std::process::exit(2);
+    }
+    if options.list {
+        for case in cases {
+            println!("{}{}", case.relative, if case.strict { " (strict)" } else { "" });
+        }
+        return;
+    }
+    let harness = match Harness::load(&options.root) {
+        Ok(harness) => harness,
+        Err(error) => {
+            eprintln!("wpt-fast: cannot read harness: {error}");
+            std::process::exit(2);
+        }
+    };
+    let started = Instant::now();
+    let outcomes = run_all(cases, &harness, options.jobs);
+    let wall = started.elapsed();
+    summarize(&outcomes, wall, options.verbose);
+    if let Some(path) = &options.report
+        && let Err(error) = report::write_report(path, &outcomes)
+    {
+        eprintln!("wpt-fast: cannot write {}: {error}", path.display());
+        std::process::exit(2);
+    }
+    if let Some(baseline) = &options.baseline {
+        match report::compare(baseline, &outcomes) {
+            Ok(comparison) => {
+                print_comparison(&comparison);
+                if comparison.failed() {
+                    std::process::exit(1);
+                }
+            }
+            Err(error) => {
+                eprintln!("wpt-fast: cannot compare {}: {error}", baseline.display());
+                std::process::exit(2);
+            }
+        }
+    }
+}
+
+/// Runs every case, one runtime per worker.
+fn run_all(cases: &[TestCase], harness: &Harness, jobs: usize) -> Vec<Outcome> {
+    let next = AtomicUsize::new(0);
+    let (sender, receiver) = mpsc::channel();
+    let workers = jobs.clamp(1, cases.len());
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            let sender = sender.clone();
+            let next = &next;
+            scope.spawn(move || {
+                let runtime = Runtime::new().unwrap_or_else(|error| {
+                    eprintln!("wpt-fast: cannot create QuickJS runtime: {error}");
+                    std::process::exit(2);
+                });
+                runtime.set_loader(
+                    modules::SuiteResolver,
+                    modules::SuiteLoader {
+                        root: harness.root.clone(),
+                    },
+                );
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(case) = cases.get(index) else {
+                        break;
+                    };
+                    let outcome = runner::run(&runtime, harness, case);
+                    if sender.send((index, outcome)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(sender);
+        let mut slots: Vec<Option<Outcome>> = (0..cases.len()).map(|_| None).collect();
+        for (index, outcome) in receiver {
+            slots[index] = Some(outcome);
+        }
+        slots
+            .into_iter()
+            .enumerate()
+            .map(|(index, outcome)| {
+                outcome.unwrap_or_else(|| Outcome {
+                    id: cases[index].wpt_id(),
+                    status: Status::Skip,
+                    message: Some("worker stopped before this test".into()),
+                    duration: std::time::Duration::ZERO,
+                })
+            })
+            .collect()
+    })
+}
+
+/// Prints counts and the slowest files.
+fn summarize(outcomes: &[Outcome], wall: std::time::Duration, verbose: bool) {
+    let mut pass = 0;
+    let mut fail = 0;
+    let mut skip = 0;
+    let mut failures = Vec::new();
+    let mut slowest: Vec<&Outcome> = outcomes.iter().collect();
+    for outcome in outcomes {
+        match outcome.status {
+            Status::Pass => pass += 1,
+            Status::Fail => {
+                fail += 1;
+                failures.push(outcome);
+            }
+            Status::Skip => skip += 1,
+        }
+    }
+    slowest.sort_by_key(|outcome| std::cmp::Reverse(outcome.duration));
+    let count = u32::try_from(outcomes.len()).unwrap_or(u32::MAX);
+    println!(
+        "{} tests in {:.1?} ({:.2} ms/test): {pass} pass, {fail} fail, {skip} skip",
+        outcomes.len(),
+        wall,
+        wall.as_secs_f64() * 1000.0 / f64::from(count)
+    );
+    if verbose {
+        for outcome in failures {
+            println!(
+                "FAIL {} :: {}",
+                outcome.id,
+                outcome.message.as_deref().unwrap_or("")
+            );
+        }
+        for outcome in slowest.iter().take(10) {
+            println!("SLOW {:>8.1?} {}", outcome.duration, outcome.id);
+        }
+    }
+}
+
+/// Prints what changed against the baseline.
+fn print_comparison(comparison: &report::Comparison) {
+    for test in &comparison.regressions {
+        println!("REGRESSION {test}");
+    }
+    for test in &comparison.new_failures {
+        println!("NEW-FAILURE {test}");
+    }
+    for test in &comparison.fixes {
+        println!("FIXED {test}");
+    }
+    println!(
+        "baseline diff: {} regressions, {} new failures, {} fixes, {} tests not selected",
+        comparison.regressions.len(),
+        comparison.new_failures.len(),
+        comparison.fixes.len(),
+        comparison.missing.len()
+    );
+}
+
+const HELP: &str = "\
+usage: wpt-fast [OPTIONS] [FILTER...]
+
+Runs test262 files in-process and emits a wptreport.
+
+  --test262-root PATH  checkout root (default third_party/wpt/third_party/test262)
+  --jobs N             worker threads (default: available CPUs)
+  --report PATH        write a wptreport JSON
+  --baseline PATH      compare with an earlier --report and exit 1 on regressions
+  --verbose            print failing tests and the ten slowest files
+  --list               print the selected files and exit
+  --limit N            stop after N selected files
+  -h, --help           show this help
+
+FILTER matches a path under the checkout, such as test/language or harness.";
+
+/// Parses the command line.
+fn parse_args() -> Result<Options, String> {
+    let mut options = Options {
+        root: suite::default_root(),
+        filters: Vec::new(),
+        jobs: std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
+        report: None,
+        baseline: None,
+        verbose: false,
+        list: false,
+        limit: None,
+    };
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                print!("{HELP}");
+                std::process::exit(0);
+            }
+            "--test262-root" => {
+                options.root = args
+                    .next()
+                    .map(PathBuf::from)
+                    .ok_or("--test262-root needs a path")?;
+            }
+            "--jobs" => {
+                options.jobs = args
+                    .next()
+                    .ok_or("--jobs needs a number")?
+                    .parse()
+                    .map_err(|_| "--jobs needs a number")?;
+            }
+            "--report" => {
+                options.report = Some(
+                    args.next()
+                        .map(PathBuf::from)
+                        .ok_or("--report needs a path")?,
+                );
+            }
+            "--baseline" => {
+                options.baseline = Some(
+                    args.next()
+                        .map(PathBuf::from)
+                        .ok_or("--baseline needs a path")?,
+                );
+            }
+            "--verbose" => options.verbose = true,
+            "--list" => options.list = true,
+            "--limit" => {
+                options.limit = Some(
+                    args.next()
+                        .ok_or("--limit needs a number")?
+                        .parse()
+                        .map_err(|_| "--limit needs a number")?,
+                );
+            }
+            other if other.starts_with('-') => return Err(format!("unknown flag {other}")),
+            other => options.filters.push(other.trim_start_matches('/').to_owned()),
+        }
+    }
+    Ok(options)
+}

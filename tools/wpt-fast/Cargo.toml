@@ -1,0 +1,21 @@
+[package]
+name = "wpt-fast"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+# Developer tooling only: not published, not part of the release binary.
+publish = false
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "wpt-fast"
+path = "src/main.rs"
+
+[dependencies]
+# test262 tests are pure ECMAScript; the runner needs nothing from the browser
+# crates except the same QuickJS build the engine ships.
+rquickjs = { version = "0.14.0", default-features = false, features = ["std", "loader"] }
+serde_json = "1"
