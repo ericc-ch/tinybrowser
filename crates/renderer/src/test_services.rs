@@ -78,12 +78,27 @@ impl StorageHost for NullServices {
 impl BrowsingContextHost for NullServices {
     fn window_open(
         &self,
-        _url: &Url,
+        _url: Option<&Url>,
+        _target: &crate::protocol::TargetName,
         _opener: crate::protocol::OpenerPolicy,
         _source: &crate::protocol::NavigationSource,
         _allow_popups: bool,
     ) -> Option<crate::protocol::WindowId> {
         None
+    }
+
+    fn window_by_name(&self, _name: &str) -> Option<crate::protocol::WindowId> {
+        None
+    }
+
+    fn window_navigate(
+        &self,
+        _window: crate::protocol::WindowId,
+        _name: &str,
+        _url: Option<&Url>,
+        _opener: crate::protocol::OpenerPolicy,
+        _source: &crate::protocol::NavigationSource,
+    ) {
     }
 
     fn window_close(&self, _window: crate::protocol::WindowId) {}

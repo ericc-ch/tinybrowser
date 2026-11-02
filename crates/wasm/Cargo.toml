@@ -16,5 +16,5 @@ renderer = { workspace = true }
 webstorage = { workspace = true }
 cookies = { workspace = true }
 net = { workspace = true }
-url = "2"
+url = { version = "2", features = ["serde"] }
 wit-bindgen = "0.62"

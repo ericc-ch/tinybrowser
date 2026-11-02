@@ -20,8 +20,8 @@ use crate::dom_string::DomString;
 
 use crate::js::FrameRuntime;
 use crate::js::canvas::{Canvas2D, Gradient, Pattern, SourceImage};
-use crate::messaging::{MAX_FRAMES, SharedHandle, TargetName};
-use crate::protocol::{FrameId, StorageChange, StorageError, StorageKey, StorageKind};
+use crate::messaging::{MAX_FRAMES, SharedHandle};
+use crate::protocol::{FrameId, StorageChange, StorageError, StorageKey, StorageKind, TargetName};
 
 pub(crate) use crate::protocol::PolicyContainer;
 use crate::storage::PendingStorageEvent;
@@ -1377,6 +1377,10 @@ pub(crate) struct World {
     /// blob lookups and same-origin checks must reuse this value
     /// (<https://html.spec.whatwg.org/multipage/browsers.html#concept-origin>).
     pub(crate) origin: url::Origin,
+    /// The top-level traversable's origin, recorded when a child realm is
+    /// created; `None` for a top-level realm, which answers its own origin
+    /// (<https://html.spec.whatwg.org/multipage/webappapis.html#concept-environment-top-level-origin>).
+    pub(crate) top_level: Option<url::Origin>,
     /// This document's policy container.
     pub(crate) policy: PolicyContainer,
     /// The sandboxing flags this frame's documents obey, from the `iframe`
@@ -1786,9 +1790,9 @@ impl Drop for World {
 /// What one `window.open` call resolved to before any context exists
 /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#window-open-steps>).
 pub(crate) struct WindowOpenPlan {
-    /// The URL encoded against this document; `about:blank` when the call
-    /// named none.
-    pub(crate) url: Url,
+    /// The URL encoded against this document, or `None` when the call named
+    /// no URL.
+    pub(crate) url: Option<Url>,
     /// What `noopener`, `noreferrer`, and the blob rule do to the opener.
     pub(crate) opener: crate::protocol::OpenerPolicy,
     /// Whether the call returns no `WindowProxy` even though the context it
@@ -1818,6 +1822,7 @@ impl World {
             document: None,
             owned: HashSet::new(),
             origin: document_url.origin(),
+            top_level: None,
             referrer_url: document_url.clone(),
             document_referrer: None,
             document_url,
@@ -2081,20 +2086,13 @@ impl World {
     /// The origin of this frame's top-level traversable
     /// (<https://html.spec.whatwg.org/multipage/webappapis.html#concept-environment-top-level-origin>).
     ///
-    /// A top-level frame answers its own origin. A child realm only exists
-    /// inside the top-level realm that created it, so that realm is alive
-    /// whenever a child script asks.
+    /// A top-level realm answers its own origin. A child's is recorded when
+    /// the child realm is created, so it cannot be missing or change under the
+    /// caller.
     pub(crate) fn top_level_origin(&self) -> url::Origin {
-        let frame = self.frame();
-        let top = self.runtime.shared.borrow().tree.top_level(frame);
-        if top == frame {
-            return self.origin.clone();
-        }
-        self.frame_world(top)
-            .expect("a child realm's top-level realm is alive")
-            .borrow()
-            .origin
+        self.top_level
             .clone()
+            .unwrap_or_else(|| self.origin.clone())
     }
 
     /// Whether this realm's environment is a secure context. The model is
@@ -2328,18 +2326,23 @@ impl World {
         target: &TargetName,
         features: &str,
     ) -> Option<WindowOpenPlan> {
+        // A null `urlRecord` is the window open steps' "no URL": an existing
+        // context is not navigated, and a new one starts on `about:blank`
+        // (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#window-open-steps>).
         let url = if url.is_empty() {
-            crate::document::about_blank()
+            None
         } else {
-            self.resolve_relative(url)?
+            Some(self.resolve_relative(url)?)
         };
-        let blob_origin = self.object_url_origin(url.as_str());
+        let blob_origin = url
+            .as_ref()
+            .and_then(|url| self.object_url_origin(url.as_str()));
         let opener = crate::window_features::WindowFeatures::parse(features)
             .opener_policy(blob_origin.as_ref(), &self.top_level_origin());
         Some(WindowOpenPlan {
             url,
             opener,
-            withholds: opener != crate::protocol::OpenerPolicy::Keep && target.names_context(),
+            withholds: opener != crate::protocol::OpenerPolicy::Keep && target.noopener_withholds(),
             source: crate::protocol::NavigationSource {
                 origin: crate::protocol::SerializedOrigin::from(&self.origin),
                 referrer: self.referrer_url.clone(),
@@ -2348,41 +2351,41 @@ impl World {
         })
     }
 
-    /// Opens an auxiliary top-level browsing context, or returns the one a
-    /// `target` name already selects
-    /// (<https://html.spec.whatwg.org/multipage/window-object.html#dom-open>).
-    ///
-    /// `None` means this renderer cannot host the result: the caller falls back
-    /// to the browser tab that hosts cross-origin contexts. The navigation of a
-    /// context this renderer hosts is queued and applied after the caller's
-    /// script stops, so the auxiliary document exists first.
-    pub(crate) fn open_auxiliary(
+    /// Navigates the context a `target` name already selected in this
+    /// renderer, queuing the navigation so it runs after the caller's script
+    /// stops. A `None` `url` navigates nothing
+    /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#window-open-steps>).
+    pub(crate) fn navigate_selected(
         world_rc: &Rc<RefCell<World>>,
-        url: &Url,
+        frame: FrameId,
+        url: Option<&Url>,
+        opener: crate::protocol::OpenerPolicy,
+    ) {
+        let Some(url) = url else {
+            return;
+        };
+        let mut navigation = FrameNavigation::get(NavigationTarget::Frame(frame), url.to_string());
+        if opener == crate::protocol::OpenerPolicy::NoReferrer {
+            navigation = navigation.without_referrer();
+        }
+        world_rc.borrow_mut().queue_frame_navigation(navigation);
+    }
+
+    /// Creates an auxiliary top-level browsing context for `target`.
+    ///
+    /// `None` means this renderer cannot host it: either the calling document
+    /// is sandboxed without `allow-popups`, or the URL belongs to another site,
+    /// so the caller falls back to a browser tab. The navigation is queued and
+    /// applied after the caller's script stops, so the auxiliary document
+    /// exists first
+    /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#window-open-steps>).
+    pub(crate) fn create_auxiliary(
+        world_rc: &Rc<RefCell<World>>,
+        url: Option<&Url>,
         target: &TargetName,
         opener: crate::protocol::OpenerPolicy,
     ) -> Option<FrameId> {
         let current = world_rc.borrow().frame;
-        // `window.open()` with no URL navigates to about:blank; a fresh
-        // auxiliary context is already on that document.
-        let spec = url.to_string();
-        let existing = (!matches!(target, TargetName::Blank)).then(|| {
-            world_rc
-                .borrow()
-                .runtime
-                .shared
-                .borrow()
-                .tree
-                .choose_navigable(target, current)
-        });
-        if let Some(frame) = existing.flatten() {
-            let mut navigation = FrameNavigation::get(NavigationTarget::Frame(frame), spec);
-            if opener == crate::protocol::OpenerPolicy::NoReferrer {
-                navigation = navigation.without_referrer();
-            }
-            world_rc.borrow_mut().queue_frame_navigation(navigation);
-            return Some(frame);
-        }
         if !world_rc.borrow().allows_auxiliary_navigation()
             || !world_rc.borrow().may_host_auxiliary(url)
         {
@@ -2417,27 +2420,19 @@ impl World {
             return None;
         };
         (host.auxiliary)(world_rc, frame, opener);
-        if url.as_str() != "about:blank" {
-            let mut navigation = FrameNavigation::get(NavigationTarget::Frame(frame), spec);
-            if opener == crate::protocol::OpenerPolicy::NoReferrer {
-                navigation = navigation.without_referrer();
-            }
-            world_rc.borrow_mut().queue_frame_navigation(navigation);
-        }
+        World::navigate_selected(world_rc, frame, url, opener);
         Some(frame)
     }
 
-    /// Whether a new auxiliary context for `spec` belongs in this renderer.
+    /// Whether a new auxiliary context for `url` may stay in this renderer.
     ///
-    /// A blank document or one on the opener's own origin keeps the opener's
-    /// realm reachable as `window.opener` and as a same-origin `WindowProxy`;
-    /// every other URL stays with the browser tab's cross-origin context
+    /// A context with no URL starts on `about:blank`; one on the opener's own
+    /// origin keeps the opener's realm reachable as `window.opener` and as a
+    /// same-origin `WindowProxy`. Every other URL stays with the browser tab's
+    /// cross-origin context
     /// (<https://html.spec.whatwg.org/multipage/browsers.html#concept-origin>).
-    fn may_host_auxiliary(&self, url: &Url) -> bool {
-        if url.scheme() == "about" {
-            return true;
-        }
-        url.origin() == self.origin
+    fn may_host_auxiliary(&self, url: Option<&Url>) -> bool {
+        url.is_none_or(|url| url.scheme() == "about" || url.origin() == self.origin)
     }
 
     /// Queues a classic inline script that could not run in the realm that

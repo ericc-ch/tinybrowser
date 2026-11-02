@@ -24,6 +24,11 @@ use super::{
 pub(crate) struct TabRegistry {
     tabs: Arc<Mutex<HashMap<TabId, TabTask>>>,
     openers: Arc<Mutex<HashMap<TabId, TabId>>>,
+    /// Target names of tabs web content opened. The browsing context group is
+    /// what `window.open`'s name lookup searches, so the names are keyed by
+    /// tab and resolved through the opener chain
+    /// (<https://html.spec.whatwg.org/multipage/document-sequences.html#the-rules-for-choosing-a-navigable>).
+    names: Arc<Mutex<HashMap<TabId, String>>>,
 }
 
 impl TabRegistry {
@@ -31,7 +36,36 @@ impl TabRegistry {
         Self {
             tabs: Arc::new(Mutex::new(HashMap::new())),
             openers: Arc::new(Mutex::new(HashMap::new())),
+            names: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// The tab `caller`'s browsing context group holds under `name`, when one
+    /// is open. The group is the opener chain's root, so a name opened by one
+    /// tab is visible to every tab in the same group and to no other.
+    pub(crate) fn find_by_name(&self, caller: TabId, name: &str) -> Option<TabId> {
+        let openers = self.openers.lock().unwrap_or_else(PoisonError::into_inner);
+        let root = group_root(&openers, caller);
+        self.names
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .find(|(id, named)| named.as_str() == name && group_root(&openers, **id) == root)
+            .map(|(id, _)| *id)
+    }
+
+    fn set_name(&self, id: TabId, name: String) {
+        self.names
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(id, name);
+    }
+
+    fn remove_name(&self, id: TabId) {
+        self.names
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&id);
     }
 
     /// The handle of one live tab.
@@ -133,6 +167,22 @@ impl TabRegistry {
     }
 }
 
+/// The top-level tab of the browsing context group `tab` belongs to: the end
+/// of its opener chain. Tab ids are never reused, so a group whose root has
+/// closed keeps its identity until the last member closes.
+fn group_root(openers: &HashMap<TabId, TabId>, tab: TabId) -> TabId {
+    let mut root = tab;
+    // A chain longer than the table is a cycle, which cannot be built; stop
+    // rather than loop if one ever is.
+    for _ in 0..=openers.len() {
+        match openers.get(&root) {
+            Some(opener) => root = *opener,
+            None => break,
+        }
+    }
+    root
+}
+
 pub(crate) struct BrowserTask {
     server: BrowserServer,
     context: BrowserContext,
@@ -230,6 +280,7 @@ impl BrowserTask {
             return Err(BrowserError::UnknownTab);
         };
         self.tabs.remove_opener(id);
+        self.tabs.remove_name(id);
         // Never wait on the tab coordinator here: the browser owner task must
         // not join a wait-for cycle with a renderer that needs it. The task
         // keeps its own lifecycle and reaps itself.
@@ -241,24 +292,23 @@ impl BrowserTask {
     fn open_window(&mut self, request: OpenWindowOptions) -> Result<TabId, BrowserError> {
         let OpenWindowOptions {
             url,
+            target,
             source,
             opener,
-            mut initiator,
+            initiator,
         } = request;
-        // `noreferrer` is the opener feature's referrer half, and the browser
-        // owns the feature's meaning: the renderer sends the document's policy
-        // and this overrides it
-        // (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#window-open-steps>).
-        if opener == renderer::OpenerPolicy::NoReferrer {
-            initiator.referrer_policy = net::ReferrerPolicy::NoReferrer;
-        }
         let handle = self.create_tab()?;
         let id = handle.id();
+        if let Some(name) = target.new_context_name() {
+            self.tabs.set_name(id, name.to_owned());
+        }
         if let (Some(source), renderer::OpenerPolicy::Keep) = (source, opener) {
             self.tabs.set_opener(id, source);
             self.context.copy_session(source, id);
         }
-        if url.as_str() != "about:blank" {
+        // A fresh tab is already on `about:blank`, so neither a missing URL
+        // nor an explicit `about:blank` needs a navigation.
+        if let Some(url) = url.filter(|url| url.as_str() != "about:blank") {
             tokio::spawn(async move {
                 let _result = handle.goto_from(url.as_str(), initiator).await;
             });

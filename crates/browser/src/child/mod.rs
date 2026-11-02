@@ -439,14 +439,16 @@ impl StorageHost for HostServices {
 impl BrowsingContextHost for HostServices {
     fn window_open(
         &self,
-        url: &Url,
+        url: Option<&Url>,
+        target: &renderer::TargetName,
         opener: OpenerPolicy,
         source: &renderer::NavigationSource,
         allow_popups: bool,
     ) -> Option<WindowId> {
         match self.call(ServiceCall::BrowsingContext(
             BrowsingContextCall::WindowOpen {
-                url: url.clone(),
+                url: url.cloned(),
+                target: target.clone(),
                 opener,
                 source: source.clone(),
                 allow_popups,
@@ -455,6 +457,36 @@ impl BrowsingContextHost for HostServices {
             Some(ServiceReply::Window(tab)) => tab,
             _ => None,
         }
+    }
+
+    fn window_by_name(&self, name: &str) -> Option<WindowId> {
+        match self.call(ServiceCall::BrowsingContext(
+            BrowsingContextCall::WindowByName {
+                name: name.to_owned(),
+            },
+        )) {
+            Some(ServiceReply::Window(tab)) => tab,
+            _ => None,
+        }
+    }
+
+    fn window_navigate(
+        &self,
+        window: WindowId,
+        name: &str,
+        url: Option<&Url>,
+        opener: OpenerPolicy,
+        source: &renderer::NavigationSource,
+    ) {
+        let _result = self.call(ServiceCall::BrowsingContext(
+            BrowsingContextCall::WindowNavigate {
+                window,
+                name: name.to_owned(),
+                url: url.cloned(),
+                opener,
+                source: source.clone(),
+            },
+        ));
     }
 
     fn window_close(&self, window: WindowId) {

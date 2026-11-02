@@ -1024,10 +1024,11 @@ Object.defineProperty(globalThis, 'name', {
 })();
 
 // ── auxiliary windows ──────────────────────────────────────────────────
-// `window.open` creates a browser tab; the returned remote-window object
-// exposes `close`, `postMessage`, and the same-origin storage areas. A named
-// window is one browsing context, so reopening a live name returns the same
-// object without a session copy
+// `window.open` may create a browser tab or a same-origin frame; either way
+// the engine selects the context. This block keeps one proxy per remote tab,
+// exposing `close`, `postMessage`, and the same-origin storage areas, and
+// forgets the tab's name when `close()` runs so a later open creates a fresh
+// one
 // (<https://html.spec.whatwg.org/multipage/window-object.html#dom-open>).
 (function() {
   const remoteWindows = new __tbPrivateMap();

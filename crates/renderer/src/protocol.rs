@@ -1283,6 +1283,84 @@ pub enum OpenerPolicy {
     NoReferrer,
 }
 
+/// One browsing-context target name, parsed once from the string a page
+/// supplied
+/// (<https://html.spec.whatwg.org/multipage/document-sequences.html#valid-browsing-context-name-or-keyword>).
+///
+/// Keywords match ASCII case-insensitively. Which spelling the empty string
+/// is depends on the caller: choosing a navigable treats it as `_self`, while
+/// the window open steps treat it as `_blank`
+/// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#window-open-steps>),
+/// which is why there are two constructors instead of one default.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TargetName {
+    /// The empty string or `_self`.
+    Current,
+    /// `_parent`.
+    Parent,
+    /// `_top`.
+    Top,
+    /// `_blank`.
+    Blank,
+    /// A named context.
+    Named(String),
+}
+
+impl TargetName {
+    /// Parses a target for the rules for choosing a navigable, where the
+    /// empty string selects the current context.
+    #[must_use]
+    pub fn parse(raw: &str) -> Self {
+        if raw.is_empty() {
+            Self::Current
+        } else {
+            Self::keyword(raw).unwrap_or_else(|| Self::Named(raw.to_owned()))
+        }
+    }
+
+    /// Parses a target for the window open steps, where an absent target is
+    /// `_blank`.
+    #[must_use]
+    pub fn for_window_open(raw: &str) -> Self {
+        if raw.is_empty() {
+            Self::Blank
+        } else {
+            Self::parse(raw)
+        }
+    }
+
+    fn keyword(raw: &str) -> Option<Self> {
+        if raw.eq_ignore_ascii_case("_self") {
+            Some(Self::Current)
+        } else if raw.eq_ignore_ascii_case("_parent") {
+            Some(Self::Parent)
+        } else if raw.eq_ignore_ascii_case("_top") {
+            Some(Self::Top)
+        } else if raw.eq_ignore_ascii_case("_blank") {
+            Some(Self::Blank)
+        } else {
+            None
+        }
+    }
+
+    /// Whether `noopener` withholds the `WindowProxy` for this target: the
+    /// window open steps except `_self`, `_parent`, and `_top`
+    /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#window-open-steps>).
+    #[must_use]
+    pub fn noopener_withholds(&self) -> bool {
+        matches!(self, Self::Blank | Self::Named(_))
+    }
+
+    /// The name a newly created context carries, when the target names one.
+    #[must_use]
+    pub fn new_context_name(&self) -> Option<&str> {
+        match self {
+            Self::Named(name) => Some(name),
+            Self::Current | Self::Parent | Self::Top | Self::Blank => None,
+        }
+    }
+}
+
 /// The calling document's navigation inputs: the origin the request runs
 /// under, its `"client"` referrer source (the document URL, walked out of an
 /// `srcdoc` chain), and the policy that decides the `Referer` header.
@@ -1305,7 +1383,9 @@ pub struct NavigationSource {
 /// Browsing-context effects the page engine asks its host to perform.
 pub trait BrowsingContextHost: Send + Sync + 'static {
     /// `window.open(url, target, features)`; `None` when the browser refused
-    /// to open a window. `url` is absolute, or empty for `about:blank`.
+    /// to open a window. `url` is absolute, or `None` when the call named no
+    /// URL, which an existing context must not navigate and a new one starts
+    /// on `about:blank` anyway.
     ///
     /// `source` is the calling document's origin, referrer source, and policy.
     /// `noreferrer` is not applied here: the browser folds it into the policy
@@ -1316,11 +1396,30 @@ pub trait BrowsingContextHost: Send + Sync + 'static {
     /// <https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
     fn window_open(
         &self,
-        url: &Url,
+        url: Option<&Url>,
+        target: &TargetName,
         opener: OpenerPolicy,
         source: &NavigationSource,
         allow_popups: bool,
     ) -> Option<WindowId>;
+
+    /// The browser tab this tab's browsing context group holds under `name`,
+    /// if any
+    /// (<https://html.spec.whatwg.org/multipage/document-sequences.html#the-rules-for-choosing-a-navigable>).
+    fn window_by_name(&self, name: &str) -> Option<WindowId>;
+
+    /// Navigates a browser tab `target` already selected under `name`. The
+    /// browser re-runs the lookup, so a renderer cannot navigate a tab outside
+    /// its own browsing context group. A `None` `url` is the window open
+    /// steps' null `urlRecord`, which navigates nothing.
+    fn window_navigate(
+        &self,
+        window: WindowId,
+        name: &str,
+        url: Option<&Url>,
+        opener: OpenerPolicy,
+        source: &NavigationSource,
+    );
 
     /// `window.close()` on a window this realm opened.
     fn window_close(&self, window: WindowId);
@@ -1834,5 +1933,73 @@ mod serialized_origin_tests {
         let opaque = SerializedOrigin::Opaque;
         assert!(opaque.is_opaque());
         assert_eq!(opaque.to_url(), None);
+    }
+}
+
+#[cfg(test)]
+mod target_name_tests {
+    use super::TargetName;
+
+    /// Choosing a navigable treats an empty target as `_self`; the window open
+    /// steps treat it as `_blank`. Keywords match ASCII case-insensitively and
+    /// every other name stays case-sensitive
+    /// (<https://html.spec.whatwg.org/multipage/document-sequences.html#valid-browsing-context-name-or-keyword>,
+    /// <https://html.spec.whatwg.org/multipage/nav-history-apis.html#window-open-steps>).
+    #[test]
+    fn a_target_name_parses_once_per_caller() {
+        assert_eq!(TargetName::parse(""), TargetName::Current);
+        assert_eq!(TargetName::for_window_open(""), TargetName::Blank);
+        for spelling in ["_SELF", "_Self", "_self"] {
+            assert_eq!(
+                TargetName::parse(spelling),
+                TargetName::Current,
+                "{spelling}"
+            );
+        }
+        for spelling in ["_PARENT", "_Top", "_blank"] {
+            assert_eq!(
+                TargetName::parse(spelling),
+                match spelling.to_ascii_lowercase().as_str() {
+                    "_parent" => TargetName::Parent,
+                    "_top" => TargetName::Top,
+                    _ => TargetName::Blank,
+                },
+                "{spelling}"
+            );
+        }
+        // A missing underscore or an unknown keyword is a plain name, matched
+        // case-sensitively.
+        for name in ["blank", "_new", "_BLANKX", "frame", "_current"] {
+            assert_eq!(
+                TargetName::parse(name),
+                TargetName::Named(name.to_owned()),
+                "{name}"
+            );
+            assert_eq!(
+                TargetName::for_window_open(name),
+                TargetName::Named(name.to_owned()),
+                "{name}"
+            );
+        }
+    }
+
+    /// `_blank` and a name create a context, so `noopener` withholds their
+    /// `WindowProxy`; `_self`, `_parent`, and `_top` do not.
+    /// Only a named target gives a new context a name: `_blank` leaves it
+    /// empty
+    /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#window-open-steps>).
+    #[test]
+    fn only_a_named_or_new_target_carries_the_opener_rules() {
+        assert!(TargetName::Blank.noopener_withholds());
+        assert!(TargetName::Named("frame".to_owned()).noopener_withholds());
+        for target in [TargetName::Current, TargetName::Parent, TargetName::Top] {
+            assert!(!target.noopener_withholds(), "{target:?}");
+            assert_eq!(target.new_context_name(), None, "{target:?}");
+        }
+        assert_eq!(TargetName::Blank.new_context_name(), None);
+        assert_eq!(
+            TargetName::Named("frame".to_owned()).new_context_name(),
+            Some("frame")
+        );
     }
 }

@@ -4,6 +4,8 @@
 //! and `Sec-Fetch-Site` from the opener's origin
 //! (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#window-open-steps>).
 
+use std::time::{Duration, Instant};
+
 use crate::fixture::{Fixture, TestServer, evaluate, ok, open_page, serve_on, server};
 
 /// Serves one page that opens a browser-hosted popup, and returns the popup
@@ -97,21 +99,26 @@ fn a_same_site_popup_is_same_site_and_not_same_origin() {
 }
 
 /// A named browser-tab popup is one browsing context: opening the same name
-/// twice selects the tab the first call opened instead of creating a second
-/// one
-/// (<https://html.spec.whatwg.org/multipage/document-sequences.html#the-rules-for-choosing-a-navigable>).
+/// again selects the tab the first call opened and navigates it, instead of
+/// creating a second tab
+/// (<https://html.spec.whatwg.org/multipage/document-sequences.html#the-rules-for-choosing-a-navigable>,
+/// <https://html.spec.whatwg.org/multipage/nav-history-apis.html#window-open-steps>).
 #[test]
-fn a_named_popup_is_reused() {
-    let popup = TestServer::start(vec![("/", "text/html", b"<!doctype html>peer")], None);
-    let target = format!("http://localhost:{}/", popup.address().port());
+fn a_named_popup_is_reused_and_navigated() {
+    let popup = TestServer::start(
+        vec![
+            ("/first", "text/html", b"<!doctype html>first"),
+            ("/second", "text/html", b"<!doctype html>second"),
+        ],
+        None,
+    );
+    let port = popup.address().port();
     let (listener, address) = server();
-    // The page is `127.0.0.1`, so the popup is cross-site and stays a browser
-    // tab; the engine has to remember the name for that case.
+    // The page is `127.0.0.1`, so the popups are cross-site and stay browser
+    // tabs; the browser has to own the name table for them.
     let page = format!(
         r#"<!doctype html><script>
-window.__first = window.open({target:?}, "shared");
-window.__second = window.open({target:?}, "shared");
-window.__same = window.__first === window.__second;
+window.__first = window.open('http://localhost:{port}/first', "shared");
 </script>"#
     );
     serve_on(listener, vec![("/start", ok("text/html", page.as_bytes()))]);
@@ -119,24 +126,63 @@ window.__same = window.__first === window.__second;
         "tinybrowser-window-open",
         &format!("http://127.0.0.1:{}/start", address.port()),
     );
-    popup.wait("/");
+    popup.wait_count("/first", 1);
+    // The second open happens after the first tab has loaded, so its
+    // navigation is not superseded by the first one.
+    let second = format!(
+        r#"window.__second = window.open('http://localhost:{port}/second', "shared");
+           window.__first === window.__second"#
+    );
     assert_eq!(
-        evaluate(&mut client, &session, "window.__same"),
+        evaluate(&mut client, &session, &second),
         serde_json::json!(true),
         "the second call with the same name selects the first tab"
     );
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    popup.wait_count("/second", 1);
     assert_eq!(
-        popup.history("/").len(),
+        popup.history("/first").len(),
         1,
         "the reused name did not open a second tab"
+    );
+    assert_eq!(
+        popup.history("/second").len(),
+        1,
+        "the selected tab navigated to the second URL"
+    );
+}
+
+/// A window open with no URL navigates nothing when it selects an existing
+/// context: `window.open('', '_self')` is how a page asks for its own proxy,
+/// and it must not replace the document with `about:blank`
+/// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#window-open-steps>).
+#[test]
+fn opening_the_current_context_with_no_url_keeps_its_document() {
+    let (listener, address) = server();
+    let page = "<!doctype html><title>stay</title><script>\
+        window.__marker = 1;\
+        window.__self = window.open('', '_self');\
+        window.__top = window.open('', '_top');\
+        </script>";
+    serve_on(listener, vec![("/start", ok("text/html", page.as_bytes()))]);
+    let (_fixture, mut client, session) = open_page(
+        "tinybrowser-window-open",
+        &format!("http://127.0.0.1:{}/start", address.port()),
+    );
+    assert_eq!(
+        evaluate(
+            &mut client,
+            &session,
+            "[window.__self === window, window.__top === window, window.__marker, document.title].join(',')"
+        ),
+        serde_json::json!("true,true,1,stay")
     );
 }
 
 /// A sandboxed document without `allow-popups` cannot create a context, no
 /// matter how the target is spelled. The old check tested for the literal
 /// `_blank`, so `_BLANK` and any unknown `_`-prefixed name walked past it and
-/// opened a cross-origin tab
+/// opened a cross-origin tab. `_self` keeps working, because it creates
+/// nothing
 /// (<https://html.spec.whatwg.org/multipage/browsers.html#sandboxed-auxiliary-navigation-browsing-context-flag>).
 #[test]
 fn a_sandbox_without_allow_popups_cannot_open_a_context_by_spelling() {
@@ -150,29 +196,79 @@ fn a_sandbox_without_allow_popups_cannot_open_a_context_by_spelling() {
         None,
     );
     let port = popup.address().port();
-    let frame = |sandbox: &str, name: &str, path: &str| {
-        format!(
-            "<iframe sandbox=\"{sandbox}\" srcdoc=\"<script>window.open('http://localhost:{port}/{path}', '{name}')</script>\"></iframe>"
-        )
+    let frame = |sandbox: &str, script: &str| {
+        format!("<iframe sandbox=\"{sandbox}\" srcdoc=\"<script>{script}</script>\"></iframe>")
     };
+    // A sandboxed `srcdoc` frame is opaque-origin, so it cannot write the
+    // parent's globals; `postMessage` is the one channel it has.
     let page = format!(
-        "<!doctype html>{}{}{}{}",
-        frame("allow-scripts allow-popups", "_blank", "allowed"),
-        frame("allow-scripts", "_blank", "blank"),
-        frame("allow-scripts", "_BLANK", "upper"),
-        frame("allow-scripts", "_new", "named"),
+        "<!doctype html><script>\
+         window.__answers = [];\
+         window.addEventListener('message', function (event) {{\
+           window.__answers.push(String(event.data));\
+         }});\
+         </script>{}{}{}",
+        frame(
+            "allow-scripts allow-popups",
+            &format!(
+                "parent.postMessage('allowed:' + (window.open('http://localhost:{port}/allowed', '_blank') !== null), '*')"
+            ),
+        ),
+        frame(
+            "allow-scripts",
+            &format!(
+                "parent.postMessage(['refused', \
+                 window.open('http://localhost:{port}/blank', '_blank') === null, \
+                 window.open('http://localhost:{port}/upper', '_BLANK') === null, \
+                 window.open('http://localhost:{port}/named', '_new') === null].join(','), '*')"
+            ),
+        ),
+        frame(
+            "allow-scripts",
+            "parent.postMessage('self:' + (window.open('', '_self') === window), '*')",
+        ),
     );
     let (listener, address) = server();
     serve_on(listener, vec![("/start", ok("text/html", page.as_bytes()))]);
-    let (_fixture, _client, _session) = open_page(
+    let (_fixture, mut client, session) = open_page(
         "tinybrowser-window-open",
         &format!("http://127.0.0.1:{}/start", address.port()),
     );
 
-    // The popup-capable frame proves the page really ran each script.
+    // The synchronous answers: the permitted frame got a proxy, the sandboxed
+    // frames got null for every spelling of a new context, and `_self` still
+    // selects its own window.
+    wait_for_answers(&mut client, &session);
+    assert_eq!(
+        evaluate(
+            &mut client,
+            &session,
+            "window.__answers.slice().sort().join('|')"
+        ),
+        serde_json::json!("allowed:true|refused,true,true,true|self:true")
+    );
+    // The permitted frame's tab really navigated; the refused names issued no
+    // request. A refused call would have started its request in the same task
+    // as the permitted one, so its absence after the permitted request lands is
+    // meaningful.
     popup.wait("/allowed");
     std::thread::sleep(std::time::Duration::from_millis(300));
     for path in ["/blank", "/upper", "/named"] {
         assert!(!popup.requested(path), "{path} opened without allow-popups");
+    }
+}
+
+/// Waits until each sandboxed frame has posted its one answer.
+fn wait_for_answers(client: &mut cdp::Client, session: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if evaluate(client, session, "window.__answers.length") == serde_json::json!(3) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the sandboxed frames never reported"
+        );
+        std::thread::sleep(Duration::from_millis(20));
     }
 }

@@ -40,7 +40,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// page request's mode with [`CorsMode`](renderer::CorsMode), which has no
 /// `navigate`. Version 15 made the handshake carry the browser identity, so
 /// every page and CDP answer reports the same product as the request headers.
-pub const PROTOCOL_VERSION: u8 = 15;
+/// Version 16 typed the values a navigation and a window open carry (origins,
+/// the window-open target and URL) and added the named-tab lookup and
+/// navigation calls.
+pub const PROTOCOL_VERSION: u8 = 16;
 
 /// Fixed frame header size in bytes.
 pub const HEADER_BYTES: usize = 16;
@@ -855,9 +858,9 @@ mod tests {
         );
     }
 
-    /// `window.open`'s caller crosses the wire as typed values: an opaque
-    /// document claims `null` rather than a sentinel URL it could forge, and
-    /// the origin, referrer, and policy travel as one source
+    /// Every field of a `window.open` call crosses the wire: the source, the
+    /// target, the URL (present or absent), the opener policy, and the
+    /// sandbox bit
     /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#window-open-steps>).
     #[test]
     fn a_window_open_caller_survives_the_wire() {
@@ -866,36 +869,63 @@ mod tests {
             referrer: url::Url::parse("https://a.test/page").expect("referrer"),
             referrer_policy: net::ReferrerPolicy::UnsafeUrl,
         };
-        let call = crate::wire::ServiceCall::BrowsingContext(
-            crate::wire::BrowsingContextCall::WindowOpen {
-                url: url::Url::parse("https://b.test/").expect("url"),
-                opener: renderer::OpenerPolicy::Keep,
-                source: source.clone(),
-                allow_popups: true,
-            },
-        );
-        let message: crate::wire::FromRenderer = crate::exchange::Frame::Call {
-            id: crate::exchange::RequestId::new(1),
-            body: crate::wire::BrowserCall {
-                assignment: crate::wire::RendererAssignmentId::new(1),
-                call,
-            },
-        };
-        let mut bytes = Vec::new();
-        write_control(&mut bytes, &message).expect("write");
-        let back: crate::wire::FromRenderer =
-            read_control(&mut Cursor::new(bytes), &mut Vec::new())
-                .expect("read")
-                .expect("one frame");
-        let crate::exchange::Frame::Call { body, .. } = back else {
-            panic!("expected a call frame");
-        };
-        let crate::wire::ServiceCall::BrowsingContext(
-            crate::wire::BrowsingContextCall::WindowOpen { source: back, .. },
-        ) = body.call
-        else {
-            panic!("expected a window.open call");
-        };
-        assert_eq!(back, source);
+        let cases = [
+            (
+                Some(url::Url::parse("https://b.test/").expect("url")),
+                renderer::TargetName::Named("peer".to_owned()),
+                renderer::OpenerPolicy::NoOpener,
+                false,
+            ),
+            (
+                None,
+                renderer::TargetName::Blank,
+                renderer::OpenerPolicy::Keep,
+                true,
+            ),
+        ];
+        for (url, target, opener, allow_popups) in cases {
+            let call = crate::wire::ServiceCall::BrowsingContext(
+                crate::wire::BrowsingContextCall::WindowOpen {
+                    url: url.clone(),
+                    target: target.clone(),
+                    opener,
+                    source: source.clone(),
+                    allow_popups,
+                },
+            );
+            let message: crate::wire::FromRenderer = crate::exchange::Frame::Call {
+                id: crate::exchange::RequestId::new(1),
+                body: crate::wire::BrowserCall {
+                    assignment: crate::wire::RendererAssignmentId::new(1),
+                    call,
+                },
+            };
+            let mut bytes = Vec::new();
+            write_control(&mut bytes, &message).expect("write");
+            let back: crate::wire::FromRenderer =
+                read_control(&mut Cursor::new(bytes), &mut Vec::new())
+                    .expect("read")
+                    .expect("one frame");
+            let crate::exchange::Frame::Call { body, .. } = back else {
+                panic!("expected a call frame");
+            };
+            let crate::wire::ServiceCall::BrowsingContext(
+                crate::wire::BrowsingContextCall::WindowOpen {
+                    url: back_url,
+                    target: back_target,
+                    opener: back_opener,
+                    source: back_source,
+                    allow_popups: back_allow,
+                },
+            ) = body.call
+            else {
+                panic!("expected a window.open call");
+            };
+            assert_eq!(back_url, url);
+            assert_eq!(back_target, target);
+            assert_eq!(back_opener, opener);
+            assert_eq!(back_allow, allow_popups);
+            assert_eq!(back_source, source);
+        }
     }
 }

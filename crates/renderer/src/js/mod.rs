@@ -47,8 +47,7 @@ use rquickjs::{
 };
 use url::Url;
 
-use crate::messaging::TargetName;
-use crate::protocol::{FrameId, WindowId};
+use crate::protocol::{FrameId, TargetName, WindowId};
 
 pub(crate) use world::{CreatorInfo, NavigationReferrer, PolicyContainer, RealmRequest, World};
 
@@ -1410,10 +1409,11 @@ fn install_window_host_functions(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> R
     bridge::object(ctx)?.set(
         "__tbWindowClose",
         Func::from(move |window: u64| {
-            let window = crate::protocol::WindowId::new(window);
-            let world = window_close.borrow();
-            world.runtime.shared.borrow_mut().forget_named_tab(window);
-            world.runtime.services.window_close(window);
+            window_close
+                .borrow()
+                .runtime
+                .services
+                .window_close(crate::protocol::WindowId::new(window));
         }),
     )?;
 
@@ -1572,19 +1572,13 @@ fn open_window(
     name: &str,
     features: &str,
 ) -> Option<WindowOpenAnswer> {
-    // The window open steps treat an absent target as `_blank`, unlike a link
-    // navigation where the empty string selects the current context
-    // (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#window-open-steps>).
-    let target = if name.is_empty() {
-        TargetName::Blank
-    } else {
-        TargetName::parse(name)
-    };
+    let target = TargetName::for_window_open(name);
     let plan = world.borrow().plan_window_open(url, &target, features)?;
+    let services = world.borrow().runtime.services.clone();
     // The rules for choosing a navigable search this tab's tree, then the
-    // browsing context group's browser-hosted tabs
+    // browsing context group's browser tabs
     // (<https://html.spec.whatwg.org/multipage/document-sequences.html#the-rules-for-choosing-a-navigable>).
-    let creates = {
+    let selected = {
         let world = world.borrow();
         world
             .runtime
@@ -1592,54 +1586,47 @@ fn open_window(
             .borrow()
             .tree
             .choose_navigable(&target, world.frame())
-            .is_none()
     };
-    if !creates {
-        // A context this renderer hosts keeps same-origin access to the
-        // opener: an auxiliary context for a blank or same-origin URL, or the
-        // navigable a name already selects.
-        let frame = World::open_auxiliary(world, &plan.url, &target, plan.opener)?;
+    if let Some(frame) = selected {
+        World::navigate_selected(world, frame, plan.url.as_ref(), plan.opener);
         return Some(WindowOpenAnswer {
             context: OpenedContext::Frame(frame),
             withholds: plan.withholds,
         });
     }
     if let TargetName::Named(name) = &target
-        && let Some(tab) = world.borrow().runtime.shared.borrow().named_tab(name)
+        && let Some(tab) = services.window_by_name(name)
     {
+        services.window_navigate(tab, name, plan.url.as_ref(), plan.opener, &plan.source);
         return Some(WindowOpenAnswer {
             context: OpenedContext::Tab(tab),
             withholds: plan.withholds,
         });
     }
-    // Nothing in this tab created the context: the call creates one. A
-    // sandboxed document without `allow-popups` cannot create an auxiliary
-    // context, whether this renderer or the browser would host it; spelling
-    // the name `_BLANK` or choosing an unknown `_x` must not change that
+    // Nothing selected a context, so the call creates one. A sandboxed
+    // document without `allow-popups` cannot create an auxiliary context,
+    // whether this renderer or the browser would host it; spelling the name
+    // `_BLANK` or choosing an unknown `_x` must not change that
     // (<https://html.spec.whatwg.org/multipage/browsers.html#sandboxed-auxiliary-navigation-browsing-context-flag>).
-    if !world.borrow().allows_auxiliary_navigation() {
+    let allow_popups = world.borrow().allows_auxiliary_navigation();
+    if !allow_popups {
         return None;
     }
-    // A cross-origin popup stays a browser tab.
-    if let Some(frame) = World::open_auxiliary(world, &plan.url, &target, plan.opener) {
+    // A same-origin popup stays in this renderer; a cross-origin one is a
+    // browser tab.
+    if let Some(frame) = World::create_auxiliary(world, plan.url.as_ref(), &target, plan.opener) {
         return Some(WindowOpenAnswer {
             context: OpenedContext::Frame(frame),
             withholds: plan.withholds,
         });
     }
-    // The check above refused an unpermitted call, so this one may create. The
-    // browser re-checks the bit because it is the trust boundary.
-    let allow_popups = world.borrow().allows_auxiliary_navigation();
-    let services = world.borrow().runtime.services.clone();
-    let tab = services.window_open(&plan.url, plan.opener, &plan.source, allow_popups)?;
-    if let Some(name) = target.new_context_name() {
-        world
-            .borrow()
-            .runtime
-            .shared
-            .borrow_mut()
-            .remember_named_tab(name.to_owned(), tab);
-    }
+    let tab = services.window_open(
+        plan.url.as_ref(),
+        &target,
+        plan.opener,
+        &plan.source,
+        allow_popups,
+    )?;
     Some(WindowOpenAnswer {
         context: OpenedContext::Tab(tab),
         withholds: plan.withholds,

@@ -20,7 +20,7 @@ use crate::exchange::{Frame, RequestId};
 use renderer::{
     BrowserEvent, DialFailure, DialOutcome, DialRequest, FrameId, NavigationSource, OpenerPolicy,
     PostedMessage, RemoteValue, SerializedOrigin, StorageChange, StorageError, StorageKey,
-    StorageKind, StreamId, TabError, WindowId,
+    StorageKind, StreamId, TabError, TargetName, WindowId,
 };
 
 /// Browser-minted identity of one top-level document hosted by a renderer.
@@ -371,8 +371,12 @@ pub enum StorageCall {
 pub enum BrowsingContextCall {
     /// `window.open(url, target, features)`.
     WindowOpen {
-        /// Absolute URL to load; `about:blank` when the call named none.
-        url: Url,
+        /// Absolute URL to load, or `None` when the call named none.
+        url: Option<Url>,
+        /// Which context the target names, so the browser records the name a
+        /// newly created tab answers to
+        /// (<https://html.spec.whatwg.org/multipage/document-sequences.html#the-rules-for-choosing-a-navigable>).
+        target: TargetName,
         /// What the `noopener` and `noreferrer` features asked for, already
         /// parsed by the renderer that read the feature string.
         opener: OpenerPolicy,
@@ -385,6 +389,25 @@ pub enum BrowsingContextCall {
         /// again because it is the trust boundary
         /// (<https://html.spec.whatwg.org/multipage/browsers.html#sandboxed-auxiliary-navigation-browsing-context-flag>).
         allow_popups: bool,
+    },
+    /// The browser tab this tab's browsing context group holds under a name.
+    WindowByName {
+        /// The name to look up.
+        name: String,
+    },
+    /// Navigates a browser tab a name already selected.
+    WindowNavigate {
+        /// The selected tab.
+        window: WindowId,
+        /// The name that selected it; the browser re-runs the lookup so a
+        /// renderer cannot navigate a tab outside its own group.
+        name: String,
+        /// Absolute URL to load, or `None` to leave the tab where it is.
+        url: Option<Url>,
+        /// What the call's `noopener` and `noreferrer` features asked for.
+        opener: OpenerPolicy,
+        /// The calling document's origin, referrer source, and policy.
+        source: NavigationSource,
     },
     /// `window.close()` on a window this renderer opened.
     WindowClose {
@@ -473,7 +496,9 @@ impl ServiceReply {
             )
             | ServiceCall::Messaging(MessagingCall::BroadcastPost { .. })
             | ServiceCall::BrowsingContext(
-                BrowsingContextCall::WindowClose { .. } | BrowsingContextCall::WindowMessage { .. },
+                BrowsingContextCall::WindowClose { .. }
+                | BrowsingContextCall::WindowMessage { .. }
+                | BrowsingContextCall::WindowNavigate { .. },
             ) => ServiceReply::Unit,
             ServiceCall::Storage(StorageCall::Get { .. })
             | ServiceCall::BrowsingContext(BrowsingContextCall::RemoteSessionGet { .. }) => {
@@ -484,7 +509,9 @@ impl ServiceReply {
                 StorageCall::Set { .. } | StorageCall::Remove { .. } | StorageCall::Clear { .. },
             ) => ServiceReply::StorageChanged(Ok(None)),
             ServiceCall::BrowsingContext(
-                BrowsingContextCall::WindowOpen { .. } | BrowsingContextCall::Opener,
+                BrowsingContextCall::WindowOpen { .. }
+                | BrowsingContextCall::WindowByName { .. }
+                | BrowsingContextCall::Opener,
             ) => ServiceReply::Window(None),
         }
     }

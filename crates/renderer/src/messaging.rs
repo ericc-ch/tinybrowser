@@ -1,7 +1,8 @@
-//! Renderer-process state shared by every frame realm: the browsing context
-//! tree, `MessagePort` endpoints, and the delivery queue between realms.
+//! Renderer state shared by every frame realm of one page engine: the browsing
+//! context tree, `MessagePort` endpoints, and the delivery queue between
+//! realms.
 //!
-//! One renderer thread hosts every frame of a tab and each frame is its own
+//! One page engine hosts every frame of its tab and each frame is its own
 //! `QuickJS` realm, so no JS value can cross. This module owns what must:
 //! which frame holds which port, where a serialized message goes, and the
 //! order it arrives in. Serialization itself happens in the sender realm (a
@@ -13,72 +14,12 @@ use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
 use crate::dom::tree::NodeId;
-use crate::protocol::{FrameId, WindowId};
+use crate::protocol::{FrameId, TargetName};
 
-/// One browsing-context target name, parsed once from the string a page
-/// supplied
-/// (<https://html.spec.whatwg.org/multipage/document-sequences.html#valid-browsing-context-name-or-keyword>).
-///
-/// Keywords match ASCII case-insensitively and the empty string is `_self`, as
-/// the HTML rules for choosing a navigable require. Every other non-empty name
-/// selects a named context. Keeping the spelling out of the decision means a
-/// sandbox gate cannot be bypassed by `_BLANK`, and every reader agrees on
-/// which names create a context.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum TargetName {
-    /// The empty string or `_self`.
-    Current,
-    /// `_parent`.
-    Parent,
-    /// `_top`.
-    Top,
-    /// `_blank`.
-    Blank,
-    /// A named context.
-    Named(String),
-}
-
-impl TargetName {
-    /// Parses one target name.
-    #[must_use]
-    pub(crate) fn parse(raw: &str) -> Self {
-        if raw.is_empty() || raw.eq_ignore_ascii_case("_self") {
-            Self::Current
-        } else if raw.eq_ignore_ascii_case("_parent") {
-            Self::Parent
-        } else if raw.eq_ignore_ascii_case("_top") {
-            Self::Top
-        } else if raw.eq_ignore_ascii_case("_blank") {
-            Self::Blank
-        } else {
-            Self::Named(raw.to_owned())
-        }
-    }
-
-    /// Whether the target names a context rather than the current frame or an
-    /// ancestor. `_blank` always creates; a named one may already exist, which
-    /// only [`choose_navigable`] can answer.
-    ///
-    /// [`choose_navigable`]: FrameTree::choose_navigable
-    #[must_use]
-    pub(crate) fn names_context(&self) -> bool {
-        matches!(self, Self::Blank | Self::Named(_))
-    }
-
-    /// The name a newly created context carries, when the target names one.
-    #[must_use]
-    pub(crate) fn new_context_name(&self) -> Option<&str> {
-        match self {
-            Self::Named(name) => Some(name),
-            Self::Current | Self::Parent | Self::Top | Self::Blank => None,
-        }
-    }
-}
-
-/// Handle every realm holds to the renderer-process shared state.
+/// Handle every realm of one page engine holds to its shared state.
 pub(crate) type SharedHandle = Rc<RefCell<Shared>>;
 
-/// Child frames one renderer process will host; the main frame is not
+/// Child frames one page engine will host; the main frame is not
 /// counted. Encoding-label WPT files create one iframe per label, so this
 /// has to clear the largest `dom/nodes` charset map. Realms are deferred
 /// for scriptless nested documents, so an idle frame costs a `Document`
@@ -373,8 +314,9 @@ impl FrameTree {
     /// The browsing context group search: every auxiliary top-level context
     /// this renderer hosts, excluding `current`.
     ///
-    /// Auxiliary contexts created by `window.open` here are same-origin by
-    /// construction, so `current` is familiar with all of them
+    /// Familiarity comes from the opener chain, not from the origins: an
+    /// auxiliary context and its opener share a top-level traversable by
+    /// construction, and every frame this renderer hosts belongs to one tab
     /// (<https://html.spec.whatwg.org/multipage/document-sequences.html#familiar>).
     fn find_by_auxiliary_name(&self, current: FrameId, target: &str) -> Option<FrameId> {
         let mut auxiliaries: Vec<FrameId> = self
@@ -781,16 +723,6 @@ pub(crate) struct Shared {
     /// `iframe` containers that owned them; the engine drops their documents
     /// at its next turn.
     removed_frames: Vec<(FrameId, Option<NodeId>)>,
-    /// Browser tabs this tab opened, by the name they were opened with.
-    ///
-    /// `window.open` searches this tab's own tree first and then the browsing
-    /// context group's other top-level contexts
-    /// (<https://html.spec.whatwg.org/multipage/document-sequences.html#the-rules-for-choosing-a-navigable>).
-    /// The tree holds the contexts this renderer hosts; this map holds the
-    /// ones the browser hosts, so a reused name selects the same tab instead
-    /// of opening a second one. Names created by another renderer's tab are
-    /// not here: only the browser can see the whole group.
-    tab_names: HashMap<String, WindowId>,
 }
 
 impl Default for Shared {
@@ -804,7 +736,6 @@ impl Default for Shared {
             document_ids: HashMap::new(),
             next_document: 0,
             removed_frames: Vec::new(),
-            tab_names: HashMap::new(),
         }
     }
 }
@@ -906,23 +837,6 @@ impl Shared {
     /// Takes the frames whose documents the engine must drop.
     pub(crate) fn take_removed_frames(&mut self) -> Vec<(FrameId, Option<NodeId>)> {
         std::mem::take(&mut self.removed_frames)
-    }
-
-    /// The browser tab this tab opened under `name`, when one is still open.
-    pub(crate) fn named_tab(&self, name: &str) -> Option<WindowId> {
-        self.tab_names.get(name).copied()
-    }
-
-    /// Records that a browser tab was opened under `name`, so a later
-    /// `window.open` with that name selects it
-    /// (<https://html.spec.whatwg.org/multipage/document-sequences.html#the-rules-for-choosing-a-navigable>).
-    pub(crate) fn remember_named_tab(&mut self, name: String, window: WindowId) {
-        self.tab_names.insert(name, window);
-    }
-
-    /// Forgets every name a closed tab answered to.
-    pub(crate) fn forget_named_tab(&mut self, window: WindowId) {
-        self.tab_names.retain(|_, named| *named != window);
     }
 }
 

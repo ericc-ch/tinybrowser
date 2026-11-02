@@ -367,6 +367,7 @@ fn materialize_iframe_document(
         let mut world = world_handle.borrow_mut();
         world.policy = world_rc.borrow().policy.clone();
         world.sandbox = sandbox;
+        world.top_level = Some(world_rc.borrow().top_level_origin());
     }
     document.load_about_blank_tree(Some(&base_url), Some(origin));
     // The initial blank reports its creator's URL, walked out of a `srcdoc`

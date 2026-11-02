@@ -31,6 +31,7 @@ use tokio::process::Command;
 use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
+use url::Url;
 
 /// Upper bound on one request to a renderer. The renderer budget is seconds;
 /// this is a last-resort wake-up if its reply path dies silently. A renderer
@@ -775,6 +776,158 @@ fn message_related(context: &ServiceContext, assignment: &Assignment, target: Ta
         || context.tabs.opener(assignment.tab) == Some(target)
 }
 
+/// The URL a browser-hosted popup may load.
+///
+/// The renderer resolved the URL; the browser still checks the scheme, because
+/// a renderer is not the trust boundary. `data:` and `blob:` popups would need
+/// a browser-side document store this engine does not have, so they are
+/// refused here rather than mis-navigated
+/// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#window-open-steps>).
+fn navigable_popup_url(url: Url) -> Option<Url> {
+    matches!(url.scheme(), "about" | "http" | "https").then_some(url)
+}
+
+/// The authorized navigation a `window.open`-family call runs under.
+fn window_initiator(
+    assignment: &Assignment,
+    source: renderer::NavigationSource,
+    opener: renderer::OpenerPolicy,
+) -> Result<crate::actor::NavigationInitiator, RendererViolation> {
+    let renderer::NavigationSource {
+        origin: claim,
+        referrer,
+        referrer_policy,
+    } = source;
+    // The calling document's origin must belong to this renderer's site lock;
+    // an opaque document may still open a window, but its origin stays opaque.
+    // The referrer is the document's own URL, so it must be same-origin with
+    // that claim and inside the lock: a URL that is neither is not this
+    // document's to name, and the popup goes out without one rather than
+    // leaking it. The dial seam makes the same check
+    // (<https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
+    let origin = match assignment.site.authorize_origin(&claim) {
+        Some(origin) => origin,
+        None if claim.is_opaque() => url::Origin::new_opaque(),
+        None => return Err(RendererViolation),
+    };
+    let referrer = assignment
+        .site
+        .allows_url(&referrer)
+        .then_some(referrer)
+        .filter(|referrer| referrer.origin() == origin);
+    // `noreferrer` is the opener feature's referrer half, and the browser owns
+    // the feature's meaning: the renderer sends the document's policy and this
+    // overrides it
+    // (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#window-open-steps>).
+    let referrer_policy = if opener == renderer::OpenerPolicy::NoReferrer {
+        net::ReferrerPolicy::NoReferrer
+    } else {
+        referrer_policy
+    };
+    Ok(crate::actor::NavigationInitiator {
+        origin,
+        referrer,
+        referrer_policy,
+    })
+}
+
+/// The window calls that create or navigate a browser tab.
+#[derive(Clone, Copy)]
+struct WindowRouter<'a> {
+    context: &'a ServiceContext,
+    assignment: &'a Assignment,
+    request: RequestId,
+}
+
+impl WindowRouter<'_> {
+    /// Creates the browser tab a `window.open` call asked for.
+    async fn open(
+        self,
+        url: Option<Url>,
+        target: renderer::TargetName,
+        opener: renderer::OpenerPolicy,
+        source: renderer::NavigationSource,
+        allow_popups: bool,
+    ) -> Result<(), RendererViolation> {
+        let Self {
+            context,
+            assignment,
+            request: id,
+        } = self;
+        // The renderer refused a call without the bit already; a renderer that
+        // sends it anyway is confused rather than hostile, so the window is
+        // refused and the process keeps running.
+        if !allow_popups
+            || matches!(
+                target,
+                renderer::TargetName::Current
+                    | renderer::TargetName::Parent
+                    | renderer::TargetName::Top
+            )
+        {
+            logging::debug!(
+                target: "browser::tabs",
+                "window.open refused: no allow-popups, or a target that cannot create"
+            );
+            return send_reply(&context.responder, id, ServiceReply::Window(None)).await;
+        }
+        let url = match url {
+            Some(url) => {
+                let Some(url) = navigable_popup_url(url) else {
+                    return send_reply(&context.responder, id, ServiceReply::Window(None)).await;
+                };
+                Some(url)
+            }
+            None => None,
+        };
+        let initiator = window_initiator(assignment, source, opener)?;
+        let tab = context
+            .browser
+            .open_window(crate::browser::OpenWindowOptions {
+                url,
+                target,
+                source: Some(assignment.tab),
+                opener,
+                initiator,
+            })
+            .await
+            .ok()
+            .map(|tab| renderer::WindowId::new(tab.get()));
+        send_reply(&context.responder, id, ServiceReply::Window(tab)).await
+    }
+
+    /// Navigates the browser tab a name already selected.
+    async fn navigate(
+        self,
+        window: renderer::WindowId,
+        name: String,
+        url: Option<Url>,
+        opener: renderer::OpenerPolicy,
+        source: renderer::NavigationSource,
+    ) -> Result<(), RendererViolation> {
+        let Self {
+            context,
+            assignment,
+            request: id,
+        } = self;
+        let target = TabId::new(window.get());
+        // The renderer selected this tab by name; re-running the group lookup
+        // is what stops it from navigating a tab outside its own browsing
+        // context group.
+        if context.tabs.find_by_name(assignment.tab, &name) == Some(target)
+            && let Some(url) = url.and_then(navigable_popup_url)
+        {
+            let initiator = window_initiator(assignment, source, opener)?;
+            if let Ok(handle) = context.browser.tab(target).await {
+                tokio::spawn(async move {
+                    let _result = handle.goto_from(url.as_str(), initiator).await;
+                });
+            }
+        }
+        send_reply(&context.responder, id, ServiceReply::Unit).await
+    }
+}
+
 /// Routes one `window.open`/`window.close`/`postMessage` service call. Step 1
 /// created the tab and its first navigation; step 2 adds the opener link,
 /// cross-tab messaging, and the relatedness gates.
@@ -787,67 +940,40 @@ async fn route_window_call(
     match call {
         BrowsingContextCall::WindowOpen {
             url,
+            target,
             opener,
             source,
             allow_popups,
         } => {
-            // The browser only ever answers with a new tab, so this is the
-            // creation branch and the sandbox bit applies here too. The
-            // renderer refused first; a call that arrives without the bit is a
-            // forged or confused renderer, not a page request
-            // (<https://html.spec.whatwg.org/multipage/browsers.html#sandboxed-auxiliary-navigation-browsing-context-flag>).
-            if !allow_popups {
-                return Err(RendererViolation);
+            WindowRouter {
+                context,
+                assignment,
+                request: id,
             }
-            let renderer::NavigationSource {
-                origin: claim,
-                referrer,
-                referrer_policy,
-            } = source;
-            // A popup may navigate only to `about:blank` or an HTTP(S) URL.
-            // The renderer resolved the URL; the browser still checks the
-            // scheme, because a renderer is not the trust boundary.
-            let url = (url.as_str() == "about:blank" || matches!(url.scheme(), "http" | "https"))
-                .then_some(url);
-            // The calling document's origin must belong to this renderer's
-            // site lock; an opaque document may still open a window, but its
-            // origin stays opaque. The referrer is the document's own URL, so
-            // it must be same-origin with that claim and inside the lock: a
-            // URL that is neither is not this document's to name, and the
-            // popup goes out without one rather than leaking it. The dial seam
-            // makes the same check
-            // (<https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
-            let origin = match assignment.site.authorize_origin(&claim) {
-                Some(origin) => origin,
-                None if claim.is_opaque() => url::Origin::new_opaque(),
-                None => return Err(RendererViolation),
-            };
-            let referrer = assignment
-                .site
-                .allows_url(&referrer)
-                .then_some(referrer)
-                .filter(|referrer| referrer.origin() == origin);
-            let initiator = crate::actor::NavigationInitiator {
-                origin,
-                referrer,
-                referrer_policy,
-            };
-            let source = Some(assignment.tab);
-            let tab = match url {
-                Some(url) => context
-                    .browser
-                    .open_window(crate::browser::OpenWindowOptions {
-                        url,
-                        source,
-                        opener,
-                        initiator,
-                    })
-                    .await
-                    .ok()
-                    .map(|tab| renderer::WindowId::new(tab.get())),
-                None => None,
-            };
+            .open(url, target, opener, source, allow_popups)
+            .await?;
+        }
+        BrowsingContextCall::WindowByName { name } => {
+            let tab = context
+                .tabs
+                .find_by_name(assignment.tab, &name)
+                .map(|tab| renderer::WindowId::new(tab.get()));
             send_reply(&context.responder, id, ServiceReply::Window(tab)).await?;
+        }
+        BrowsingContextCall::WindowNavigate {
+            window,
+            name,
+            url,
+            opener,
+            source,
+        } => {
+            WindowRouter {
+                context,
+                assignment,
+                request: id,
+            }
+            .navigate(window, name, url, opener, source)
+            .await?;
         }
         BrowsingContextCall::WindowClose { window } => {
             let target = TabId::new(window.get());
