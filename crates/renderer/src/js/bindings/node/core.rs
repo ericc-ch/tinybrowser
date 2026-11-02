@@ -2716,7 +2716,7 @@ fn truncate_split_text(parsed: &mut crate::Parsed, id: NodeId, kept: &[u16], old
         }
         Some(NodeData::CDataSection { .. }) => {
             let base = &mut parsed.document.base;
-            base.snapshot_node(id.node);
+            base.snapshot_node_state_only(id.node);
             if let Some(NodeData::CDataSection { contents }) =
                 base.get_node_mut(id.node).map(|node| &mut node.data)
             {

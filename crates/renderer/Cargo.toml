@@ -58,10 +58,10 @@ png = "0.18"
 # SVG `naturalWidth`/`naturalHeight` read Blitz's parsed intrinsic lengths.
 svgtypes = "0.16"
 # Stylo is a `links` crate: one copy per graph. The blitz fork pins a
-# DioxusLabs/stylo rev; the renderer's direct stylo use must pin the same
-# rev or the resolver builds a second servo_style_crate and fails.
-style = { package = "stylo", version = "0.22.0", git = "https://github.com/DioxusLabs/stylo", rev = "d6502e0002e9c40c43a0a4776f9e7eb93be360e3" }
-style_traits = { package = "stylo_traits", version = "0.22.0", git = "https://github.com/DioxusLabs/stylo", rev = "d6502e0002e9c40c43a0a4776f9e7eb93be360e3" }
+# nicoburns/stylo rev; the renderer's direct stylo use must pin the same rev
+# or the resolver builds a second servo_style_crate and fails.
+style = { package = "stylo", version = "0.22.0", git = "https://github.com/nicoburns/stylo", rev = "78734bf554bb40af9dc11c0eedbe724f6055697c" }
+style_traits = { package = "stylo_traits", version = "0.22.0", git = "https://github.com/nicoburns/stylo", rev = "78734bf554bb40af9dc11c0eedbe724f6055697c" }
 # Full Blitz adoption: DOM + parse + paint replace the in-tree pipeline.
 # Pinned exact: beta drift is fast, and Cargo.lock pins the rest. The pin
 # must track `version.workspace` in third_party/blitz/Cargo.toml, or

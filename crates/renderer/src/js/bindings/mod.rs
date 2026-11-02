@@ -1394,7 +1394,7 @@ fn write_character_data(base: &mut blitz_dom::BaseDocument, id: NodeId, utf8: &s
             true
         }
         NodeData::Comment { .. } => {
-            base.snapshot_node(id.node);
+            base.snapshot_node_state_only(id.node);
             base.get_node_mut(id.node)
                 .and_then(|node| match &mut node.data {
                     NodeData::Comment { contents } => Some(contents),
@@ -1407,7 +1407,7 @@ fn write_character_data(base: &mut blitz_dom::BaseDocument, id: NodeId, utf8: &s
                 })
         }
         NodeData::ProcessingInstruction { .. } => {
-            base.snapshot_node(id.node);
+            base.snapshot_node_state_only(id.node);
             // Writing the data re-derives the pseudo-attributes, so no reader
             // sees a map older than the data
             // (<https://www.w3.org/TR/xml-stylesheet/#dt-parsing>).
@@ -1415,7 +1415,7 @@ fn write_character_data(base: &mut blitz_dom::BaseDocument, id: NodeId, utf8: &s
             true
         }
         NodeData::CDataSection { .. } => {
-            base.snapshot_node(id.node);
+            base.snapshot_node_state_only(id.node);
             base.get_node_mut(id.node)
                 .and_then(|node| match &mut node.data {
                     NodeData::CDataSection { contents } => Some(contents),
