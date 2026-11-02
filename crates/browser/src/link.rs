@@ -25,13 +25,12 @@ use crate::wire::{
     MessagingCall, NetworkCall, RendererAssignmentId, RendererCall, RendererNotice, RendererReply,
     Reply, ResponseStart, ServiceCall, ServiceReply, StorageCall, ToRenderer,
 };
-use renderer::{BrowserEvent, FrameId, Mount, StorageChange, StorageKind, TabError};
+use renderer::{BrowserEvent, FrameId, Mount, StorageChange, StorageKey, StorageKind, TabError};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite};
 use tokio::process::Command;
 use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
-use url::Url;
 
 /// Upper bound on one request to a renderer. The renderer budget is seconds;
 /// this is a last-resort wake-up if its reply path dies silently. A renderer
@@ -573,7 +572,7 @@ fn live_assignment(
 async fn race_dial(
     network: &crate::network::TabNetworkHandle,
     request: &renderer::DialRequest,
-    initiator: &Url,
+    initiator: &url::Origin,
     assignment: RendererAssignmentId,
     mut kill: watch::Receiver<bool>,
     mut cancel: watch::Receiver<bool>,
@@ -584,27 +583,6 @@ async fn race_dial(
         _ = cancel.changed() => Err(renderer::DialFailure::Cancelled),
         result = network.dial_request(request, initiator, assignment) => result,
     }
-}
-
-/// The initiator a dial or popup from an opaque document goes out with. Every
-/// opaque origin is distinct, so the referrer and the same-origin credential
-/// rules treat it as the isolated origin it is. The serialized `Origin` header
-/// is `null` (<https://fetch.spec.whatwg.org/#concept-request-origin>).
-fn opaque_initiator() -> url::Url {
-    url::Url::parse("about:blank").expect("about:blank is a valid URL")
-}
-
-/// The origin URL a renderer names as a request initiator, when this
-/// renderer's site lock authorizes it.
-///
-/// The claim is a serialized origin, never a document URL: a path, query, or
-/// local-scheme URL parses to the tuple it wraps and is authorized as that
-/// origin, and the URL this returns is the origin's own serialization, so no
-/// other shape reaches the request
-/// (<https://fetch.spec.whatwg.org/#concept-request-origin>).
-fn authorized_initiator(site: &Site, claim: &renderer::SerializedOrigin) -> Option<Url> {
-    let url = claim.to_url()?;
-    site.allows_origin(&url.origin()).then_some(url)
 }
 
 /// Routes one browser service call from a renderer. This is a dispatch table:
@@ -641,9 +619,9 @@ async fn route_service_call(
             // credentials it would not otherwise send and no referrer, so it
             // cannot claim the renderer's own site
             // (<https://fetch.spec.whatwg.org/#concept-request-origin>).
-            let initiator = match authorized_initiator(&assignment.site, &request.initiator) {
+            let initiator = match assignment.site.authorize_origin(&request.initiator) {
                 Some(initiator) => initiator,
-                None if request.initiator.is_opaque() => opaque_initiator(),
+                None if request.initiator.is_opaque() => url::Origin::new_opaque(),
                 None => return Err(RendererViolation),
             };
             let worker_network = assignment.network.clone();
@@ -738,14 +716,14 @@ async fn route_service_call(
             send_reply(&context.responder, id, ServiceReply::Unit).await?;
         }
         ServiceCall::Network(NetworkCall::CookieGet { url }) => {
-            let Some(url) = assignment.site.authorize(&url) else {
+            let Some(url) = assignment.site.authorize_url(&url) else {
                 return Err(RendererViolation);
             };
             let reply = ServiceReply::Cookie(assignment.network.cookies_for(&url));
             send_reply(&context.responder, id, reply).await?;
         }
         ServiceCall::Network(NetworkCall::CookieSet { value, url }) => {
-            let Some(url) = assignment.site.authorize(&url) else {
+            let Some(url) = assignment.site.authorize_url(&url) else {
                 return Err(RendererViolation);
             };
             assignment.network.set_cookie(&value, &url);
@@ -759,9 +737,10 @@ async fn route_service_call(
         }) => {
             // `BroadcastChannel` is origin-scoped; a frame's origin is the
             // frame's, so the browser bound is the process site lock.
-            if assignment.site.authorize(&origin).is_none() {
-                return Err(RendererViolation);
-            }
+            let origin = assignment
+                .site
+                .storage_key(&origin)
+                .ok_or(RendererViolation)?;
             context
                 .partition
                 .events
@@ -830,14 +809,14 @@ async fn route_window_call(
             // popup goes out without one rather than leaking it. The dial seam
             // makes the same check
             // (<https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
-            let origin = match authorized_initiator(&assignment.site, &initiator) {
-                Some(origin) => origin.origin(),
-                None if initiator.is_opaque() => opaque_initiator().origin(),
+            let origin = match assignment.site.authorize_origin(&initiator) {
+                Some(origin) => origin,
+                None if initiator.is_opaque() => url::Origin::new_opaque(),
                 None => return Err(RendererViolation),
             };
             let referrer = assignment
                 .site
-                .allows(&referrer)
+                .allows_url(&referrer)
                 .then_some(referrer)
                 .filter(|referrer| referrer.origin() == origin);
             let initiator = crate::actor::NavigationInitiator {
@@ -887,7 +866,7 @@ async fn route_window_call(
             // site lock. An opaque origin has no authority to claim: its
             // serialized `null` passes through, and no tuple-origin document
             // admits it.
-            if !assignment.site.allows_serialized_origin(&message.origin) {
+            if !assignment.site.allows_message_origin(&message.origin) {
                 return Err(RendererViolation);
             }
             let target = TabId::new(window.get());
@@ -906,9 +885,10 @@ async fn route_window_call(
             origin,
             key,
         } => {
-            if !assignment.site.authorizes_origin_claim(&origin) {
-                return Err(RendererViolation);
-            }
+            let origin = assignment
+                .site
+                .storage_key(&origin)
+                .ok_or(RendererViolation)?;
             let target = TabId::new(window.get());
             let related = target == assignment.tab
                 || context.tabs.opener(target) == Some(assignment.tab)
@@ -931,9 +911,17 @@ struct StorageRouter<'a> {
 
 impl StorageRouter<'_> {
     async fn route(&self, call: StorageCall) -> Result<(), RendererViolation> {
+        // Every storage call names one origin; authorize and type it once,
+        // before any area is touched.
         match call {
-            StorageCall::Get { kind, origin, key } => self.get(kind, &origin, &key).await,
-            StorageCall::Keys { kind, origin } => self.keys(kind, &origin).await,
+            StorageCall::Get { kind, origin, key } => {
+                let origin = self.key(&origin)?;
+                self.get(kind, &origin, &key).await
+            }
+            StorageCall::Keys { kind, origin } => {
+                let origin = self.key(&origin)?;
+                self.keys(kind, &origin).await
+            }
             StorageCall::Set {
                 kind,
                 origin,
@@ -941,30 +929,47 @@ impl StorageRouter<'_> {
                 key,
                 value,
                 source,
-            } => self.set(kind, &origin, &url, &key, &value, source).await,
+            } => {
+                let origin = self.key(&origin)?;
+                self.set(kind, &origin, &url, &key, &value, source).await
+            }
             StorageCall::Remove {
                 kind,
                 origin,
                 url,
                 key,
                 source,
-            } => self.remove(kind, &origin, &url, &key, source).await,
+            } => {
+                let origin = self.key(&origin)?;
+                self.remove(kind, &origin, &url, &key, source).await
+            }
             StorageCall::Clear {
                 kind,
                 origin,
                 url,
                 source,
-            } => self.clear(kind, &origin, &url, source).await,
+            } => {
+                let origin = self.key(&origin)?;
+                self.clear(kind, &origin, &url, source).await
+            }
         }
+    }
+
+    /// The typed key for one renderer's origin claim, or a refusal.
+    fn key(&self, origin: &renderer::SerializedOrigin) -> Result<StorageKey, RendererViolation> {
+        self.authority
+            .site
+            .storage_key(origin)
+            .ok_or(RendererViolation)
     }
 
     async fn get(
         &self,
         kind: StorageKind,
-        origin: &str,
+        origin: &StorageKey,
         key: &str,
     ) -> Result<(), RendererViolation> {
-        self.authorize(origin, None)?;
+        self.authorize(None)?;
         let value = match kind {
             StorageKind::Local => self.context.partition.local_storage.get(origin, key),
             StorageKind::Session => self.context.sessions.get(self.authority.tab, origin, key),
@@ -977,8 +982,8 @@ impl StorageRouter<'_> {
         .await
     }
 
-    async fn keys(&self, kind: StorageKind, origin: &str) -> Result<(), RendererViolation> {
-        self.authorize(origin, None)?;
+    async fn keys(&self, kind: StorageKind, origin: &StorageKey) -> Result<(), RendererViolation> {
+        self.authorize(None)?;
         let keys = match kind {
             StorageKind::Local => self.context.partition.local_storage.keys(origin),
             StorageKind::Session => self.context.sessions.keys(self.authority.tab, origin),
@@ -994,13 +999,13 @@ impl StorageRouter<'_> {
     async fn set(
         &self,
         kind: StorageKind,
-        origin: &str,
+        origin: &StorageKey,
         url: &str,
         key: &str,
         value: &str,
         source: FrameId,
     ) -> Result<(), RendererViolation> {
-        self.authorize(origin, Some(url))?;
+        self.authorize(Some(url))?;
         let change = match kind {
             StorageKind::Local => self.context.partition.local_storage.set(origin, key, value),
             StorageKind::Session => {
@@ -1027,12 +1032,12 @@ impl StorageRouter<'_> {
     async fn remove(
         &self,
         kind: StorageKind,
-        origin: &str,
+        origin: &StorageKey,
         url: &str,
         key: &str,
         source: FrameId,
     ) -> Result<(), RendererViolation> {
-        self.authorize(origin, Some(url))?;
+        self.authorize(Some(url))?;
         let change = match kind {
             StorageKind::Local => self.context.partition.local_storage.remove(origin, key),
             StorageKind::Session => self
@@ -1052,11 +1057,11 @@ impl StorageRouter<'_> {
     async fn clear(
         &self,
         kind: StorageKind,
-        origin: &str,
+        origin: &StorageKey,
         url: &str,
         source: FrameId,
     ) -> Result<(), RendererViolation> {
-        self.authorize(origin, Some(url))?;
+        self.authorize(Some(url))?;
         let change = match kind {
             StorageKind::Local => self.context.partition.local_storage.clear(origin),
             StorageKind::Session => self.context.sessions.clear(self.authority.tab, origin),
@@ -1070,10 +1075,8 @@ impl StorageRouter<'_> {
         .await
     }
 
-    fn authorize(&self, origin: &str, url: Option<&str>) -> Result<(), RendererViolation> {
-        if self.authority.site.authorize(origin).is_none()
-            || url.is_some_and(|url| self.authority.site.authorize(url).is_none())
-        {
+    fn authorize(&self, url: Option<&str>) -> Result<(), RendererViolation> {
+        if url.is_some_and(|url| self.authority.site.authorize_url(url).is_none()) {
             return Err(RendererViolation);
         }
         Ok(())
@@ -1083,7 +1086,7 @@ impl StorageRouter<'_> {
         &self,
         source: FrameId,
         kind: StorageKind,
-        origin: &str,
+        origin: &StorageKey,
         url: &str,
         change: Option<&StorageChange>,
     ) {
@@ -1124,7 +1127,7 @@ fn broadcast_local_storage_event(
     context: &ServiceContext,
     assignment: RendererAssignmentId,
     source: FrameId,
-    origin: &str,
+    origin: &StorageKey,
     url: &str,
     change: &StorageChange,
 ) {
@@ -1132,7 +1135,7 @@ fn broadcast_local_storage_event(
         .partition
         .events
         .broadcast(&ContextEvent::Storage(StorageBroadcast {
-            origin: origin.to_owned(),
+            origin: origin.clone(),
             kind: StorageKind::Local,
             key: change.key.clone(),
             old_value: change.old_value.clone(),

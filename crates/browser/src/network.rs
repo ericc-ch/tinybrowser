@@ -308,12 +308,16 @@ fn abort_stream(entry: Option<StreamEntry>) {
     }
 }
 
-fn cache_key(request: &DialRequest, initiator: &Url, partition: RendererAssignmentId) -> CacheKey {
+fn cache_key(
+    request: &DialRequest,
+    initiator: &url::Origin,
+    partition: RendererAssignmentId,
+) -> CacheKey {
     CacheKey {
         method: request.method.clone(),
         url: request.url.clone(),
         credentials: request.policy.cors().credentials,
-        initiator: initiator.origin(),
+        initiator: initiator.clone(),
         partition,
     }
 }
@@ -485,7 +489,7 @@ fn store_response(
 /// Rechecks the request-mode rules that produced a cached filtered response.
 /// The cache partition keeps other origins away, but one document can still
 /// switch modes between requests.
-fn cache_usable(request: &DialRequest, initiator: &Url, entry: &CachedResponse) -> bool {
+fn cache_usable(request: &DialRequest, initiator: &url::Origin, entry: &CachedResponse) -> bool {
     if entry.outcome.response_type.is_opaque() {
         return false;
     }
@@ -496,7 +500,7 @@ fn cache_usable(request: &DialRequest, initiator: &Url, entry: &CachedResponse) 
         return false;
     };
     match cors.mode {
-        renderer::CorsMode::SameOrigin => url.origin() == initiator.origin(),
+        renderer::CorsMode::SameOrigin => url.origin() == *initiator,
         renderer::CorsMode::NoCors => {
             !matches!(entry.outcome.response_type, net::cors::ResponseType::Cors)
         }
@@ -735,7 +739,7 @@ impl TabNetworkHandle {
     pub(crate) async fn dial_request(
         &self,
         request: &DialRequest,
-        initiator: &Url,
+        initiator: &url::Origin,
         owner: RendererAssignmentId,
     ) -> Result<DialOutcome, DialFailure> {
         let started = Instant::now();
@@ -806,7 +810,7 @@ impl TabNetworkHandle {
     async fn send_head(
         &self,
         request: &DialRequest,
-        initiator: &Url,
+        initiator: &url::Origin,
         stored: Option<&CachedResponse>,
         etag: Option<&str>,
     ) -> Result<DialProgress, DialFailure> {
@@ -858,7 +862,7 @@ impl TabNetworkHandle {
     fn start_stream(
         &self,
         request: &DialRequest,
-        initiator: &Url,
+        initiator: &url::Origin,
         owner: RendererAssignmentId,
         mode: RequestCache,
         response: net::Response,
@@ -973,7 +977,7 @@ impl TabNetworkHandle {
     fn cache_read(
         &self,
         request: &DialRequest,
-        initiator: &Url,
+        initiator: &url::Origin,
         owner: RendererAssignmentId,
     ) -> Result<CacheDecision, DialFailure> {
         let mode = request.cache;
@@ -1013,7 +1017,7 @@ impl TabNetworkHandle {
     fn cached_hit(
         &self,
         request: &DialRequest,
-        initiator: &Url,
+        initiator: &url::Origin,
         partition: RendererAssignmentId,
     ) -> Option<CachedResponse> {
         if !request.policy.exposes_response() {
@@ -1065,7 +1069,7 @@ impl TabNetworkHandle {
     fn remember_response(
         &self,
         request: &DialRequest,
-        initiator: &Url,
+        initiator: &url::Origin,
         partition: RendererAssignmentId,
         mode: RequestCache,
         outcome: &DialOutcome,
@@ -1119,7 +1123,7 @@ impl TabNetworkHandle {
     fn build_outbound(
         &self,
         request: &DialRequest,
-        initiator: &Url,
+        initiator: &url::Origin,
         deadline: Instant,
     ) -> Result<Request, DialFailure> {
         let sheets = self
@@ -1153,12 +1157,12 @@ impl TabNetworkHandle {
 /// <https://w3c.github.io/webappsec-csp/#should-request-be-blocked-by-content-security-policy>
 fn watch_redirects(
     request: &DialRequest,
-    initiator: &Url,
+    initiator: &url::Origin,
     outbound: &mut Request,
 ) -> Arc<std::sync::Mutex<Option<Url>>> {
     let blocked = Arc::new(std::sync::Mutex::new(None));
     if let Some(csp) = request.csp.clone() {
-        let document_url = initiator.clone();
+        let document_url = document_url(initiator);
         let blocked = Arc::clone(&blocked);
         outbound.on_redirect = Some(Arc::new(move |next, redirects| {
             if csp.allows(&document_url, next, redirects) {
@@ -1173,6 +1177,20 @@ fn watch_redirects(
     blocked
 }
 
+/// The URL a dial's CSP reports name as their document.
+///
+/// The dial seam carries the initiator origin, not its document URL; an origin
+/// root is the URL the old seam carried too. An opaque origin has no URL, so
+/// reports get `about:blank`; the renderer keeps the real one.
+fn document_url(origin: &url::Origin) -> Url {
+    match origin {
+        url::Origin::Tuple(..) => {
+            Url::parse(&origin.ascii_serialization()).expect("a tuple origin serializes as a URL")
+        }
+        url::Origin::Opaque(_) => Url::parse("about:blank").expect("about:blank is a valid URL"),
+    }
+}
+
 /// Builds the `net` request for one page dial: URL, method, CORS parameters,
 /// headers, body, and initiator.
 /// JS header values are `ByteString`s: each UTF-16 code unit is one byte. The
@@ -1180,7 +1198,7 @@ fn watch_redirects(
 /// into two wire bytes.
 fn outbound_request(
     request: &DialRequest,
-    initiator: &Url,
+    initiator: &url::Origin,
     deadline: Instant,
     sheets: &HashSet<Url>,
 ) -> Result<Request, DialFailure> {
@@ -1213,7 +1231,7 @@ fn outbound_request(
     // name a different origin *within* that site, which shares the renderer
     // process; deriving the origin from a per-frame record the browser owns is
     // a known gap.
-    outbound.cors = cors.with_origin(initiator.origin());
+    outbound.cors = cors.with_origin(initiator.clone());
     if let Some(content_type) = &request.content_type {
         let content_type = isomorphic_encode(content_type).ok_or(DialFailure::Connect)?;
         // The body's type is appended through the same guard as every other
@@ -1258,7 +1276,7 @@ fn outbound_request(
         outbound.body = Some(request.body.clone());
     }
     outbound.initiator_kind = InitiatorKind::Fetch;
-    outbound.initiator = Some(initiator.origin());
+    outbound.initiator = Some(initiator.clone());
     outbound.deadline = Some(deadline);
     // The renderer picks the referrer kind and policy; the browser owns the
     // client environment and the origin check. A referrer URL that is neither
@@ -1269,9 +1287,9 @@ fn outbound_request(
     // (<https://fetch.spec.whatwg.org/#concept-request-referrer>,
     // <https://w3c.github.io/webappsec-referrer-policy/#integration-with-css>).
     outbound.referrer = match &request.referrer {
-        renderer::ReferrerRequest::Client { url } if url.origin() == initiator.origin() => {
+        renderer::ReferrerRequest::Client { url } if url.origin() == *initiator => {
             net::Referrer::Client(net::ReferrerClient {
-                origin: initiator.origin(),
+                origin: initiator.clone(),
                 url: url.clone(),
             })
         }
@@ -1291,8 +1309,8 @@ fn outbound_request(
 /// The sheet arm is what authorizes CSS-initiated requests, whose referrer is
 /// the sheet's URL on whatever host the sheet came from
 /// (<https://w3c.github.io/webappsec-referrer-policy/#integration-with-css>).
-fn referrer_authorized(referrer: &Url, initiator: &Url, sheets: &HashSet<Url>) -> bool {
-    if referrer.origin() == initiator.origin() {
+fn referrer_authorized(referrer: &Url, initiator: &url::Origin, sheets: &HashSet<Url>) -> bool {
+    if referrer.origin() == *initiator {
         return true;
     }
     let mut stripped = referrer.clone();
@@ -1629,7 +1647,7 @@ mod tests {
     fn every_policy_reaches_the_wire_with_its_own_parameters() {
         use net::cors::{CredentialsMode, RedirectMode, RequestMode};
 
-        let initiator = Url::parse("http://a.test/page").expect("page URL");
+        let initiator = Url::parse("http://a.test/page").expect("page URL").origin();
         let deadline = Instant::now() + Duration::from_secs(5);
         let sheets = HashSet::new();
         let anonymous = Some(net::cors::CrossOrigin::Anonymous);
@@ -1743,7 +1761,7 @@ mod tests {
             assert_eq!(outbound.cors.redirect, redirect, "{:?}", policy.kind());
             assert_eq!(
                 outbound.cors.origin,
-                initiator.origin(),
+                initiator.clone(),
                 "the browser fills in the origin it authorized"
             );
             assert_eq!(
@@ -1768,7 +1786,7 @@ mod tests {
     fn a_no_cors_body_cannot_smuggle_a_non_safelisted_content_type() {
         use net::cors::{CredentialsMode, RedirectMode};
 
-        let initiator = Url::parse("http://a.test/page").expect("page URL");
+        let initiator = Url::parse("http://a.test/page").expect("page URL").origin();
         let deadline = Instant::now() + Duration::from_secs(5);
         let sheets = HashSet::new();
         let mut request = dial(
@@ -1814,8 +1832,10 @@ mod tests {
     #[test]
     fn cache_partitions_by_document_and_initiator_origin() {
         let request = js_fetch(renderer::CorsMode::Cors, "http://a.test/data");
-        let initiator = Url::parse("http://a.test/page").expect("page URL");
-        let other_initiator = Url::parse("http://b.test/page").expect("other URL");
+        let initiator = Url::parse("http://a.test/page").expect("page URL").origin();
+        let other_initiator = Url::parse("http://b.test/page")
+            .expect("other URL")
+            .origin();
         let first = cache_key(&request, &initiator, RendererAssignmentId::new(1));
         let same = cache_key(&request, &initiator, RendererAssignmentId::new(1));
         let other_document = cache_key(&request, &initiator, RendererAssignmentId::new(2));
@@ -1828,7 +1848,7 @@ mod tests {
     #[test]
     fn cached_cors_response_is_not_reused_as_no_cors_across_origins() {
         let request = js_fetch(renderer::CorsMode::NoCors, "http://b.test/data");
-        let initiator = Url::parse("http://a.test/page").expect("page URL");
+        let initiator = Url::parse("http://a.test/page").expect("page URL").origin();
         assert!(!cache_usable(
             &request,
             &initiator,
@@ -1956,7 +1976,7 @@ mod tests {
         };
         stream_request.delivery = BodyDelivery::Stream;
         let outcome = handle
-            .dial_request(&stream_request, &initiator, owner)
+            .dial_request(&stream_request, &initiator.origin(), owner)
             .await
             .expect("stream head");
         let ResponseBody::Streamed(stream) = outcome.body else {
@@ -1983,7 +2003,7 @@ mod tests {
         };
         let next = tokio::time::timeout(
             Duration::from_secs(1),
-            handle.dial_request(&next_request, &initiator, owner),
+            handle.dial_request(&next_request, &initiator.origin(), owner),
         )
         .await
         .expect("the next dial gets the released permit")
@@ -2024,7 +2044,7 @@ mod tests {
         });
         let context = NetworkContext::new(AgentOptions::default());
         let handle = context.tab_handle();
-        let initiator = Url::parse("http://a.test/page").expect("page URL");
+        let initiator = Url::parse("http://a.test/page").expect("page URL").origin();
         let owner = RendererAssignmentId::new(1);
         let url = format!("http://{address}/img");
 
@@ -2190,7 +2210,7 @@ mod tests {
             url: initiator.clone(),
         };
         let first = handle
-            .dial_request(&request, &initiator, owner)
+            .dial_request(&request, &initiator.origin(), owner)
             .await
             .expect("first dial");
         assert_eq!(first.status, 200);
@@ -2203,7 +2223,7 @@ mod tests {
         );
 
         let revalidated = handle
-            .dial_request(&request, &initiator, owner)
+            .dial_request(&request, &initiator.origin(), owner)
             .await
             .expect("revalidation");
         assert_eq!(revalidated.status, 200, "a 304 merges into the stored head");
@@ -2246,7 +2266,7 @@ mod tests {
     #[test]
     fn cache_evicts_the_oldest_entry_at_the_count_limit() {
         let mut cache = HashMap::new();
-        let initiator = Url::parse("http://a.test/page").expect("page URL");
+        let initiator = Url::parse("http://a.test/page").expect("page URL").origin();
         let keys: Vec<CacheKey> = (0..=CACHE_MAX_ENTRIES)
             .map(|index| {
                 let mut request = js_fetch(renderer::CorsMode::Cors, "http://a.test/data");
@@ -2275,7 +2295,7 @@ mod tests {
     fn cache_evicts_by_body_bytes_from_the_oldest_entry() {
         let bodies = CACHE_MAX_BYTES / renderer::MAX_RESPONSE_BODY_BYTES + 1;
         let mut cache = HashMap::new();
-        let initiator = Url::parse("http://a.test/page").expect("page URL");
+        let initiator = Url::parse("http://a.test/page").expect("page URL").origin();
         let keys: Vec<CacheKey> = (0..bodies)
             .map(|index| {
                 let mut request = js_fetch(renderer::CorsMode::Cors, "http://a.test/data");

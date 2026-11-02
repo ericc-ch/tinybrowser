@@ -24,18 +24,27 @@ impl NetworkHost for NullServices {
 }
 
 impl StorageHost for NullServices {
-    fn storage_get(&self, _kind: StorageKind, _origin: &str, _key: &str) -> Option<String> {
+    fn storage_get(
+        &self,
+        _kind: StorageKind,
+        _origin: &crate::protocol::StorageKey,
+        _key: &str,
+    ) -> Option<String> {
         None
     }
 
-    fn storage_keys(&self, _kind: StorageKind, _origin: &str) -> Vec<String> {
+    fn storage_keys(
+        &self,
+        _kind: StorageKind,
+        _origin: &crate::protocol::StorageKey,
+    ) -> Vec<String> {
         Vec::new()
     }
 
     fn storage_set(
         &self,
         _kind: StorageKind,
-        _origin: &str,
+        _origin: &crate::protocol::StorageKey,
         _url: &str,
         _key: &str,
         _value: &str,
@@ -47,7 +56,7 @@ impl StorageHost for NullServices {
     fn storage_remove(
         &self,
         _kind: StorageKind,
-        _origin: &str,
+        _origin: &crate::protocol::StorageKey,
         _url: &str,
         _key: &str,
         _source: FrameId,
@@ -58,7 +67,7 @@ impl StorageHost for NullServices {
     fn storage_clear(
         &self,
         _kind: StorageKind,
-        _origin: &str,
+        _origin: &crate::protocol::StorageKey,
         _url: &str,
         _source: FrameId,
     ) -> Option<StorageChange> {
@@ -95,7 +104,7 @@ impl BrowsingContextHost for NullServices {
     fn remote_session_get(
         &self,
         _window: crate::protocol::WindowId,
-        _origin: &str,
+        _origin: &crate::protocol::StorageKey,
         _key: &str,
     ) -> Option<String> {
         None
@@ -103,5 +112,12 @@ impl BrowsingContextHost for NullServices {
 }
 
 impl MessagingHost for NullServices {
-    fn broadcast_post(&self, _origin: &str, _name: &str, _payload: &str, _channel: u64) {}
+    fn broadcast_post(
+        &self,
+        _origin: &crate::protocol::StorageKey,
+        _name: &str,
+        _payload: &str,
+        _channel: u64,
+    ) {
+    }
 }

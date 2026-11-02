@@ -1241,11 +1241,11 @@ pub trait NetworkHost: Send + Sync + 'static {
 pub trait StorageHost: Send + Sync + 'static {
     /// `Storage.getItem(key)`
     /// (<https://html.spec.whatwg.org/multipage/webstorage.html#dom-storage-getitem>).
-    fn storage_get(&self, kind: StorageKind, origin: &str, key: &str) -> Option<String>;
+    fn storage_get(&self, kind: StorageKind, origin: &StorageKey, key: &str) -> Option<String>;
 
     /// The keys of `origin`'s local storage area, in the area's iteration
     /// order (<https://html.spec.whatwg.org/multipage/webstorage.html#dom-storage-key>).
-    fn storage_keys(&self, kind: StorageKind, origin: &str) -> Vec<String>;
+    fn storage_keys(&self, kind: StorageKind, origin: &StorageKey) -> Vec<String>;
 
     /// `localStorage.setItem(key, value)`. `url` is the mutating document's
     /// URL and `source` its frame; the browser excludes it from the broadcast.
@@ -1257,7 +1257,7 @@ pub trait StorageHost: Send + Sync + 'static {
     fn storage_set(
         &self,
         kind: StorageKind,
-        origin: &str,
+        origin: &StorageKey,
         url: &str,
         key: &str,
         value: &str,
@@ -1268,7 +1268,7 @@ pub trait StorageHost: Send + Sync + 'static {
     fn storage_remove(
         &self,
         kind: StorageKind,
-        origin: &str,
+        origin: &StorageKey,
         url: &str,
         key: &str,
         source: FrameId,
@@ -1278,7 +1278,7 @@ pub trait StorageHost: Send + Sync + 'static {
     fn storage_clear(
         &self,
         kind: StorageKind,
-        origin: &str,
+        origin: &StorageKey,
         url: &str,
         source: FrameId,
     ) -> Option<StorageChange>;
@@ -1336,13 +1336,18 @@ pub trait BrowsingContextHost: Send + Sync + 'static {
     fn window_post_message(&self, window: WindowId, message: PostedMessage);
 
     /// Reads one key from another tab's same-origin session area.
-    fn remote_session_get(&self, window: WindowId, origin: &str, key: &str) -> Option<String>;
+    fn remote_session_get(
+        &self,
+        window: WindowId,
+        origin: &StorageKey,
+        key: &str,
+    ) -> Option<String>;
 }
 
 /// Cross-context messaging effects the page engine asks its host to perform.
 pub trait MessagingHost: Send + Sync + 'static {
     /// `BroadcastChannel.postMessage` for every same-origin channel.
-    fn broadcast_post(&self, origin: &str, name: &str, payload: &str, channel: u64);
+    fn broadcast_post(&self, origin: &StorageKey, name: &str, payload: &str, channel: u64);
 }
 
 /// An origin as a cross-tab message carries it: a tuple origin, or the opaque
@@ -1414,6 +1419,61 @@ impl<'de> Deserialize<'de> for SerializedOrigin {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let raw = String::deserialize(deserializer)?;
         Self::parse(&raw).ok_or_else(|| serde::de::Error::custom("invalid origin"))
+    }
+}
+
+/// The key of one origin's storage areas: a tuple origin, never opaque.
+///
+/// Storage exists only for tuple origins
+/// (<https://html.spec.whatwg.org/multipage/webstorage.html#the-localstorage-attribute>).
+/// Keying the areas by a serialized string let several spellings of one origin
+/// (`https://example.test`, `https://example.test/path`,
+/// `HTTPS://EXAMPLE.TEST`) create separate areas, and let `about:blank` stand
+/// for every opaque document. Parsing normalizes a URL to its origin, so the
+/// wire and the persisted profile stay strings while the map sees one value per
+/// origin.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct StorageKey(url::Origin);
+
+impl StorageKey {
+    /// The key for `origin`, or `None` when it is opaque.
+    #[must_use]
+    pub fn from_origin(origin: &url::Origin) -> Option<Self> {
+        matches!(origin, url::Origin::Tuple(..)).then(|| Self(origin.clone()))
+    }
+
+    /// Reads one serialized origin; a full URL normalizes to its origin.
+    #[must_use]
+    pub fn parse(spec: &str) -> Option<Self> {
+        match SerializedOrigin::parse(spec)? {
+            SerializedOrigin::Tuple(origin) => Some(Self(origin)),
+            SerializedOrigin::Opaque => None,
+        }
+    }
+
+    /// The origin this key names.
+    #[must_use]
+    pub fn origin(&self) -> &url::Origin {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for StorageKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0.ascii_serialization())
+    }
+}
+
+impl Serialize for StorageKey {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for StorageKey {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        Self::parse(&raw).ok_or_else(|| serde::de::Error::custom("a storage key is a tuple origin"))
     }
 }
 

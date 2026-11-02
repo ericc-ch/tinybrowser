@@ -19,8 +19,8 @@ use url::Url;
 use crate::exchange::{Frame, RequestId};
 use renderer::{
     BrowserEvent, DialFailure, DialOutcome, DialRequest, FrameId, OpenerPolicy, PostedMessage,
-    RemoteValue, SerializedOrigin, StorageChange, StorageError, StorageKind, StreamId, TabError,
-    WindowId,
+    RemoteValue, SerializedOrigin, StorageChange, StorageError, StorageKey, StorageKind, StreamId,
+    TabError, WindowId,
 };
 
 /// Browser-minted identity of one top-level document hosted by a renderer.
@@ -177,8 +177,8 @@ pub enum HostNotice {
     /// `origin` except the source window fires a `storage` event
     /// (<https://html.spec.whatwg.org/multipage/webstorage.html#concept-storage-broadcast>).
     StorageEvent {
-        /// Serialized origin whose area changed.
-        origin: String,
+        /// Storage key whose area changed.
+        origin: StorageKey,
         /// Which area changed.
         kind: StorageKind,
         /// The changed key, or `None` for `clear()`.
@@ -196,8 +196,8 @@ pub enum HostNotice {
     },
     /// One same-origin `BroadcastChannel` message.
     BroadcastMessage {
-        /// Serialized origin whose channels receive it.
-        origin: String,
+        /// Storage key whose channels receive it.
+        origin: StorageKey,
         /// Channel name.
         name: String,
         /// `__tbEncode` payload from the posting realm.
@@ -314,7 +314,7 @@ pub enum StorageCall {
         /// Storage area kind.
         kind: StorageKind,
         /// Serialized origin of the calling document.
-        origin: String,
+        origin: SerializedOrigin,
         /// Item key.
         key: String,
     },
@@ -323,14 +323,14 @@ pub enum StorageCall {
         /// Storage area kind.
         kind: StorageKind,
         /// Serialized origin of the calling document.
-        origin: String,
+        origin: SerializedOrigin,
     },
     /// `localStorage.setItem(key, value)`.
     Set {
         /// Storage area kind.
         kind: StorageKind,
         /// Serialized origin of the calling document.
-        origin: String,
+        origin: SerializedOrigin,
         /// Calling document URL; the `storage` event reports it.
         url: String,
         /// Item key.
@@ -345,7 +345,7 @@ pub enum StorageCall {
         /// Storage area kind.
         kind: StorageKind,
         /// Serialized origin of the calling document.
-        origin: String,
+        origin: SerializedOrigin,
         /// Calling document URL.
         url: String,
         /// Item key.
@@ -358,7 +358,7 @@ pub enum StorageCall {
         /// Storage area kind.
         kind: StorageKind,
         /// Serialized origin of the calling document.
-        origin: String,
+        origin: SerializedOrigin,
         /// Calling document URL.
         url: String,
         /// Frame whose script made the change.
@@ -410,7 +410,7 @@ pub enum BrowsingContextCall {
         /// Target window identity.
         window: WindowId,
         /// Serialized origin of the calling document.
-        origin: String,
+        origin: SerializedOrigin,
         /// Encoded item key.
         key: String,
     },
@@ -422,7 +422,7 @@ pub enum MessagingCall {
     /// One `BroadcastChannel.postMessage` for every same-origin channel.
     BroadcastPost {
         /// Serialized origin of the posting document.
-        origin: String,
+        origin: SerializedOrigin,
         /// Channel name.
         name: String,
         /// `__tbEncode` payload from the posting realm.

@@ -343,11 +343,21 @@ impl NetworkHost for HostServices {
     }
 }
 
+/// One storage key as the wire claim, which is the serialized origin.
+fn claim(origin: &renderer::StorageKey) -> renderer::SerializedOrigin {
+    renderer::SerializedOrigin::from(origin.origin())
+}
+
 impl StorageHost for HostServices {
-    fn storage_get(&self, kind: StorageKind, origin: &str, key: &str) -> Option<String> {
+    fn storage_get(
+        &self,
+        kind: StorageKind,
+        origin: &renderer::StorageKey,
+        key: &str,
+    ) -> Option<String> {
         match self.call(ServiceCall::Storage(StorageCall::Get {
             kind,
-            origin: origin.to_owned(),
+            origin: claim(origin),
             key: key.to_owned(),
         })) {
             Some(ServiceReply::StorageValue(value)) => value,
@@ -355,10 +365,10 @@ impl StorageHost for HostServices {
         }
     }
 
-    fn storage_keys(&self, kind: StorageKind, origin: &str) -> Vec<String> {
+    fn storage_keys(&self, kind: StorageKind, origin: &renderer::StorageKey) -> Vec<String> {
         match self.call(ServiceCall::Storage(StorageCall::Keys {
             kind,
-            origin: origin.to_owned(),
+            origin: claim(origin),
         })) {
             Some(ServiceReply::StorageKeys(keys)) => keys,
             _ => Vec::new(),
@@ -368,7 +378,7 @@ impl StorageHost for HostServices {
     fn storage_set(
         &self,
         kind: StorageKind,
-        origin: &str,
+        origin: &renderer::StorageKey,
         url: &str,
         key: &str,
         value: &str,
@@ -376,7 +386,7 @@ impl StorageHost for HostServices {
     ) -> Result<Option<StorageChange>, StorageError> {
         match self.call(ServiceCall::Storage(StorageCall::Set {
             kind,
-            origin: origin.to_owned(),
+            origin: claim(origin),
             url: url.to_owned(),
             key: key.to_owned(),
             value: value.to_owned(),
@@ -390,14 +400,14 @@ impl StorageHost for HostServices {
     fn storage_remove(
         &self,
         kind: StorageKind,
-        origin: &str,
+        origin: &renderer::StorageKey,
         url: &str,
         key: &str,
         source: FrameId,
     ) -> Option<StorageChange> {
         match self.call(ServiceCall::Storage(StorageCall::Remove {
             kind,
-            origin: origin.to_owned(),
+            origin: claim(origin),
             url: url.to_owned(),
             key: key.to_owned(),
             source,
@@ -410,13 +420,13 @@ impl StorageHost for HostServices {
     fn storage_clear(
         &self,
         kind: StorageKind,
-        origin: &str,
+        origin: &renderer::StorageKey,
         url: &str,
         source: FrameId,
     ) -> Option<StorageChange> {
         match self.call(ServiceCall::Storage(StorageCall::Clear {
             kind,
-            origin: origin.to_owned(),
+            origin: claim(origin),
             url: url.to_owned(),
             source,
         })) {
@@ -470,11 +480,16 @@ impl BrowsingContextHost for HostServices {
         ));
     }
 
-    fn remote_session_get(&self, window: WindowId, origin: &str, key: &str) -> Option<String> {
+    fn remote_session_get(
+        &self,
+        window: WindowId,
+        origin: &renderer::StorageKey,
+        key: &str,
+    ) -> Option<String> {
         match self.call(ServiceCall::BrowsingContext(
             BrowsingContextCall::RemoteSessionGet {
                 window,
-                origin: origin.to_owned(),
+                origin: claim(origin),
                 key: key.to_owned(),
             },
         )) {
@@ -485,9 +500,15 @@ impl BrowsingContextHost for HostServices {
 }
 
 impl MessagingHost for HostServices {
-    fn broadcast_post(&self, origin: &str, name: &str, payload: &str, channel: u64) {
+    fn broadcast_post(
+        &self,
+        origin: &renderer::StorageKey,
+        name: &str,
+        payload: &str,
+        channel: u64,
+    ) {
         let _result = self.call(ServiceCall::Messaging(MessagingCall::BroadcastPost {
-            origin: origin.to_owned(),
+            origin: claim(origin),
             name: name.to_owned(),
             payload: payload.to_owned(),
             channel,

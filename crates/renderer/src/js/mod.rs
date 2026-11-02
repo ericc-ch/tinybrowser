@@ -1495,6 +1495,12 @@ fn install_window_messaging_functions(
         "__tbBroadcastPost",
         Func::from(
             move |origin: String, name: String, payload: String, channel: u64| {
+                // The shim passes back the serialized origin this realm gave
+                // it; parsing it at the boundary keeps the engine side typed
+                // and refuses a forged one.
+                let Some(origin) = crate::protocol::StorageKey::parse(&origin) else {
+                    return;
+                };
                 let world = broadcast.borrow();
                 // A channel in a detached iframe must not reach live contexts
                 // (<https://html.spec.whatwg.org/multipage/web-messaging.html#broadcasting-to-other-browsing-contexts>).
@@ -1636,7 +1642,7 @@ fn install_storage_host_functions(
     let origin = world.clone();
     bridge::object(ctx)?.set(
         "__tbStorageOrigin",
-        Func::from(move || origin.borrow().storage_origin()),
+        Func::from(move || origin.borrow().storage_origin().map(|key| key.to_string())),
     )?;
 
     let get = world.clone();

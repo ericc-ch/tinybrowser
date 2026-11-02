@@ -910,10 +910,11 @@ impl Document {
         Rc::clone(&self.world)
     }
 
-    /// The serialized origin of the frame's document.
-    #[must_use]
-    pub(crate) fn origin_string(&self) -> String {
-        self.world.borrow().origin.ascii_serialization()
+    /// The storage key of this document's origin, or `None` for an opaque
+    /// origin, where the storage getters throw `SecurityError`
+    /// (<https://html.spec.whatwg.org/multipage/webstorage.html#the-localstorage-attribute>).
+    pub(crate) fn storage_key(&self) -> Option<crate::protocol::StorageKey> {
+        self.world.borrow().storage_origin()
     }
 
     /// The root node of the frame's active document.

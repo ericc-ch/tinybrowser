@@ -271,14 +271,14 @@ fn cookie_jar() -> &'static Mutex<CookieJar> {
 /// insertion order: the storage proxy exposes enumeration and `key(index)`
 /// directly, and a `HashMap` would make both unstable.
 /// A browser tab has no profile on disk, so the areas die with the component.
-fn local_storage() -> &'static Mutex<HashMap<String, StorageArea>> {
-    static AREAS: OnceLock<Mutex<HashMap<String, StorageArea>>> = OnceLock::new();
+fn local_storage() -> &'static Mutex<HashMap<renderer::StorageKey, StorageArea>> {
+    static AREAS: OnceLock<Mutex<HashMap<renderer::StorageKey, StorageArea>>> = OnceLock::new();
     AREAS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// Session storage namespaces keyed by component tab owner.
-fn session_storage() -> &'static Mutex<HashMap<u64, HashMap<String, StorageArea>>> {
-    static NAMESPACES: OnceLock<Mutex<HashMap<u64, HashMap<String, StorageArea>>>> =
+fn session_storage() -> &'static Mutex<HashMap<u64, HashMap<renderer::StorageKey, StorageArea>>> {
+    static NAMESPACES: OnceLock<Mutex<HashMap<u64, HashMap<renderer::StorageKey, StorageArea>>>> =
         OnceLock::new();
     NAMESPACES.get_or_init(|| Mutex::new(HashMap::new()))
 }
@@ -570,7 +570,12 @@ impl NetworkHost for WasmServices {
 }
 
 impl StorageHost for WasmServices {
-    fn storage_get(&self, kind: StorageKind, origin: &str, key: &str) -> Option<String> {
+    fn storage_get(
+        &self,
+        kind: StorageKind,
+        origin: &renderer::StorageKey,
+        key: &str,
+    ) -> Option<String> {
         match kind {
             StorageKind::Local => lock(local_storage())
                 .get(origin)
@@ -582,7 +587,7 @@ impl StorageHost for WasmServices {
         }
     }
 
-    fn storage_keys(&self, kind: StorageKind, origin: &str) -> Vec<String> {
+    fn storage_keys(&self, kind: StorageKind, origin: &renderer::StorageKey) -> Vec<String> {
         match kind {
             StorageKind::Local => lock(local_storage())
                 .get(origin)
@@ -599,7 +604,7 @@ impl StorageHost for WasmServices {
     fn storage_set(
         &self,
         kind: StorageKind,
-        origin: &str,
+        origin: &renderer::StorageKey,
         _url: &str,
         key: &str,
         value: &str,
@@ -607,13 +612,13 @@ impl StorageHost for WasmServices {
     ) -> Result<Option<StorageChange>, renderer::StorageError> {
         match kind {
             StorageKind::Local => lock(local_storage())
-                .entry(origin.to_owned())
+                .entry(origin.clone())
                 .or_default()
                 .set(key, value),
             StorageKind::Session => lock(session_storage())
                 .entry(self.owner)
                 .or_default()
-                .entry(origin.to_owned())
+                .entry(origin.clone())
                 .or_default()
                 .set(key, value),
         }
@@ -622,7 +627,7 @@ impl StorageHost for WasmServices {
     fn storage_remove(
         &self,
         kind: StorageKind,
-        origin: &str,
+        origin: &renderer::StorageKey,
         _url: &str,
         key: &str,
         _source: renderer::FrameId,
@@ -639,7 +644,7 @@ impl StorageHost for WasmServices {
     fn storage_clear(
         &self,
         kind: StorageKind,
-        origin: &str,
+        origin: &renderer::StorageKey,
         _url: &str,
         _source: renderer::FrameId,
     ) -> Option<StorageChange> {
@@ -677,7 +682,7 @@ impl BrowsingContextHost for WasmServices {
     fn remote_session_get(
         &self,
         _window: renderer::WindowId,
-        _origin: &str,
+        _origin: &renderer::StorageKey,
         _key: &str,
     ) -> Option<String> {
         None
@@ -685,7 +690,14 @@ impl BrowsingContextHost for WasmServices {
 }
 
 impl MessagingHost for WasmServices {
-    fn broadcast_post(&self, _origin: &str, _name: &str, _payload: &str, _channel: u64) {}
+    fn broadcast_post(
+        &self,
+        _origin: &renderer::StorageKey,
+        _name: &str,
+        _payload: &str,
+        _channel: u64,
+    ) {
+    }
 }
 
 impl Drop for WasmServices {

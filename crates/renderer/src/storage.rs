@@ -1,6 +1,6 @@
 //! Storage changes waiting for delivery in a renderer.
 
-use crate::protocol::{FrameId, StorageKind};
+use crate::protocol::{FrameId, StorageKey, StorageKind};
 
 /// One change waiting on the `storage`-event task of every receiving frame.
 #[derive(Clone, Debug)]
@@ -10,8 +10,8 @@ pub struct PendingStorageEvent {
     /// The source window itself never receives the event
     /// (<https://html.spec.whatwg.org/multipage/webstorage.html#concept-storage-broadcast>).
     pub source: Option<FrameId>,
-    /// Serialized origin shared by the change and its receivers.
-    pub origin: String,
+    /// Origin shared by the change and its receivers; storage has no opaque case.
+    pub origin: StorageKey,
     pub kind: StorageKind,
     pub key: Option<String>,
     pub old_value: Option<String>,
@@ -25,7 +25,7 @@ impl PendingStorageEvent {
     /// sets `source` for the assignment that made it.
     #[must_use]
     pub fn broadcast(
-        origin: String,
+        origin: StorageKey,
         kind: StorageKind,
         key: Option<String>,
         old_value: Option<String>,

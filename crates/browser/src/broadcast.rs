@@ -8,14 +8,14 @@
 
 use std::sync::{Mutex, PoisonError};
 
-use renderer::{FrameId, StorageKind};
+use renderer::{FrameId, StorageKey, StorageKind};
 
 use crate::wire::RendererAssignmentId;
 
 /// One `BroadcastChannel.postMessage` broadcast.
 #[derive(Clone, Debug)]
 pub(crate) struct BroadcastMessage {
-    pub(crate) origin: String,
+    pub(crate) origin: StorageKey,
     pub(crate) name: String,
     pub(crate) payload: String,
     /// Assignment and per-realm channel id that posted it.
@@ -25,7 +25,7 @@ pub(crate) struct BroadcastMessage {
 /// One storage mutation delivered to eligible renderer frames.
 #[derive(Clone, Debug)]
 pub(crate) struct StorageBroadcast {
-    pub(crate) origin: String,
+    pub(crate) origin: StorageKey,
     pub(crate) kind: StorageKind,
     pub(crate) key: Option<String>,
     pub(crate) old_value: Option<String>,

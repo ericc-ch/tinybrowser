@@ -799,25 +799,23 @@ impl Engine {
     /// (<https://html.spec.whatwg.org/multipage/web-messaging.html#broadcasting-to-other-browsing-contexts>).
     pub fn receive_broadcast_message(
         &mut self,
-        origin: &str,
+        origin: &crate::protocol::StorageKey,
         name: &str,
         payload: &str,
         source: Option<u64>,
     ) {
         for document in self.frames.values_mut() {
-            // Two opaque origins never share a `BroadcastChannel`
+            // Two opaque origins never share a `BroadcastChannel`, and the
+            // key has no opaque case at all
             // (<https://html.spec.whatwg.org/multipage/web-messaging.html#broadcasting-to-other-browsing-contexts>).
-            // Their serialization is `"null"` for every document, so matching
-            // it would deliver across unrelated opaque documents.
-            let target = document.origin_string();
-            if target != origin || target == "null" {
+            if document.storage_key().as_ref() != Some(origin) {
                 continue;
             }
             if !document.world().borrow().is_attached() {
                 continue;
             }
             document.push_broadcast_message(
-                origin.to_owned(),
+                origin.to_string(),
                 name.to_owned(),
                 payload.to_owned(),
                 source,
@@ -854,7 +852,7 @@ impl Engine {
             let Some(document) = self.frames.get_mut(&frame) else {
                 continue;
             };
-            if document.origin_string() != event.origin {
+            if document.storage_key().as_ref() != Some(&event.origin) {
                 continue;
             }
             document.push_storage_event(event.clone());

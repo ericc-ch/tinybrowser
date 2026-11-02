@@ -1,5 +1,6 @@
 //! Renderer identity: one site instance per scheme plus registrable domain.
 
+use renderer::{SerializedOrigin, StorageKey};
 use url::Url;
 
 use crate::actor::TabId;
@@ -7,14 +8,19 @@ use crate::actor::TabId;
 /// Chrome-style site: scheme plus registrable domain (`https://example.co.uk`),
 /// or an opaque per-tab instance for non-HTTP(S) documents.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct Site(String);
+pub(crate) enum Site {
+    /// One HTTP(S) site: `https://example.co.uk`.
+    Tuple(String),
+    /// One tab's non-network documents.
+    Opaque(TabId),
+}
 
 impl Site {
     /// Site for an HTTP(S) URL; `None` for opaque or non-HTTP URLs.
     #[must_use]
     pub(crate) fn for_url(url: &Url) -> Option<Self> {
         if url.scheme() == "http" || url.scheme() == "https" {
-            net::site(url).map(Self)
+            net::site(url).map(Self::Tuple)
         } else {
             None
         }
@@ -23,7 +29,7 @@ impl Site {
     /// Opaque instance for one tab's non-HTTP documents.
     #[must_use]
     pub(crate) fn opaque(tab: TabId) -> Self {
-        Self(format!("opaque:tab-{}", tab.get()))
+        Self::Opaque(tab)
     }
 
     /// Whether a document URL belongs in a renderer locked to this site.
@@ -35,73 +41,78 @@ impl Site {
     /// granting access to origin data:
     /// <https://chromium.googlesource.com/chromium/src/+/main/docs/process_model_and_site_isolation.md#process-locks>.
     #[must_use]
-    pub(crate) fn allows(&self, url: &Url) -> bool {
+    pub(crate) fn allows_url(&self, url: &Url) -> bool {
         match Self::for_url(url) {
             Some(site) => site == *self,
             None => {
-                self.0.starts_with("opaque:") && matches!(url.scheme(), "about" | "blob" | "data")
+                matches!(self, Self::Opaque(_)) && matches!(url.scheme(), "about" | "blob" | "data")
             }
         }
     }
 
-    pub(crate) fn authorize(&self, spec: &str) -> Option<Url> {
-        Url::parse(spec).ok().filter(|url| self.allows(url))
+    /// Parses one document URL and checks it against this lock. This is the
+    /// entry point for URLs (cookie operations and referrer checks); origin
+    /// claims use [`Self::authorize_origin`].
+    pub(crate) fn authorize_url(&self, spec: &str) -> Option<Url> {
+        Url::parse(spec).ok().filter(|url| self.allows_url(url))
     }
 
-    /// Whether a renderer-supplied origin string names an origin inside this
-    /// lock.
+    /// The tuple origin one renderer claims, when this lock authorizes it.
     ///
     /// The renderer hosts every same-site frame, and a frame's origin differs
     /// from the top-level document's while staying inside the lock:
     /// `https://ads.example.test` inside `https://www.example.test`, or one
     /// host on another port (`site` ignores the port). The lock is the trust
     /// boundary — one renderer process is one authority — and it is the same
-    /// bound `postMessage` and `BroadcastChannel` apply. Recording per-frame
-    /// origins would not narrow it: the browser would learn them from the
-    /// process it is checking, and every frame in that process is the same
-    /// trust unit
+    /// bound `postMessage`, `BroadcastChannel`, and storage apply. Recording
+    /// per-frame origins would not narrow it: the browser would learn them
+    /// from the process it is checking, and every frame in that process is the
+    /// same trust unit
     /// (<https://chromium.googlesource.com/chromium/src/+/main/docs/process_model_and_site_isolation.md#process-locks>).
     ///
-    /// An opaque claim names no origin data: it has no storage keyed by a
-    /// tuple, and `"null"` is shared by every opaque document
-    /// (<https://html.spec.whatwg.org/multipage/browsers.html#serialized-origins>).
+    /// An opaque claim names no tuple origin and is not authorized here; the
+    /// messaging entry point decides whether an opaque sender is allowed.
     #[must_use]
-    pub(crate) fn authorizes_origin_claim(&self, spec: &str) -> bool {
-        match renderer::SerializedOrigin::parse(spec) {
-            Some(renderer::SerializedOrigin::Tuple(origin)) => self.allows_origin(&origin),
-            Some(renderer::SerializedOrigin::Opaque) | None => false,
+    pub(crate) fn authorize_origin(&self, claim: &SerializedOrigin) -> Option<url::Origin> {
+        match claim {
+            SerializedOrigin::Tuple(origin) if self.allows_origin(origin) => Some(origin.clone()),
+            SerializedOrigin::Tuple(_) | SerializedOrigin::Opaque => None,
         }
     }
 
-    /// Whether one message's claimed sender origin belongs in a renderer locked
-    /// to this site.
+    /// The storage key one renderer claims, when this lock authorizes it and
+    /// the origin is a tuple origin.
+    ///
+    /// Storage has no opaque case: the getter throws `SecurityError` for an
+    /// opaque document in the renderer, and the browser refuses one that
+    /// arrives anyway
+    /// (<https://html.spec.whatwg.org/multipage/webstorage.html#the-localstorage-attribute>).
+    #[must_use]
+    pub(crate) fn storage_key(&self, claim: &SerializedOrigin) -> Option<StorageKey> {
+        StorageKey::from_origin(&self.authorize_origin(claim)?)
+    }
+
+    /// Whether one message's claimed sender origin may be delivered as coming
+    /// from this renderer.
     ///
     /// An opaque origin claims no authority, so it passes: the receiving
     /// document's target-origin check is what rejects a delivery it does not
     /// want. A tuple origin must belong to this site.
     #[must_use]
-    pub(crate) fn allows_serialized_origin(&self, origin: &renderer::SerializedOrigin) -> bool {
+    pub(crate) fn allows_message_origin(&self, origin: &SerializedOrigin) -> bool {
         match origin {
-            renderer::SerializedOrigin::Opaque => true,
-            renderer::SerializedOrigin::Tuple(origin) => self.allows_origin(origin),
+            SerializedOrigin::Opaque => true,
+            SerializedOrigin::Tuple(origin) => self.allows_origin(origin),
         }
     }
 
-    /// Whether a parsed origin belongs in a renderer locked to this site.
-    ///
-    /// The origin's scheme and host stand in for a document URL: only an
-    /// HTTP(S) site lock can accept a tuple origin, and an opaque origin names
-    /// no principal to authorize.
+    /// Whether a parsed tuple origin belongs in a renderer locked to this site.
     #[must_use]
-    pub(crate) fn allows_origin(&self, origin: &url::Origin) -> bool {
-        let url::Origin::Tuple(scheme, host, port) = origin else {
+    fn allows_origin(&self, origin: &url::Origin) -> bool {
+        let url::Origin::Tuple(..) = origin else {
             return false;
         };
-        let Ok(mut url) = Url::parse(&format!("{scheme}://{host}")) else {
-            return false;
-        };
-        let _ = url.set_port(Some(*port));
-        self.allows(&url)
+        Url::parse(&origin.ascii_serialization()).is_ok_and(|url| self.allows_url(&url))
     }
 }
 
@@ -113,14 +124,14 @@ mod tests {
     fn renderer_site_lock_rejects_other_principals() {
         let locked =
             Site::for_url(&Url::parse("https://a.example.test/").expect("url")).expect("site");
-        assert!(locked.allows(&Url::parse("https://b.example.test/path").expect("url")));
-        assert!(!locked.allows(&Url::parse("http://a.example.test/").expect("url")));
-        assert!(!locked.allows(&Url::parse("https://other.test/").expect("url")));
+        assert!(locked.allows_url(&Url::parse("https://b.example.test/path").expect("url")));
+        assert!(!locked.allows_url(&Url::parse("http://a.example.test/").expect("url")));
+        assert!(!locked.allows_url(&Url::parse("https://other.test/").expect("url")));
 
         let opaque = Site::opaque(TabId::new(7));
-        assert!(opaque.allows(&Url::parse("about:blank").expect("url")));
-        assert!(!opaque.allows(&Url::parse("file:///etc/passwd").expect("url")));
-        assert!(!opaque.allows(&Url::parse("https://example.test/").expect("url")));
+        assert!(opaque.allows_url(&Url::parse("about:blank").expect("url")));
+        assert!(!opaque.allows_url(&Url::parse("file:///etc/passwd").expect("url")));
+        assert!(!opaque.allows_url(&Url::parse("https://example.test/").expect("url")));
     }
 
     /// A renderer's origin claim is bounded by the site, not by the top-level
@@ -136,19 +147,64 @@ mod tests {
             "https://ads.example.test",
             "https://example.test:8443",
         ] {
-            assert!(locked.authorizes_origin_claim(allowed), "{allowed}");
+            assert!(
+                locked
+                    .authorize_origin(&claim(allowed))
+                    .is_some_and(|origin| origin.ascii_serialization() == allowed),
+                "{allowed}"
+            );
         }
         for rejected in [
             "https://other.test",
             "http://ads.example.test",
             "null",
             "about:blank",
-            "garbage",
         ] {
-            assert!(!locked.authorizes_origin_claim(rejected), "{rejected}");
+            assert!(
+                locked.authorize_origin(&claim(rejected)).is_none(),
+                "{rejected}"
+            );
         }
         let opaque = Site::opaque(TabId::new(7));
-        assert!(!opaque.authorizes_origin_claim("null"));
-        assert!(!opaque.authorizes_origin_claim("https://www.example.test"));
+        assert!(opaque.authorize_origin(&claim("null")).is_none());
+        assert!(
+            opaque
+                .authorize_origin(&claim("https://www.example.test"))
+                .is_none()
+        );
+    }
+
+    /// Storage is keyed by the tuple origin, and a claim that is not one is
+    /// refused instead of becoming a shared `"null"` area.
+    #[test]
+    fn storage_keys_are_tuple_origins() {
+        let locked =
+            Site::for_url(&Url::parse("https://www.example.test/").expect("url")).expect("site");
+        let key = locked
+            .storage_key(&claim("https://ads.example.test/path?q#f"))
+            .expect("a same-site tuple origin");
+        assert_eq!(key.to_string(), "https://ads.example.test");
+        // Every spelling of one origin is one key.
+        for spelling in [
+            "https://ads.example.test/",
+            "https://ads.example.test/a?b#c",
+            "HTTPS://ADS.EXAMPLE.TEST",
+        ] {
+            assert_eq!(
+                locked.storage_key(&claim(spelling)).as_ref(),
+                Some(&key),
+                "{spelling}"
+            );
+        }
+        assert!(locked.storage_key(&claim("null")).is_none());
+        assert!(locked.storage_key(&claim("https://other.test")).is_none());
+
+        let opaque = Site::opaque(TabId::new(7));
+        assert!(opaque.storage_key(&claim("null")).is_none());
+        assert!(opaque.storage_key(&claim("about:blank")).is_none());
+    }
+
+    fn claim(spec: &str) -> SerializedOrigin {
+        SerializedOrigin::parse(spec).expect("a serialized origin")
     }
 }

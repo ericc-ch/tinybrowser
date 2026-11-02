@@ -21,7 +21,7 @@ use crate::dom_string::DomString;
 use crate::js::FrameRuntime;
 use crate::js::canvas::{Canvas2D, Gradient, Pattern, SourceImage};
 use crate::messaging::{MAX_FRAMES, SharedHandle};
-use crate::protocol::{FrameId, StorageChange, StorageError, StorageKind};
+use crate::protocol::{FrameId, StorageChange, StorageError, StorageKey, StorageKind};
 
 pub(crate) use crate::protocol::PolicyContainer;
 use crate::storage::PendingStorageEvent;
@@ -2589,11 +2589,8 @@ impl World {
     /// The origin scoping this realm's storage areas, or `None` for an opaque
     /// origin, where the storage getters must throw `SecurityError`
     /// (<https://html.spec.whatwg.org/multipage/webstorage.html#the-localstorage-attribute>).
-    pub(crate) fn storage_origin(&self) -> Option<String> {
-        match self.origin {
-            url::Origin::Tuple(..) => Some(self.origin_string()),
-            url::Origin::Opaque(_) => None,
-        }
+    pub(crate) fn storage_origin(&self) -> Option<StorageKey> {
+        StorageKey::from_origin(&self.origin)
     }
 
     /// `Storage.getItem(key)` for the `"local"` or `"session"` area.
@@ -2686,7 +2683,7 @@ impl World {
     /// Queues the event for a change this engine made. Only `sessionStorage`
     /// needs it: `localStorage` changes return as a browser broadcast, which
     /// excludes the source frame.
-    fn queue_storage_event(&self, kind: StorageKind, origin: &str, change: &StorageChange) {
+    fn queue_storage_event(&self, kind: StorageKind, origin: &StorageKey, change: &StorageChange) {
         if kind != StorageKind::Session {
             return;
         }
@@ -2695,7 +2692,7 @@ impl World {
             .borrow_mut()
             .push(PendingStorageEvent {
                 source: Some(self.frame),
-                origin: origin.to_owned(),
+                origin: origin.clone(),
                 kind,
                 key: change.key.clone(),
                 old_value: change.old_value.clone(),

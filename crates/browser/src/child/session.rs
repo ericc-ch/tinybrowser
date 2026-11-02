@@ -309,7 +309,7 @@ fn assign_engine(
 /// only the posting assignment skips the source channel.
 fn queue_broadcast_message(
     engines: &mut HashMap<RendererAssignmentId, Engine>,
-    origin: &str,
+    origin: &renderer::StorageKey,
     name: &str,
     payload: &str,
     source: Option<(RendererAssignmentId, u64)>,
