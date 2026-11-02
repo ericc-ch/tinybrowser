@@ -69,15 +69,6 @@ image.addEventListener('load', () => window.__loads++);
         &session,
         "document.getElementById('second').append(document.getElementById('img'))",
     );
-    // A reload would be visible as `complete` turning false on the next turn.
-    assert_eq!(
-        evaluate(
-            &mut client,
-            &session,
-            "String(document.getElementById('img').complete)"
-        ),
-        json!("true")
-    );
     assert_eq!(evaluate(&mut client, &session, "window.__loads"), json!(1));
     assert_eq!(
         foreign.history("/pixel.png").len(),

@@ -78,6 +78,9 @@ const TLS_SERVER_KEY_PEM: &str = "\
 -----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgiOq3Tq7nKzsvkH8R\nCv2ScQ1xyfEou4Fvhl0JLJDob3ihRANCAARaU9LlsB9YYhjXs5HSIoylgAjx9GY8\nhaKduRJhUaGe0xXXBx62Rf7XRCdAfnzL4svr8w4EgUe5iEbWNJTWNBdK\n-----END PRIVATE KEY-----\n";
 
 /// One HTTPS loopback server whose page title says it was reached over TLS.
+///
+/// A framed copy also reports its `isSecureContext` bit to the parent, so a
+/// test can put it under an insecure document.
 fn https_server() -> (String, TestServer) {
     let identity = native_tls::Identity::from_pkcs8(
         TLS_SERVER_CERT_PEM.as_bytes(),
@@ -87,7 +90,12 @@ fn https_server() -> (String, TestServer) {
     let server = TestServer::start_tls(
         vec![(
             "/",
-            ok("text/html", b"<!doctype html><title>trusted</title>"),
+            ok(
+                "text/html",
+                b"<!doctype html><script>\
+                  if (parent !== window) parent.postMessage(String(isSecureContext), '*');\
+                  </script><title>trusted</title>",
+            ),
         )],
         identity,
     );
@@ -130,6 +138,66 @@ fn a_tls_ca_from_the_command_line_makes_an_https_navigation_load() {
     let (addr, _fixture) = start_in(trusted, vec![format!("--tls-ca={}", ca.display())]);
     let loaded = navigate_new_session(&addr, &url);
     assert_eq!(loaded["value"], Value::Null, "{loaded}");
+}
+
+/// An `https` document under an insecure parent is not a secure context: its
+/// URL is potentially trustworthy, but every ancestor must be too
+/// (<https://html.spec.whatwg.org/multipage/webappapis.html#secure-contexts>).
+///
+/// The parent is plain http on `example.test`, a non-loopback host, so only the
+/// inheritance rule can make the loopback `https` child insecure.
+#[test]
+fn an_https_child_of_an_insecure_parent_is_not_a_secure_context() {
+    let (url, _server) = https_server();
+    let parent = TestServer::start(
+        vec![(
+            "/",
+            ok(
+                "text/html",
+                format!(
+                    "<!doctype html><iframe src=\"{url}\"></iframe>\
+                     <script>addEventListener('message', event => window.__child = event.data)</script>"
+                )
+                .as_bytes(),
+            ),
+        )],
+        None,
+    );
+
+    let fixture = Fixture::new("tinybrowser-webdriver-secure-context");
+    let ca = fixture.data().join("test-ca.pem");
+    std::fs::write(&ca, TLS_SERVER_CERT_PEM).expect("write CA");
+    let (addr, _fixture) = start_in(
+        fixture,
+        vec![
+            format!("--tls-ca={}", ca.display()),
+            "--resolve=*.test=127.0.0.1".to_owned(),
+        ],
+    );
+    let id = create_session(&addr);
+    navigate(
+        &addr,
+        &id,
+        &format!("http://example.test:{}/", parent.address().port()),
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let reported = request(
+            &addr,
+            "POST",
+            &format!("/session/{id}/execute/sync"),
+            Some(r#"{"script":"return window.__child ?? 'pending'","args":[]}"#),
+        );
+        if reported["value"] == json!("false") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the https child never reported its bit: {reported}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// A readable `--tls-ca` is part of the network configuration, so the server

@@ -26,6 +26,29 @@ pub(crate) fn cross_origin(setting: Option<blitz_traits::net::CorsSetting>) -> O
     })
 }
 
+/// The element's `referrerpolicy` state, as the policy the carrier applies to
+/// the dial. Blitz parses and compares the attribute state; the carrier owns
+/// the referrer algorithm, so this is the one keyword-to-keyword translation
+/// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#referrer-policy-attribute>).
+pub(crate) fn referrer_policy(policy: blitz_traits::net::ReferrerPolicy) -> net::ReferrerPolicy {
+    match policy {
+        blitz_traits::net::ReferrerPolicy::NoReferrer => net::ReferrerPolicy::NoReferrer,
+        blitz_traits::net::ReferrerPolicy::NoReferrerWhenDowngrade => {
+            net::ReferrerPolicy::NoReferrerWhenDowngrade
+        }
+        blitz_traits::net::ReferrerPolicy::Origin => net::ReferrerPolicy::Origin,
+        blitz_traits::net::ReferrerPolicy::OriginWhenCrossOrigin => {
+            net::ReferrerPolicy::OriginWhenCrossOrigin
+        }
+        blitz_traits::net::ReferrerPolicy::SameOrigin => net::ReferrerPolicy::SameOrigin,
+        blitz_traits::net::ReferrerPolicy::StrictOrigin => net::ReferrerPolicy::StrictOrigin,
+        blitz_traits::net::ReferrerPolicy::StrictOriginWhenCrossOrigin => {
+            net::ReferrerPolicy::StrictOriginWhenCrossOrigin
+        }
+        blitz_traits::net::ReferrerPolicy::UnsafeUrl => net::ReferrerPolicy::UnsafeUrl,
+    }
+}
+
 /// Maximum aggregate bytes retained for one streamed response.
 ///
 /// A Wikipedia article is already past 1 MiB. 8 MiB still caps one document

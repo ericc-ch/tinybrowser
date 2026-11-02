@@ -484,7 +484,8 @@ struct BlitzRequest {
     /// The URL and CORS settings state the request went out under, as Blitz
     /// keys its cache and settlements.
     key: blitz_dom::ImageKey,
-    referrer_policy: Option<String>,
+    /// The `referrerpolicy` state sampled when Blitz created the request.
+    referrer_policy: Option<blitz_traits::net::ReferrerPolicy>,
     node: Option<crate::dom::tree::NodeId>,
     destination: Option<crate::csp::Destination>,
 }
@@ -3904,8 +3905,7 @@ impl Document {
                 // (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#referrer-policy-attribute>).
                 let policy = request
                     .referrer_policy
-                    .as_deref()
-                    .and_then(net::ReferrerPolicy::parse)
+                    .map(crate::protocol::referrer_policy)
                     .or(self.world.borrow().policy.referrer_policy)
                     .unwrap_or_default();
                 (

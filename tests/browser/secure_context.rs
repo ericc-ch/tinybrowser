@@ -78,9 +78,12 @@ fn a_data_document_is_never_secure_and_its_child_inherits_it() {
     );
 }
 
-/// A child of a potentially trustworthy document inherits the bit, and an
-/// `https` child of an insecure document stays insecure
+/// A child of a potentially trustworthy document inherits the bit
 /// (<https://html.spec.whatwg.org/multipage/webappapis.html#secure-contexts>).
+///
+/// The other direction, an `https` child of an insecure document, needs a
+/// trusted TLS server, so it lives in `webdriver.rs`
+/// (`an_https_child_of_an_insecure_parent_is_not_a_secure_context`).
 #[test]
 fn a_child_inherits_its_creators_secure_context() {
     let (listener, page) = server();

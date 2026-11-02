@@ -572,35 +572,168 @@ fn a_link_crossorigin_write_refetches_the_sheet() {
     );
 }
 
-/// HTML samples the element's `referrerpolicy` when it creates the request, so
-/// a write before the request leaves the renderer cannot change what the first
-/// request sends
+/// The `Referer` value of one recorded request head, if it sent one.
+fn referer(head: &str) -> Option<&str> {
+    head.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("referer")
+            .then(|| value.trim_start())
+    })
+}
+
+/// The element's `referrerpolicy` state reaches the dial: `unsafe-url` sends
+/// the full page URL, `no-referrer` sends nothing, and an element without the
+/// attribute follows the document's `<meta name=referrer>` fallback
 /// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#referrer-policy-attribute>).
 #[test]
-fn a_referrerpolicy_write_does_not_change_an_earlier_request() {
-    let foreign = TestServer::start(vec![("/pixel.png", ok("image/png", PIXEL))], None);
+fn each_referrerpolicy_state_reaches_the_dial() {
+    let foreign = TestServer::start(
+        vec![
+            ("/unsafe.png", ok("image/png", PIXEL)),
+            ("/none.png", ok("image/png", PIXEL)),
+            ("/meta.png", ok("image/png", PIXEL)),
+        ],
+        None,
+    );
     let page = format!(
-        "<!doctype html><body>
-<script>
-const image = document.createElement('img');
-image.referrerPolicy = 'no-referrer';
-image.src = 'http://{}/pixel.png';
-// The request exists now; this write starts over, and the pending request
-// keeps the policy it was created with.
-image.referrerPolicy = 'unsafe-url';
-document.body.append(image);
-</script>
-",
+        r#"<!doctype html><head><meta name="referrer" content="origin"></head><body>
+<img src="http://{0}/unsafe.png" referrerpolicy="unsafe-url">
+<img src="http://{0}/none.png" referrerpolicy="no-referrer">
+<img src="http://{0}/meta.png">
+</body>"#,
         foreign.address()
     );
     let (listener, origin) = server();
-    TestServer::serve_on(listener, vec![("/", ok("text/html", page.as_bytes()))]);
-    let (_fixture, _client, _session) =
-        open_page("tinybrowser-referrer-sampled", &format!("http://{origin}/"));
+    TestServer::serve_on(
+        listener,
+        vec![("/page/index.html", ok("text/html", page.as_bytes()))],
+    );
+    let (_fixture, _client, _session) = open_page(
+        "tinybrowser-referrer-states",
+        &format!("http://{origin}/page/index.html"),
+    );
 
-    let head = foreign.wait("/pixel.png").to_ascii_lowercase();
+    // A non-root page, so the full URL and the origin serialize differently.
+    let full = format!("http://{origin}/page/index.html");
+    let origin_only = format!("http://{origin}/");
+    let unsafe_head = foreign.wait("/unsafe.png");
+    assert_eq!(
+        referer(&unsafe_head),
+        Some(full.as_str()),
+        "unsafe-url sends the full URL: {unsafe_head}"
+    );
+    let none_head = foreign.wait("/none.png");
+    assert_eq!(
+        referer(&none_head),
+        None,
+        "no-referrer sends no Referer at all: {none_head}"
+    );
+    let meta_head = foreign.wait("/meta.png");
+    assert_eq!(
+        referer(&meta_head),
+        Some(origin_only.as_str()),
+        "the document's meta fallback decides an element with no attribute: {meta_head}"
+    );
+}
+
+/// A write that leaves the `referrerpolicy` attribute's *state* alone does not
+/// restart the request: `NO-REFERRER` is the same state as `no-referrer`, and
+/// two invalid values are both the invalid value default
+/// (<https://html.spec.whatwg.org/multipage/images.html#reacting-to-dom-mutations>).
+#[test]
+fn a_referrerpolicy_write_that_keeps_the_state_does_not_restart() {
+    let foreign = TestServer::start(
+        vec![
+            ("/named.png", ok("image/png", PIXEL)),
+            ("/invalid.png", ok("image/png", PIXEL)),
+        ],
+        None,
+    );
+    let page = format!(
+        r#"<!doctype html><body>
+<img id="named" referrerpolicy="no-referrer" src="http://{0}/named.png">
+<img id="invalid" referrerpolicy="bogus" src="http://{0}/invalid.png">
+<script>
+window.__loads = 0;
+for (const name of ['named', 'invalid']) {{
+  document.getElementById(name).addEventListener('load', () => window.__loads++);
+}}
+</script>"#,
+        foreign.address()
+    );
+    let (listener, origin) = server();
+    TestServer::serve_on(
+        listener,
+        vec![("/page/index.html", ok("text/html", page.as_bytes()))],
+    );
+    let (_fixture, mut client, session) = open_page(
+        "tinybrowser-referrer-state",
+        &format!("http://{origin}/page/index.html"),
+    );
+    poll_until("both images to load", || {
+        (evaluate(&mut client, &session, "window.__loads") == json!(2)).then_some(())
+    });
+
+    evaluate(
+        &mut client,
+        &session,
+        "document.getElementById('named').setAttribute('referrerpolicy', 'NO-REFERRER');\
+         document.getElementById('invalid').setAttribute('referrerpolicy', 'other-bogus')",
+    );
+    // A restart would fire `load` again on the next turn.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert_eq!(
+        evaluate(&mut client, &session, "window.__loads"),
+        json!(2),
+        "a write that keeps the parsed state must not restart the request"
+    );
+    assert_eq!(foreign.history("/named.png").len(), 1);
+    assert_eq!(foreign.history("/invalid.png").len(), 1);
+}
+
+/// A `referrerpolicy` state change while the request is in flight dials it
+/// again: the request the page replaced was sampled with the old policy, so
+/// the new state can only take effect on a new request
+/// (<https://html.spec.whatwg.org/multipage/images.html#reacting-to-dom-mutations>,
+/// <https://html.spec.whatwg.org/multipage/urls-and-fetching.html#referrer-policy-attribute>).
+#[test]
+fn a_referrerpolicy_state_change_dials_the_in_flight_request_again() {
+    let (foreign_listener, _) = server();
+    let foreign = TestServer::serve_on_after(
+        foreign_listener,
+        vec![("/slow.png", ok("image/png", PIXEL))],
+        std::time::Duration::from_millis(400),
+    );
+    let page = format!(
+        r"<!doctype html><body><script>
+const image = document.createElement('img');
+image.referrerPolicy = 'no-referrer';
+image.src = 'http://{}/slow.png';
+image.referrerPolicy = 'unsafe-url';
+document.body.append(image);
+</script>",
+        foreign.address()
+    );
+    let (listener, origin) = server();
+    TestServer::serve_on(
+        listener,
+        vec![("/page/index.html", ok("text/html", page.as_bytes()))],
+    );
+    let (_fixture, _client, _session) = open_page(
+        "tinybrowser-referrer-restart",
+        &format!("http://{origin}/page/index.html"),
+    );
+
+    let requests = foreign.wait_count("/slow.png", 2);
+    let referers: Vec<Option<&str>> = requests.iter().map(|head| referer(head)).collect();
+    let full = format!("http://{origin}/page/index.html");
     assert!(
-        !head.contains("\r\nreferer:"),
-        "the sampled no-referrer policy must win: {head}"
+        referers.contains(&Some(full.as_str())),
+        "the restarted request carries the state the page set: {requests:?}"
+    );
+    assert_eq!(
+        referers.iter().filter(|value| value.is_none()).count(),
+        1,
+        "the request sampled before the write kept its no-referrer state: {requests:?}"
     );
 }
