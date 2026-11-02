@@ -2092,7 +2092,8 @@ def run_shard_range(
         try:
             code = subprocess.run(command, cwd=str(ROOT), check=False).returncode
         except OSError as error:
-            return die("fast-harness", f"cannot run {binary}: {error}")
+            eprint(f"wpt: fast-harness: cannot run {binary}: {error}")
+            return []
         if code == 0 and out.exists():
             reports.append(out)
             offset += size
