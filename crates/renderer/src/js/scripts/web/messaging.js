@@ -883,9 +883,7 @@ globalThis.BroadcastChannel = class BroadcastChannel extends EventTarget {
       throw new globalThis.DOMException('The channel is closed.', 'InvalidStateError');
     }
     const encoded = __tbEncode(message, [], null);
-    const origin = host.__tbStorageOrigin();
-    if (origin === null || origin === undefined) return;
-    host.__tbBroadcastPost(origin, data.name, encoded.payload, data.id);
+    host.__tbBroadcastPost(data.name, encoded.payload, data.id);
   }
   close() {
     const data = __tbBrand(this, __tbBroadcastData);

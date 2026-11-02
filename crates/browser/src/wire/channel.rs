@@ -515,7 +515,11 @@ mod tests {
             Some("text/html".to_owned()),
             &[("Referrer-Policy".to_owned(), "origin".to_owned())],
         );
-        let local = ResponseHead::local(url.clone(), None, None);
+        let local = ResponseHead::local(
+            url.clone(),
+            None,
+            Some(renderer::PolicyContainer::default()),
+        );
         let inherited = ResponseHead::local(
             url,
             None,

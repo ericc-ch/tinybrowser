@@ -1908,9 +1908,9 @@ impl Document {
         let policy = head.source.policy();
         self.response_policy = policy.csp.clone();
         self.response_referrer_policy = policy.referrer_policy;
-        // A local-scheme document clones its creator's whole container; an
-        // HTTP document starts from its headers and adds its creator's bit,
-        // which the navigation carried
+        // A local-scheme document clones its creator's whole container, and its
+        // creator's secure-context bit is the one it inherits. A document with no
+        // creator has no bit to inherit, so its own URL decides
         // (<https://html.spec.whatwg.org/multipage/browsers.html#determining-navigation-params-policy-container>).
         let creator = match &head.source {
             crate::protocol::ResponseSource::Http(_) => self.creator_secure_context,

@@ -2469,22 +2469,18 @@ impl World {
         StorageKey::from_origin(&self.origin)
     }
 
-    /// `Storage.getItem(key)` for the `"local"` or `"session"` area.
-    pub(crate) fn storage_get(&self, kind: &str, key: &str) -> Option<String> {
+    /// `Storage.getItem(key)`.
+    pub(crate) fn storage_get(&self, kind: StorageKind, key: &str) -> Option<String> {
         let origin = self.storage_origin()?;
-        self.runtime
-            .services
-            .storage_get(Self::storage_kind(kind), &origin, key)
+        self.runtime.services.storage_get(kind, &origin, key)
     }
 
     /// The keys of one storage area, in the area's iteration order.
-    pub(crate) fn storage_keys(&self, kind: &str) -> Vec<String> {
+    pub(crate) fn storage_keys(&self, kind: StorageKind) -> Vec<String> {
         let Some(origin) = self.storage_origin() else {
             return Vec::new();
         };
-        self.runtime
-            .services
-            .storage_keys(Self::storage_kind(kind), &origin)
+        self.runtime.services.storage_keys(kind, &origin)
     }
 
     /// `Storage.setItem(key, value)`; `Ok(None)` means no change and the error
@@ -2493,14 +2489,13 @@ impl World {
     /// (<https://html.spec.whatwg.org/multipage/webstorage.html#concept-storage-broadcast>).
     pub(crate) fn storage_set(
         &self,
-        kind: &str,
+        kind: StorageKind,
         key: &str,
         value: &str,
     ) -> Result<Option<StorageChange>, StorageError> {
         let Some(origin) = self.storage_origin() else {
             return Ok(None);
         };
-        let kind = Self::storage_kind(kind);
         let change = self.runtime.services.storage_set(
             kind,
             &origin,
@@ -2516,9 +2511,8 @@ impl World {
     }
 
     /// `Storage.removeItem(key)`; `None` means the key was absent.
-    pub(crate) fn storage_remove(&self, kind: &str, key: &str) -> Option<StorageChange> {
+    pub(crate) fn storage_remove(&self, kind: StorageKind, key: &str) -> Option<StorageChange> {
         let origin = self.storage_origin()?;
-        let kind = Self::storage_kind(kind);
         let change = self.runtime.services.storage_remove(
             kind,
             &origin,
@@ -2533,9 +2527,8 @@ impl World {
     }
 
     /// `Storage.clear()`; `None` means the area was empty.
-    pub(crate) fn storage_clear(&self, kind: &str) -> Option<StorageChange> {
+    pub(crate) fn storage_clear(&self, kind: StorageKind) -> Option<StorageChange> {
         let origin = self.storage_origin()?;
-        let kind = Self::storage_kind(kind);
         let change = self.runtime.services.storage_clear(
             kind,
             &origin,
@@ -2546,14 +2539,6 @@ impl World {
             self.queue_storage_event(kind, &origin, change);
         }
         change
-    }
-
-    fn storage_kind(kind: &str) -> StorageKind {
-        if kind == "session" {
-            StorageKind::Session
-        } else {
-            StorageKind::Local
-        }
     }
 
     /// Queues the event for a change this engine made. Only `sessionStorage`

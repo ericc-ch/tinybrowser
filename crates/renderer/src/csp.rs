@@ -114,6 +114,16 @@ pub struct List {
     policies: Vec<Policy>,
 }
 
+impl List {
+    /// An empty list, usable in a constant.
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            policies: Vec::new(),
+        }
+    }
+}
+
 /// Inline content being checked: an inline script, `javascript:` navigation,
 /// event handler, style block, or style attribute.
 pub(crate) struct InlineScript<'a> {

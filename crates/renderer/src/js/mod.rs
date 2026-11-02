@@ -1501,26 +1501,23 @@ fn install_window_messaging_functions(
     let broadcast = world.clone();
     bridge::object(ctx)?.set(
         "__tbBroadcastPost",
-        Func::from(
-            move |origin: String, name: String, payload: String, channel: u64| {
-                // The shim passes back the serialized origin this realm gave
-                // it; parsing it at the boundary keeps the engine side typed
-                // and refuses a forged one.
-                let Some(origin) = crate::protocol::StorageKey::parse(&origin) else {
-                    return;
-                };
-                let world = broadcast.borrow();
-                // A channel in a detached iframe must not reach live contexts
-                // (<https://html.spec.whatwg.org/multipage/web-messaging.html#broadcasting-to-other-browsing-contexts>).
-                if !world.is_attached() {
-                    return;
-                }
-                world
-                    .runtime
-                    .services
-                    .broadcast_post(&origin, &name, &payload, channel);
-            },
-        ),
+        Func::from(move |name: String, payload: String, channel: u64| {
+            let world = broadcast.borrow();
+            // A channel in a detached iframe must not reach live contexts
+            // (<https://html.spec.whatwg.org/multipage/web-messaging.html#broadcasting-to-other-browsing-contexts>).
+            if !world.is_attached() {
+                return;
+            }
+            // An opaque origin has no area to broadcast in, and the realm's own
+            // origin is the only one a channel can be scoped to.
+            let Some(origin) = world.storage_origin() else {
+                return;
+            };
+            world
+                .runtime
+                .services
+                .broadcast_post(&origin, &name, &payload, channel);
+        }),
     )?;
     Ok(())
 }
@@ -1683,37 +1680,70 @@ fn install_storage_host_functions(
     let get = world.clone();
     bridge::object(ctx)?.set(
         "__tbStorageGet",
-        Func::from(move |kind: String, key: String| get.borrow().storage_get(&kind, &key)),
+        Func::from(
+            move |ctx: Ctx<'_>, kind: String, key: String| -> rquickjs::Result<Option<String>> {
+                let kind = storage_area(&ctx, &kind)?;
+                Ok(get.borrow().storage_get(kind, &key))
+            },
+        ),
     )?;
 
     let keys = world.clone();
     bridge::object(ctx)?.set(
         "__tbStorageKeys",
-        Func::from(move |kind: String| keys.borrow().storage_keys(&kind)),
+        Func::from(
+            move |ctx: Ctx<'_>, kind: String| -> rquickjs::Result<Vec<String>> {
+                let kind = storage_area(&ctx, &kind)?;
+                Ok(keys.borrow().storage_keys(kind))
+            },
+        ),
     )?;
 
     let set = world.clone();
     bridge::object(ctx)?.set(
         "__tbStorageSet",
-        Func::from(move |kind: String, key: String, value: String| {
-            set.borrow().storage_set(&kind, &key, &value).is_ok()
-        }),
+        Func::from(
+            move |ctx: Ctx<'_>,
+                  kind: String,
+                  key: String,
+                  value: String|
+                  -> rquickjs::Result<bool> {
+                let kind = storage_area(&ctx, &kind)?;
+                Ok(set.borrow().storage_set(kind, &key, &value).is_ok())
+            },
+        ),
     )?;
 
     let remove = world.clone();
     bridge::object(ctx)?.set(
         "__tbStorageRemove",
-        Func::from(move |kind: String, key: String| {
-            remove.borrow().storage_remove(&kind, &key).is_some()
-        }),
+        Func::from(
+            move |ctx: Ctx<'_>, kind: String, key: String| -> rquickjs::Result<bool> {
+                let kind = storage_area(&ctx, &kind)?;
+                Ok(remove.borrow().storage_remove(kind, &key).is_some())
+            },
+        ),
     )?;
 
     let clear = world.clone();
     bridge::object(ctx)?.set(
         "__tbStorageClear",
-        Func::from(move |kind: String| clear.borrow().storage_clear(&kind).is_some()),
+        Func::from(
+            move |ctx: Ctx<'_>, kind: String| -> rquickjs::Result<bool> {
+                let kind = storage_area(&ctx, &kind)?;
+                Ok(clear.borrow().storage_clear(kind).is_some())
+            },
+        ),
     )?;
     Ok(())
+}
+
+/// The storage area the shim names: `"local"` or `"session"`. The shim is the
+/// only caller, so an unknown name is an engine bug: it throws instead of
+/// silently selecting `localStorage`.
+fn storage_area(ctx: &Ctx<'_>, kind: &str) -> rquickjs::Result<crate::protocol::StorageKind> {
+    crate::protocol::StorageKind::parse(kind)
+        .ok_or_else(|| rquickjs::Exception::throw_type(ctx, "unknown storage area"))
 }
 
 impl Drop for JsRealm {

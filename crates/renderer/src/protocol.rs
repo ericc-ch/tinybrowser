@@ -8,6 +8,7 @@
 
 use std::fmt;
 
+use enumerated::Enumerated;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -344,6 +345,18 @@ impl StorageKind {
             Self::Session => "session",
         }
     }
+
+    /// The area a shim token names, or `None` for anything else. The shim is
+    /// the only caller, so an unknown token is an engine bug rather than page
+    /// input.
+    #[must_use]
+    pub fn parse(token: &str) -> Option<Self> {
+        match token {
+            "local" => Some(Self::Local),
+            "session" => Some(Self::Session),
+            _ => None,
+        }
+    }
 }
 
 /// One top-level response: a complete [`ResponseHead`] plus its body. The
@@ -421,7 +434,9 @@ pub enum ResponseSource {
     /// A document whose bytes never came over the network.
     Local {
         /// The policy container the response inherits from its initiator, when
-        /// there is one
+        /// there is one. `None` is a document with no creator, which is not the
+        /// same as an insecure creator: its own secure-context bit then comes
+        /// from its URL alone
         /// (<https://html.spec.whatwg.org/multipage/browsers.html#determining-navigation-params-policy-container>).
         inherited: Option<PolicyContainer>,
     },
@@ -460,11 +475,23 @@ impl ResponseSource {
         }
     }
 
-    /// The policy container this document runs under.
+    /// The policy container this document runs under: an HTTP response's
+    /// headers, or the container a local-scheme document inherited.
+    ///
+    /// A document with no creator inherits the empty container, which has the
+    /// same policy fields but no secure-context bit to inherit; the bit is read
+    /// from the creator separately, because a missing creator is not an
+    /// insecure one.
     #[must_use]
     pub fn policy(&self) -> &PolicyContainer {
-        static EMPTY: std::sync::LazyLock<PolicyContainer> =
-            std::sync::LazyLock::new(PolicyContainer::default);
+        // A `static`, not a runtime default: `PolicyContainer` owns a `Vec`, so
+        // a constant can live here but cannot be promoted to a borrowed
+        // `'static` from a temporary.
+        static EMPTY: PolicyContainer = PolicyContainer {
+            csp: crate::csp::List::empty(),
+            referrer_policy: None,
+            secure_context: false,
+        };
         match self {
             Self::Http(head) => &head.policy,
             Self::Local { inherited } => inherited.as_ref().unwrap_or(&EMPTY),
@@ -808,97 +835,96 @@ impl DialRequest {
     }
 }
 
-/// How a dial delivers its response body to the renderer.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum BodyDelivery {
-    /// Read the whole body before answering.
-    Buffer,
-    /// Answer with the head and stream the body in chunks.
-    Stream,
+enumerated::enumerated! {
+    /// How a dial delivers its response body to the renderer.
+    #[derive(serde::Serialize, serde::Deserialize)]
+    pub BodyDelivery {
+        /// Read the whole body before answering.
+        Buffer => "buffer",
+        /// Answer with the head and stream the body in chunks.
+        Stream => "stream",
+    }
 }
 
 impl BodyDelivery {
-    /// Parses the `delivery` value `fetch.js` sends: the one spelling of each
-    /// delivery the renderer accepts, so a typo cannot become a silent buffer
-    /// request.
+    /// Parses the `delivery` value `fetch.js` sends, which is exact-match: the
+    /// one spelling of each delivery the renderer accepts, so a typo cannot
+    /// become a silent buffer request.
     #[must_use]
     pub fn from_idl(value: &str) -> Option<Self> {
-        match value {
-            "buffer" => Some(Self::Buffer),
-            "stream" => Some(Self::Stream),
-            _ => None,
-        }
+        Self::KEYWORDS
+            .iter()
+            .copied()
+            .find(|delivery| delivery.keyword() == value)
     }
 }
 
-/// A `fetch` request's cache mode
-/// (<https://fetch.spec.whatwg.org/#concept-request-cache-mode>). The renderer
-/// parses the `RequestInit.cache` string once; the browser matches on this
-/// instead of re-reading a string.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-pub enum RequestCache {
-    /// Consult the HTTP cache, and revalidate a stale entry.
-    #[default]
-    Default,
-    /// Neither consult nor populate the HTTP cache.
-    NoStore,
-    /// Bypass the HTTP cache for this request and update it.
-    Reload,
-    /// Bypass the HTTP cache only after revalidating a stored entry.
-    NoCache,
-    /// Use a stored entry even when it is stale.
-    ForceCache,
-    /// Fail when no stored entry exists.
-    OnlyIfCached,
+enumerated::enumerated! {
+    /// A `fetch` request's cache mode
+    /// (<https://fetch.spec.whatwg.org/#concept-request-cache-mode>). The
+    /// renderer parses the `RequestInit.cache` string once; the browser matches
+    /// on this instead of re-reading a string.
+    #[derive(Default, serde::Serialize, serde::Deserialize)]
+    pub RequestCache {
+        /// Consult the HTTP cache, and revalidate a stale entry.
+        #[default]
+        Default => "default",
+        /// Neither consult nor populate the HTTP cache.
+        NoStore => "no-store",
+        /// Bypass the HTTP cache for this request and update it.
+        Reload => "reload",
+        /// Bypass the HTTP cache only after revalidating a stored entry.
+        NoCache => "no-cache",
+        /// Use a stored entry even when it is stale.
+        ForceCache => "force-cache",
+        /// Fail when no stored entry exists.
+        OnlyIfCached => "only-if-cached",
+    }
 }
 
 impl RequestCache {
-    /// Parses the IDL enum's string value
+    /// Parses the IDL enum's string value, which is exact-match
     /// (<https://fetch.spec.whatwg.org/#requestinit>).
     #[must_use]
     pub fn from_idl(value: &str) -> Option<Self> {
-        match value {
-            "default" => Some(Self::Default),
-            "no-store" => Some(Self::NoStore),
-            "reload" => Some(Self::Reload),
-            "no-cache" => Some(Self::NoCache),
-            "force-cache" => Some(Self::ForceCache),
-            "only-if-cached" => Some(Self::OnlyIfCached),
-            _ => None,
-        }
+        Self::KEYWORDS
+            .iter()
+            .copied()
+            .find(|mode| mode.keyword() == value)
     }
 }
 
-/// A page request's CORS mode, which is Fetch's request mode without
-/// `navigate`
-/// (<https://fetch.spec.whatwg.org/#concept-request-mode>).
-///
-/// `navigate` exists for document navigations, and a page request cannot send
-/// under it: `RequestInit.mode` rejects the keyword, and a page `fetch` that
-/// did would skip the CORS check on a response the page can read. Keeping it
-/// out of the type makes that pairing unrepresentable here and across the wire.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum CorsMode {
-    /// No CORS: same-origin reads, opaque cross-origin reads.
-    NoCors,
-    /// A cross-origin request fails outright.
-    SameOrigin,
-    /// The full CORS protocol runs, and a cross-origin response is readable.
-    Cors,
+enumerated::enumerated! {
+    /// A page request's CORS mode, which is Fetch's request mode without
+    /// `navigate`
+    /// (<https://fetch.spec.whatwg.org/#concept-request-mode>).
+    ///
+    /// `navigate` exists for document navigations, and a page request cannot
+    /// send under it: `RequestInit.mode` rejects the keyword, and a page
+    /// `fetch` that did would skip the CORS check on a response the page can
+    /// read. Keeping it out of the type makes that pairing unrepresentable here
+    /// and across the wire.
+    #[derive(serde::Serialize, serde::Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    pub CorsMode {
+        /// No CORS: same-origin reads, opaque cross-origin reads.
+        NoCors => "no-cors",
+        /// A cross-origin request fails outright.
+        SameOrigin => "same-origin",
+        /// The full CORS protocol runs, and a cross-origin response is readable.
+        Cors => "cors",
+    }
 }
 
 impl CorsMode {
-    /// Parses a `RequestInit.mode` string
+    /// Parses a `RequestInit.mode` string, which is exact-match
     /// (<https://fetch.spec.whatwg.org/#requestinit>).
     #[must_use]
     pub fn from_idl(value: &str) -> Option<Self> {
-        match value {
-            "no-cors" => Some(Self::NoCors),
-            "same-origin" => Some(Self::SameOrigin),
-            "cors" => Some(Self::Cors),
-            _ => None,
-        }
+        Self::KEYWORDS
+            .iter()
+            .copied()
+            .find(|mode| mode.keyword() == value)
     }
 
     /// The request mode this sends under.
@@ -1888,7 +1914,8 @@ mod response_head_tests {
             "the inherited container is the only policy source"
         );
 
-        let inherited = ResponseHead::local(url("about:blank"), None, None);
+        let inherited =
+            ResponseHead::local(url("about:blank"), None, Some(PolicyContainer::default()));
         assert_eq!(inherited.source.policy().referrer_policy, None);
     }
 

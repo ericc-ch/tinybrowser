@@ -10,6 +10,7 @@
 //! follows the kind the renderer names; probing that label with response-body
 //! sniffing is tracked in #190.
 
+use enumerated::Enumerated;
 use hyper::header::{self, HeaderValue};
 
 use crate::protocol::{HeaderMap, Method};
@@ -46,21 +47,21 @@ impl RequestMode {
     }
 }
 
-/// A request's credentials mode
-/// (<https://fetch.spec.whatwg.org/#concept-request-credentials-mode>).
-#[derive(
-    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
-)]
-#[serde(rename_all = "kebab-case")]
-pub enum CredentialsMode {
-    /// Never send or accept credentials; cookies cross the wire only if they
-    /// are already same-origin.
-    Omit,
-    /// Credentials for same-origin requests only. The `fetch` default.
-    #[default]
-    SameOrigin,
-    /// Credentials for every request.
-    Include,
+enumerated::enumerated! {
+    /// A request's credentials mode
+    /// (<https://fetch.spec.whatwg.org/#concept-request-credentials-mode>).
+    #[derive(Default, Hash, serde::Serialize, serde::Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    pub CredentialsMode {
+        /// Never send or accept credentials; cookies cross the wire only if they
+        /// are already same-origin.
+        Omit => "omit",
+        /// Credentials for same-origin requests only. The `fetch` default.
+        #[default]
+        SameOrigin => "same-origin",
+        /// Credentials for every request.
+        Include => "include",
+    }
 }
 
 impl CredentialsMode {
@@ -70,16 +71,14 @@ impl CredentialsMode {
         matches!(self, Self::Include)
     }
 
-    /// Parses the IDL enum's string value
+    /// Parses the IDL enum's string value, which is exact-match
     /// (<https://fetch.spec.whatwg.org/#requestinit>).
     #[must_use]
     pub fn from_idl(value: &str) -> Option<Self> {
-        match value {
-            "omit" => Some(Self::Omit),
-            "same-origin" => Some(Self::SameOrigin),
-            "include" => Some(Self::Include),
-            _ => None,
-        }
+        Self::KEYWORDS
+            .iter()
+            .copied()
+            .find(|mode| mode.keyword() == value)
     }
 }
 
@@ -205,32 +204,32 @@ impl Filtering {
     }
 }
 
-/// How redirects are handled
-/// (<https://fetch.spec.whatwg.org/#concept-request-redirect-mode>).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum RedirectMode {
-    /// Follow redirects.
-    #[default]
-    Follow,
-    /// A redirect is a network error.
-    Error,
-    /// Return an opaque-redirect filtered response; the caller cannot see the
-    /// `Location`.
-    Manual,
+enumerated::enumerated! {
+    /// How redirects are handled
+    /// (<https://fetch.spec.whatwg.org/#concept-request-redirect-mode>).
+    #[derive(Default, serde::Serialize, serde::Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    pub RedirectMode {
+        /// Follow redirects.
+        #[default]
+        Follow => "follow",
+        /// A redirect is a network error.
+        Error => "error",
+        /// Return an opaque-redirect filtered response; the caller cannot see
+        /// the `Location`.
+        Manual => "manual",
+    }
 }
 
 impl RedirectMode {
-    /// Parses the IDL enum's string value
+    /// Parses the IDL enum's string value, which is exact-match
     /// (<https://fetch.spec.whatwg.org/#requestinit>).
     #[must_use]
     pub fn from_idl(value: &str) -> Option<Self> {
-        match value {
-            "follow" => Some(Self::Follow),
-            "error" => Some(Self::Error),
-            "manual" => Some(Self::Manual),
-            _ => None,
-        }
+        Self::KEYWORDS
+            .iter()
+            .copied()
+            .find(|mode| mode.keyword() == value)
     }
 }
 

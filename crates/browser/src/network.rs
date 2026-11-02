@@ -359,8 +359,13 @@ fn vary_matches(entry: &CachedResponse, request: &DialRequest) -> bool {
     })
 }
 
-fn fresh(entry: &CachedResponse) -> bool {
-    let age = entry.stored_at.elapsed().as_secs();
+/// Whether a stored response is still fresh for a request arriving at `now`
+/// (<https://www.rfc-editor.org/rfc/rfc9111#section-4.2>).
+fn fresh(entry: &CachedResponse, clock: net::Clock) -> bool {
+    let age = clock
+        .monotonic()
+        .saturating_duration_since(entry.stored_at)
+        .as_secs();
     let mut saw_max_age = false;
     let cache_control = net::get_decode_split_decoded(&entry.outcome.headers, "cache-control");
     for directive in cache_control.iter().flatten() {
@@ -390,8 +395,7 @@ fn fresh(entry: &CachedResponse) -> bool {
     }
     entry.outcome.headers.iter().any(|(name, value)| {
         name.eq_ignore_ascii_case("expires")
-            && httpdate::parse_http_date(value)
-                .is_ok_and(|expires| expires > std::time::SystemTime::now())
+            && httpdate::parse_http_date(value).is_ok_and(|expires| expires > clock.now())
     })
 }
 
@@ -451,6 +455,7 @@ fn store_response(
     key: CacheKey,
     outcome: DialOutcome,
     request_headers: Vec<(String, String)>,
+    clock: net::Clock,
 ) {
     let mut cache = cache
         .lock()
@@ -460,7 +465,7 @@ fn store_response(
         key,
         CachedResponse {
             outcome,
-            stored_at: Instant::now(),
+            stored_at: clock.monotonic(),
             request_headers,
         },
     );
@@ -499,6 +504,11 @@ pub(crate) struct NavOutcome {
 /// Live network state for one storage partition.
 pub(crate) struct NetworkContext {
     agent: Agent,
+    /// The clock the HTTP cache stamps and reads entries with, so an
+    /// embedder that injects one through [`AgentOptions`] gets a cache that
+    /// agrees with it. Dial deadlines stay on the reactor clock, which is what
+    /// drives tokio timers.
+    clock: net::Clock,
     permits: NetworkPermits,
     cache: ResponseCache,
     streams: StreamMap,
@@ -513,8 +523,10 @@ impl NetworkContext {
         if options.timeout_per_call.is_none() {
             options.timeout_per_call = Some(PAGE_FETCH_TIMEOUT);
         }
+        let clock = options.clock;
         Self {
             agent: Agent::new(options),
+            clock,
             permits: NetworkPermits::new(),
             cache: Arc::new(Mutex::new(HashMap::new())),
             streams: Arc::new(Mutex::new(HashMap::new())),
@@ -527,6 +539,7 @@ impl NetworkContext {
     pub(crate) fn tab_handle(&self) -> TabNetworkHandle {
         TabNetworkHandle {
             agent: self.agent.clone(),
+            clock: self.clock,
             permits: self.permits.clone(),
             tab: Arc::new(Semaphore::new(MAX_TAB_DIALS)),
             cache: Arc::clone(&self.cache),
@@ -589,6 +602,9 @@ const MAX_TAB_DIALS: usize = 8;
 #[derive(Clone)]
 pub(crate) struct TabNetworkHandle {
     agent: Agent,
+    /// The clock the cache stamps and reads entries with; see
+    /// [`NetworkContext::clock`].
+    clock: net::Clock,
     permits: NetworkPermits,
     tab: Arc<Semaphore>,
     cache: ResponseCache,
@@ -861,6 +877,7 @@ impl TabNetworkHandle {
             cache: Arc::clone(&self.cache),
             key: cache_key(request, initiator, owner),
             request_headers: request.headers.clone(),
+            clock: self.clock,
         });
         let task = spawn_stream_body(StreamJob {
             response,
@@ -966,7 +983,7 @@ impl TabNetworkHandle {
         } else {
             self.cached_hit(request, initiator, owner)
         };
-        if let Some(hit) = Self::cached_response(request, mode, cached.as_ref())? {
+        if let Some(hit) = Self::cached_response(request, mode, cached.as_ref(), self.clock)? {
             return Ok(CacheDecision::Hit(hit));
         }
         // A default or no-cache request revalidates a stored response when it
@@ -1015,6 +1032,7 @@ impl TabNetworkHandle {
         request: &DialRequest,
         mode: RequestCache,
         cached: Option<&CachedResponse>,
+        clock: net::Clock,
     ) -> Result<Option<DialOutcome>, DialFailure> {
         if !request.policy.exposes_response() {
             return Ok(None);
@@ -1028,7 +1046,7 @@ impl TabNetworkHandle {
                 cached
             }
             (RequestCache::ForceCache, Some(cached)) => cached,
-            (RequestCache::Default, Some(cached)) if fresh(cached) => cached,
+            (RequestCache::Default, Some(cached)) if fresh(cached, clock) => cached,
             (
                 RequestCache::Default
                 | RequestCache::ForceCache
@@ -1060,6 +1078,7 @@ impl TabNetworkHandle {
             cache_key(request, initiator, partition),
             outcome.clone(),
             request.headers.clone(),
+            self.clock,
         );
     }
 
@@ -1302,6 +1321,7 @@ struct PendingStore {
     cache: ResponseCache,
     key: CacheKey,
     request_headers: Vec<(String, String)>,
+    clock: net::Clock,
 }
 
 /// One event from [`BodyReader`].
@@ -1405,6 +1425,7 @@ fn spawn_stream_body(job: StreamJob) -> tokio::task::JoinHandle<()> {
                             store.key,
                             store.outcome,
                             store.request_headers,
+                            store.clock,
                         );
                     }
                     let _ = tx.send(StreamMessage::End).await;
@@ -1847,8 +1868,13 @@ mod tests {
         let request = js_fetch(renderer::CorsMode::Cors, "http://a.test/data");
         let mut entry = cached(net::cors::ResponseType::Basic);
         assert_eq!(
-            TabNetworkHandle::cached_response(&request, RequestCache::OnlyIfCached, None)
-                .expect_err("only-if-cached needs an entry"),
+            TabNetworkHandle::cached_response(
+                &request,
+                RequestCache::OnlyIfCached,
+                None,
+                net::Clock::default()
+            )
+            .expect_err("only-if-cached needs an entry"),
             DialFailure::Connect
         );
         let mut cross_origin = entry.clone();
@@ -1857,31 +1883,52 @@ mod tests {
             TabNetworkHandle::cached_response(
                 &request,
                 RequestCache::OnlyIfCached,
-                Some(&cross_origin)
+                Some(&cross_origin),
+                net::Clock::default()
             )
             .is_err(),
             "only-if-cached refuses a cross-origin final URL"
         );
         assert!(
-            TabNetworkHandle::cached_response(&request, RequestCache::OnlyIfCached, Some(&entry))
-                .expect("hit")
-                .is_some()
+            TabNetworkHandle::cached_response(
+                &request,
+                RequestCache::OnlyIfCached,
+                Some(&entry),
+                net::Clock::default()
+            )
+            .expect("hit")
+            .is_some()
         );
         assert!(
-            TabNetworkHandle::cached_response(&request, RequestCache::ForceCache, Some(&entry))
-                .expect("stale hit")
-                .is_some(),
+            TabNetworkHandle::cached_response(
+                &request,
+                RequestCache::ForceCache,
+                Some(&entry),
+                net::Clock::default()
+            )
+            .expect("stale hit")
+            .is_some(),
             "force-cache uses a stale entry"
         );
         assert!(
-            TabNetworkHandle::cached_response(&request, RequestCache::ForceCache, None)
-                .expect("miss")
-                .is_none()
+            TabNetworkHandle::cached_response(
+                &request,
+                RequestCache::ForceCache,
+                None,
+                net::Clock::default()
+            )
+            .expect("miss")
+            .is_none()
         );
         assert!(
-            TabNetworkHandle::cached_response(&request, RequestCache::Default, Some(&entry))
-                .expect("stale miss")
-                .is_none(),
+            TabNetworkHandle::cached_response(
+                &request,
+                RequestCache::Default,
+                Some(&entry),
+                net::Clock::default()
+            )
+            .expect("stale miss")
+            .is_none(),
             "default does not use a stale entry"
         );
         entry
@@ -1889,9 +1936,14 @@ mod tests {
             .headers
             .push(("cache-control".to_owned(), "max-age=60".to_owned()));
         assert!(
-            TabNetworkHandle::cached_response(&request, RequestCache::Default, Some(&entry))
-                .expect("fresh hit")
-                .is_some(),
+            TabNetworkHandle::cached_response(
+                &request,
+                RequestCache::Default,
+                Some(&entry),
+                net::Clock::default()
+            )
+            .expect("fresh hit")
+            .is_some(),
             "default uses a fresh entry"
         );
         for mode in [
@@ -1900,9 +1952,14 @@ mod tests {
             RequestCache::NoCache,
         ] {
             assert!(
-                TabNetworkHandle::cached_response(&request, mode, Some(&entry))
-                    .expect("miss")
-                    .is_none(),
+                TabNetworkHandle::cached_response(
+                    &request,
+                    mode,
+                    Some(&entry),
+                    net::Clock::default()
+                )
+                .expect("miss")
+                .is_none(),
                 "{mode:?} must not answer from the cache"
             );
         }
@@ -2108,31 +2165,94 @@ mod tests {
 
     #[test]
     fn fresh_reads_max_age_through_the_header_splitter() {
+        let clock = net::Clock::default();
         let mut entry = cached(net::cors::ResponseType::Basic);
         entry.outcome.headers = vec![(
             "cache-control".to_owned(),
             "private=\"a,b\", max-age=60".to_owned(),
         )];
-        assert!(fresh(&entry));
+        assert!(fresh(&entry, clock));
 
         entry.outcome.headers = vec![("cache-control".to_owned(), "max-age=1".to_owned())];
         entry.stored_at = Instant::now()
             .checked_sub(Duration::from_secs(2))
             .expect("two seconds before now");
-        assert!(!fresh(&entry), "an expired max-age is stale");
+        assert!(!fresh(&entry, clock), "an expired max-age is stale");
 
         // `age` counts whole seconds, so `max-age=0` must not stay fresh for
         // the first second of its life
         // (<https://www.rfc-editor.org/rfc/rfc9111#section-4.2>).
         entry.outcome.headers = vec![("cache-control".to_owned(), "max-age=0".to_owned())];
         entry.stored_at = Instant::now();
-        assert!(!fresh(&entry), "a zero lifetime is spent on arrival");
+        assert!(!fresh(&entry, clock), "a zero lifetime is spent on arrival");
 
         entry.outcome.headers = vec![(
             "expires".to_owned(),
             "Thu, 01 Jan 2099 00:00:00 GMT".to_owned(),
         )];
-        assert!(fresh(&entry), "a future Expires is fresh");
+        assert!(fresh(&entry, clock), "a future Expires is fresh");
+    }
+
+    /// The cache stamps and reads entries with the injected clock, so an
+    /// embedder's clock is the one freshness follows and a test can expire an
+    /// entry without sleeping.
+    #[test]
+    fn the_cache_reads_the_injected_clock() {
+        let clock = test_clock::clock();
+        let request = js_fetch(renderer::CorsMode::Cors, "http://a.test/data");
+        let initiator = Url::parse("http://a.test/page").expect("page URL").origin();
+        let key = cache_key(&request, &initiator, RendererAssignmentId::new(1));
+        let mut outcome = cached(net::cors::ResponseType::Basic).outcome;
+        outcome.headers = vec![("cache-control".to_owned(), "max-age=60".to_owned())];
+        let cache = ResponseCache::default();
+        store_response(&cache, key.clone(), outcome, Vec::new(), clock);
+        let entry = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key)
+            .cloned()
+            .expect("stored");
+        assert_eq!(
+            entry.stored_at,
+            clock.monotonic(),
+            "the entry is stamped with the injected clock"
+        );
+        assert!(fresh(&entry, clock), "fresh at the stored instant");
+        test_clock::set_offset(61);
+        assert!(!fresh(&entry, clock), "stale one second after max-age");
+        test_clock::set_offset(0);
+    }
+
+    /// A clock the test moves by hand: a wall clock, a monotonic clock, and one
+    /// offset for both.
+    mod test_clock {
+        use std::sync::OnceLock;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::{Duration, Instant, SystemTime};
+
+        static OFFSET_SECONDS: AtomicU64 = AtomicU64::new(0);
+        static MONOTONIC_BASE: OnceLock<Instant> = OnceLock::new();
+        static WALL_BASE: OnceLock<SystemTime> = OnceLock::new();
+
+        pub(super) fn set_offset(seconds: u64) {
+            OFFSET_SECONDS.store(seconds, Ordering::Relaxed);
+        }
+
+        fn offset() -> Duration {
+            Duration::from_secs(OFFSET_SECONDS.load(Ordering::Relaxed))
+        }
+
+        fn monotonic() -> Instant {
+            *MONOTONIC_BASE.get_or_init(Instant::now) + offset()
+        }
+
+        fn wall() -> SystemTime {
+            *WALL_BASE.get_or_init(SystemTime::now) + offset()
+        }
+
+        pub(super) fn clock() -> net::Clock {
+            net::Clock::new(wall, monotonic)
+        }
     }
 
     /// A stored `ETag` holds isomorphic-decoded bytes, so writing it back must
