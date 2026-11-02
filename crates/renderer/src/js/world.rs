@@ -1796,9 +1796,7 @@ pub(crate) struct WindowOpenPlan {
     /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#window-open-steps>).
     pub(crate) withholds: bool,
     /// The navigation a browser-hosted tab's first request runs under.
-    pub(crate) initiator: crate::protocol::SerializedOrigin,
-    pub(crate) referrer: Url,
-    pub(crate) referrer_policy: net::ReferrerPolicy,
+    pub(crate) source: crate::protocol::NavigationSource,
 }
 
 impl World {
@@ -2346,9 +2344,11 @@ impl World {
                 && !name.eq_ignore_ascii_case("_self")
                 && !name.eq_ignore_ascii_case("_parent")
                 && !name.eq_ignore_ascii_case("_top"),
-            initiator: crate::protocol::SerializedOrigin::from(&self.origin),
-            referrer: self.referrer_url.clone(),
-            referrer_policy: self.policy.referrer_policy.unwrap_or_default(),
+            source: crate::protocol::NavigationSource {
+                origin: crate::protocol::SerializedOrigin::from(&self.origin),
+                referrer: self.referrer_url.clone(),
+                referrer_policy: self.policy.referrer_policy.unwrap_or_default(),
+            },
         })
     }
 

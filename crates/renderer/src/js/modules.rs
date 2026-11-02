@@ -144,7 +144,7 @@ pub(super) fn load_module<'js>(ctx: &Ctx<'js>, name: &str) -> Result<Module<'js,
         cancel();
         return Err(Error::new_loading(name));
     };
-    let final_url = outcome.internal_url();
+    let final_url = &outcome.final_url;
     if final_url != &url {
         let violations = {
             let world = world_rc.borrow();

@@ -664,9 +664,7 @@ impl BrowsingContextHost for WasmServices {
         _url: &str,
         _name: &str,
         _opener: renderer::OpenerPolicy,
-        _initiator: &renderer::SerializedOrigin,
-        _referrer: &Url,
-        _referrer_policy: net::ReferrerPolicy,
+        _source: &renderer::NavigationSource,
     ) -> Option<renderer::WindowId> {
         None
     }
@@ -752,6 +750,6 @@ mod tests {
         };
         let outcome = decode_fetch_result(response, &hop).expect("decoded");
         assert!(matches!(&outcome.body, renderer::ResponseBody::Bytes(body) if body == b"hi"));
-        assert_eq!(outcome.internal_url(), &hop);
+        assert_eq!(&outcome.final_url, &hop);
     }
 }

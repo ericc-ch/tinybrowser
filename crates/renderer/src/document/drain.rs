@@ -183,7 +183,7 @@ impl Document {
                             outcome: crate::protocol::DialOutcome {
                                 status: 200,
                                 status_text: "OK".to_owned(),
-                                final_url: Some(final_url),
+                                final_url,
                                 content_type: Some(content_type.clone()),
                                 // Scheme fetch serves the data: MIME type
                                 // as the response's `Content-Type` header

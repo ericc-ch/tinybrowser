@@ -857,19 +857,21 @@ mod tests {
 
     /// `window.open`'s caller crosses the wire as typed values: an opaque
     /// document claims `null` rather than a sentinel URL it could forge, and
-    /// the referrer is a URL rather than text the browser parses again
+    /// the origin, referrer, and policy travel as one source
     /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#window-open-steps>).
     #[test]
     fn a_window_open_caller_survives_the_wire() {
-        let referrer = url::Url::parse("https://a.test/page").expect("referrer");
+        let source = renderer::NavigationSource {
+            origin: renderer::SerializedOrigin::Opaque,
+            referrer: url::Url::parse("https://a.test/page").expect("referrer"),
+            referrer_policy: net::ReferrerPolicy::UnsafeUrl,
+        };
         let call = crate::wire::ServiceCall::BrowsingContext(
             crate::wire::BrowsingContextCall::WindowOpen {
                 url: "https://b.test/".to_owned(),
                 name: String::new(),
                 opener: renderer::OpenerPolicy::Keep,
-                initiator: renderer::SerializedOrigin::Opaque,
-                referrer: referrer.clone(),
-                referrer_policy: net::ReferrerPolicy::UnsafeUrl,
+                source: source.clone(),
             },
         );
         let message: crate::wire::FromRenderer = crate::exchange::Frame::Call {
@@ -889,18 +891,11 @@ mod tests {
             panic!("expected a call frame");
         };
         let crate::wire::ServiceCall::BrowsingContext(
-            crate::wire::BrowsingContextCall::WindowOpen {
-                initiator: back_initiator,
-                referrer: back_referrer,
-                referrer_policy: back_policy,
-                ..
-            },
+            crate::wire::BrowsingContextCall::WindowOpen { source: back, .. },
         ) = body.call
         else {
             panic!("expected a window.open call");
         };
-        assert_eq!(back_initiator, renderer::SerializedOrigin::Opaque);
-        assert_eq!(back_referrer, referrer);
-        assert_eq!(back_policy, net::ReferrerPolicy::UnsafeUrl);
+        assert_eq!(back, source);
     }
 }

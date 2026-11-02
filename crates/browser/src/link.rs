@@ -788,11 +788,14 @@ async fn route_window_call(
         BrowsingContextCall::WindowOpen {
             url,
             opener,
-            initiator,
-            referrer,
-            referrer_policy,
+            source,
             ..
         } => {
+            let renderer::NavigationSource {
+                origin: claim,
+                referrer,
+                referrer_policy,
+            } = source;
             let spec = if url.is_empty() || url == "about:blank" {
                 Some(String::new())
             } else {
@@ -809,9 +812,9 @@ async fn route_window_call(
             // popup goes out without one rather than leaking it. The dial seam
             // makes the same check
             // (<https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
-            let origin = match assignment.site.authorize_origin(&initiator) {
+            let origin = match assignment.site.authorize_origin(&claim) {
                 Some(origin) => origin,
-                None if initiator.is_opaque() => url::Origin::new_opaque(),
+                None if claim.is_opaque() => url::Origin::new_opaque(),
                 None => return Err(RendererViolation),
             };
             let referrer = assignment

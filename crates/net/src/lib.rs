@@ -12,7 +12,7 @@ pub mod referrer;
 mod resolve;
 mod transport;
 
-pub use client::{Agent, AgentOptions, Body, Clock, Request, Response, sec_fetch_site};
+pub use client::{Agent, AgentOptions, Body, Clock, Request, Response};
 pub use cookies::{CookieRecord, CookieSameSite, InitiatorKind, origins_same_site, site};
 pub use error::{NetError, TimeoutKind, TransportError};
 pub use identity::{

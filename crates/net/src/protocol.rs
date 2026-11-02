@@ -310,15 +310,16 @@ impl Method {
     ///
     /// [`InvalidMethod`] when `token` is empty or not an HTTP token.
     pub fn parse(token: &str) -> Result<Self, InvalidMethod> {
-        let standard = match token.to_ascii_uppercase().as_str() {
-            "GET" => Some(Self::GET),
-            "HEAD" => Some(Self::HEAD),
-            "POST" => Some(Self::POST),
-            "PUT" => Some(Self::PUT),
-            "DELETE" => Some(Self::DELETE),
-            "OPTIONS" => Some(Self::OPTIONS),
-            _ => None,
-        };
+        let standard = [
+            Self::GET,
+            Self::HEAD,
+            Self::POST,
+            Self::PUT,
+            Self::DELETE,
+            Self::OPTIONS,
+        ]
+        .into_iter()
+        .find(|method| token.eq_ignore_ascii_case(method.as_str()));
         if let Some(method) = standard {
             return Ok(method);
         }

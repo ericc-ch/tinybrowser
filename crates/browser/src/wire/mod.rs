@@ -14,13 +14,12 @@
 pub mod channel;
 
 use serde::{Deserialize, Serialize};
-use url::Url;
 
 use crate::exchange::{Frame, RequestId};
 use renderer::{
-    BrowserEvent, DialFailure, DialOutcome, DialRequest, FrameId, OpenerPolicy, PostedMessage,
-    RemoteValue, SerializedOrigin, StorageChange, StorageError, StorageKey, StorageKind, StreamId,
-    TabError, WindowId,
+    BrowserEvent, DialFailure, DialOutcome, DialRequest, FrameId, NavigationSource, OpenerPolicy,
+    PostedMessage, RemoteValue, SerializedOrigin, StorageChange, StorageError, StorageKey,
+    StorageKind, StreamId, TabError, WindowId,
 };
 
 /// Browser-minted identity of one top-level document hosted by a renderer.
@@ -378,18 +377,10 @@ pub enum BrowsingContextCall {
         /// What the `noopener` and `noreferrer` features asked for, already
         /// parsed by the renderer that read the feature string.
         opener: OpenerPolicy,
-        /// Serialized origin of the calling document: the navigation request's
-        /// origin and the source of its `Sec-Fetch-Site`
-        /// (<https://w3c.github.io/webappsec-fetch-metadata/#abstract-opdef-set-site>).
-        /// `null` for an opaque document.
-        initiator: SerializedOrigin,
-        /// The calling document's `"client"` referrer source: its URL, walked
-        /// out of an `srcdoc` chain
-        /// (<https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
-        referrer: Url,
-        /// The calling document's referrer policy; the browser applies
-        /// `noreferrer` on top of it.
-        referrer_policy: net::ReferrerPolicy,
+        /// The calling document's origin, referrer source, and policy
+        /// (<https://w3c.github.io/webappsec-fetch-metadata/#abstract-opdef-set-site>,
+        /// <https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
+        source: NavigationSource,
     },
     /// `window.close()` on a window this renderer opened.
     WindowClose {

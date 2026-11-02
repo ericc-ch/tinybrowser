@@ -442,18 +442,14 @@ impl BrowsingContextHost for HostServices {
         url: &str,
         name: &str,
         opener: OpenerPolicy,
-        initiator: &renderer::SerializedOrigin,
-        referrer: &Url,
-        referrer_policy: net::ReferrerPolicy,
+        source: &renderer::NavigationSource,
     ) -> Option<WindowId> {
         match self.call(ServiceCall::BrowsingContext(
             BrowsingContextCall::WindowOpen {
                 url: url.to_owned(),
                 name: name.to_owned(),
                 opener,
-                initiator: initiator.clone(),
-                referrer: referrer.clone(),
-                referrer_policy,
+                source: source.clone(),
             },
         )) {
             Some(ServiceReply::Window(tab)) => tab,

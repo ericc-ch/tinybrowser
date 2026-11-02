@@ -125,9 +125,9 @@ enum DialProgress {
 struct DialHead {
     status: u16,
     status_text: String,
-    /// `None` for a filtered opaque response, whose URL list is empty
-    /// (<https://fetch.spec.whatwg.org/#concept-filtered-response-opaque>).
-    final_url: Option<Url>,
+    /// The internal response URL; a filtered opaque view hides it from page
+    /// script but the engine still names it.
+    final_url: Url,
     content_type: Option<String>,
     /// The response's header list, minus the forbidden response-header names:
     /// cookies live in the browser's jar, and an `HttpOnly` one must not reach
@@ -150,7 +150,7 @@ impl DialHead {
         Self {
             status: response.status(),
             status_text: response.status_text().to_owned(),
-            final_url: Some(response.final_url().clone()),
+            final_url: response.final_url().clone(),
             content_type: content_type_header(response.internal_headers().iter()),
             headers: internal_headers(response),
             response_type: response.response_type(),
@@ -175,7 +175,7 @@ impl DialHead {
         Self {
             status: filtered.status(),
             status_text: filtered.status_text().to_owned(),
-            final_url: filtered.url().cloned(),
+            final_url: response.final_url().clone(),
             content_type,
             headers,
             response_type: filtered.response_type(),
@@ -212,11 +212,12 @@ impl DialHead {
     /// When the head is the page-fetch view of an opaque response, which names
     /// no document to mount.
     fn into_document_head(self) -> renderer::ResponseHead {
-        let final_url = self
-            .final_url
-            .clone()
-            .expect("a document mounts a response that names its URL");
-        renderer::ResponseHead::http(self.status, final_url, self.content_type, &self.headers)
+        renderer::ResponseHead::http(
+            self.status,
+            self.final_url,
+            self.content_type,
+            &self.headers,
+        )
     }
 
     /// The outcome this head answers with, once its body is known.
@@ -430,7 +431,7 @@ fn etag(outcome: &DialOutcome) -> Option<String> {
 fn merge_not_modified(cached: &DialOutcome, response: &net::Response) -> DialOutcome {
     let mut merged = cached.clone();
     merged.status = 200;
-    merged.final_url = Some(response.final_url().clone());
+    merged.final_url = response.final_url().clone();
     merged.referrer = response.referrer().cloned();
     merged.crossed_origin = response.crossed_origin();
     for (name, value) in response.filtered().headers() {
@@ -676,7 +677,7 @@ impl TabNetworkHandle {
         let deadline = started + PAGE_FETCH_TIMEOUT;
         let permits = Self::acquire(&self.permits.navigation, deadline).await?;
         let mut request = Request::new(Method::GET, url.clone());
-        chrome_navigation_request(&mut request, url, source);
+        chrome_navigation_request(&mut request, url);
         request.initiator_kind = InitiatorKind::Navigation;
         // One initiator origin feeds `Sec-Fetch-Site`, the cookie context, and
         // the request origin. `None` means a fresh opaque origin: no document
@@ -800,7 +801,7 @@ impl TabNetworkHandle {
         }
         .await;
         if let Ok(outcome) = &result {
-            self.remember_sheet(request, outcome.status, outcome.final_url.as_ref());
+            self.remember_sheet(request, outcome.status, &outcome.final_url);
         }
         trace_dial_result(request, started, result.as_ref());
         result
@@ -1042,9 +1043,7 @@ impl TabNetworkHandle {
         let hit = match (mode, cached) {
             (RequestCache::OnlyIfCached, None) => return Err(DialFailure::Connect),
             (RequestCache::OnlyIfCached, Some(cached)) => {
-                if let Some(final_url) = &cached.outcome.final_url
-                    && request.url.origin() != final_url.origin()
-                {
+                if request.url.origin() != cached.outcome.final_url.origin() {
                     return Err(DialFailure::Connect);
                 }
                 cached
@@ -1099,7 +1098,7 @@ impl TabNetworkHandle {
     /// referrer naming the sheet can be authorized. A sheet that failed or
     /// never arrived is not recorded: nothing it contained can issue a request
     /// (<https://w3c.github.io/webappsec-referrer-policy/#integration-with-css>).
-    fn remember_sheet(&self, request: &DialRequest, status: u16, final_url: Option<&Url>) {
+    fn remember_sheet(&self, request: &DialRequest, status: u16, final_url: &Url) {
         if request.policy.kind() != DialKind::Stylesheet || !(200..300).contains(&status) {
             return;
         }
@@ -1107,7 +1106,7 @@ impl TabNetworkHandle {
             .sheets
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for url in [Some(&request.url), final_url].into_iter().flatten() {
+        for url in [&request.url, final_url] {
             // A referrer never carries a fragment, and the sheet URL the
             // renderer names is the one it was loaded from
             // (<https://w3c.github.io/webappsec-referrer-policy/#strip-url>).
@@ -1483,7 +1482,7 @@ fn refused_redirect(blocked: &std::sync::Mutex<Option<Url>>) -> Option<DialOutco
     Some(DialOutcome {
         status: 0,
         status_text: String::new(),
-        final_url: Some(url),
+        final_url: url,
         content_type: None,
         headers: Vec::new(),
         body: ResponseBody::Bytes(Vec::new()),
@@ -1523,31 +1522,22 @@ fn opaque_origin() -> url::Origin {
 ///
 /// `Upgrade-Insecure-Requests` is the document navigation preference
 /// (<https://www.w3.org/TR/upgrade-insecure-requests/#preference>), and
-/// `Accept` and Fetch Metadata (`Sec-Fetch-*`) match Chrome's document
+/// `Accept` and the other Fetch Metadata headers match Chrome's document
 /// navigation request
 /// (<https://w3c.github.io/webappsec-fetch-metadata/>). `Sec-Fetch-Site` is
-/// `none` for a browser-initiated navigation and otherwise computed from the
-/// initiator origin over the URL list; the net client widens it on redirects
-/// (<https://w3c.github.io/webappsec-fetch-metadata/#abstract-opdef-set-site>).
+/// the net client's: it reads the request's one initiator origin and widens it
+/// across redirects, for navigations and subresources alike.
 ///
 /// Low-entropy UA client hints are sent only to potentially trustworthy URLs
 /// (<https://wicg.github.io/ua-client-hints/#sec-ch-ua>,
 /// <https://w3c.github.io/webappsec-secure-contexts/#is-url-trustworthy>).
-fn chrome_navigation_request(
-    request: &mut Request,
-    url: &Url,
-    source: Option<&NavigationInitiator>,
-) {
+fn chrome_navigation_request(request: &mut Request, url: &Url) {
     static_header(request, "Upgrade-Insecure-Requests", "1");
     static_header(
         request,
         "Accept",
         "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
     );
-    // With one URL this is the whole answer; the net client widens it as
-    // redirects add URLs.
-    let site = source.map_or("none", |source| net::sec_fetch_site(&source.origin, url));
-    static_header(request, "Sec-Fetch-Site", site);
     static_header(request, "Sec-Fetch-Mode", "navigate");
     static_header(request, "Sec-Fetch-User", "?1");
     static_header(request, "Sec-Fetch-Dest", "document");
@@ -1624,7 +1614,7 @@ mod tests {
             outcome: DialOutcome {
                 status: 200,
                 status_text: "OK".to_owned(),
-                final_url: Some(Url::parse("http://a.test/").expect("url")),
+                final_url: Url::parse("http://a.test/").expect("url"),
                 content_type: None,
                 headers: Vec::new(),
                 body: ResponseBody::Bytes(Vec::new()),
@@ -1877,7 +1867,7 @@ mod tests {
             DialFailure::Connect
         );
         let mut cross_origin = entry.clone();
-        cross_origin.outcome.final_url = Some(Url::parse("http://b.test/data").expect("url"));
+        cross_origin.outcome.final_url = Url::parse("http://b.test/data").expect("url");
         assert!(
             TabNetworkHandle::cached_response(
                 &request,
@@ -2356,7 +2346,7 @@ mod tests {
     fn chrome_navigation_headers_are_limited_to_trustworthy_urls() {
         let secure = Url::parse("https://example.com/").expect("https url");
         let mut secure_request = net::Request::new(net::Method::GET, secure.clone());
-        chrome_navigation_request(&mut secure_request, &secure, None);
+        chrome_navigation_request(&mut secure_request, &secure);
         assert!(
             secure_request
                 .headers
@@ -2367,7 +2357,7 @@ mod tests {
 
         let insecure = Url::parse("http://example.com/").expect("http url");
         let mut insecure_request = net::Request::new(net::Method::GET, insecure.clone());
-        chrome_navigation_request(&mut insecure_request, &insecure, None);
+        chrome_navigation_request(&mut insecure_request, &insecure);
         assert!(
             insecure_request
                 .headers
@@ -2377,43 +2367,5 @@ mod tests {
         );
         assert!(insecure_request.headers.get("sec-fetch-mode").is_some());
         assert!(insecure_request.headers.get("accept").is_some());
-    }
-
-    /// A navigation a document started names its relationship to the opener;
-    /// one the browser started names no site at all
-    /// (<https://w3c.github.io/webappsec-fetch-metadata/#abstract-opdef-set-site>).
-    #[test]
-    fn a_navigation_names_its_fetch_site_only_when_a_document_started_it() {
-        let source = |spec: &str| NavigationInitiator {
-            origin: Url::parse(spec).expect("origin URL").origin(),
-            referrer: None,
-            referrer_policy: net::ReferrerPolicy::default(),
-        };
-        let cases = [
-            ("https://a.test", "https://a.test/next", "same-origin"),
-            ("https://a.test", "https://b.a.test/", "same-site"),
-            ("https://a.test", "https://b.test/", "cross-site"),
-            ("data:,", "https://a.test/", "cross-site"),
-        ];
-        for (initiator, target, expected) in cases {
-            let target = Url::parse(target).expect("target URL");
-            let initiator = source(initiator);
-            let mut request = net::Request::new(net::Method::GET, target.clone());
-            chrome_navigation_request(&mut request, &target, Some(&initiator));
-            assert_eq!(
-                request.headers.get("sec-fetch-site"),
-                Some(expected.as_bytes()),
-                "{initiator:?} to {target}"
-            );
-        }
-
-        let target = Url::parse("https://a.test/").expect("target URL");
-        let mut request = net::Request::new(net::Method::GET, target.clone());
-        chrome_navigation_request(&mut request, &target, None);
-        assert_eq!(
-            request.headers.get("sec-fetch-site"),
-            Some(b"none".as_slice()),
-            "a browser-initiated navigation has no site to name"
-        );
     }
 }

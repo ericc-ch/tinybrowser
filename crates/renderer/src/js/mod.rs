@@ -592,15 +592,15 @@ impl JsRealm {
                     callback.set("status", i32::from(outcome.status))?;
                     callback.set("statusText", outcome.status_text)?;
                     // A filtered opaque response has an empty URL list, so
-                    // `Response.url` is the empty string
+                    // `Response.url` is the empty string; the engine still knows
+                    // the URL it fetched
                     // (<https://fetch.spec.whatwg.org/#concept-filtered-response-opaque>).
-                    callback.set(
-                        "url",
-                        outcome
-                            .final_url
-                            .as_ref()
-                            .map_or_else(String::new, Url::to_string),
-                    )?;
+                    let url = if outcome.response_type.is_opaque() {
+                        String::new()
+                    } else {
+                        outcome.final_url.to_string()
+                    };
+                    callback.set("url", url)?;
                     callback.set("contentType", outcome.content_type.unwrap_or_default())?;
                     callback.set(
                         "headers",
@@ -1569,14 +1569,7 @@ fn open_window<'js>(
         return opened_window(ctx, "frame", Some(js_number(frame.get())), plan.withholds);
     }
     let services = world.borrow().runtime.services.clone();
-    let Some(tab) = services.window_open(
-        &plan.spec,
-        name,
-        plan.opener,
-        &plan.initiator,
-        &plan.referrer,
-        plan.referrer_policy,
-    ) else {
+    let Some(tab) = services.window_open(&plan.spec, name, plan.opener, &plan.source) else {
         return Ok(Value::new_null(ctx.clone()));
     };
     opened_window(ctx, "tab", Some(js_number(tab.get())), plan.withholds)
@@ -2040,7 +2033,14 @@ fn sync_page_fetch(world: &World, request: SyncPageFetch) -> Option<SyncFetchLis
         // The header list stays as served; nothing is sniffed into it
         // (<https://fetch.spec.whatwg.org/#concept-response-header-list>).
         Ok(outcome) => {
-            let url = outcome.internal_url().to_string();
+            // Page script reads the filtered view: an opaque response's URL
+            // list is empty
+            // (<https://fetch.spec.whatwg.org/#concept-filtered-response-opaque>).
+            let url = if outcome.response_type.is_opaque() {
+                String::new()
+            } else {
+                outcome.final_url.to_string()
+            };
             let crate::protocol::ResponseBody::Bytes(body) = outcome.body else {
                 return None;
             };

@@ -1104,12 +1104,11 @@ pub struct DialOutcome {
     pub status: u16,
     /// HTTP reason phrase, or `"OK"` for scheme fetches.
     pub status_text: String,
-    /// The response's URL after redirects, or `None` for a filtered opaque
-    /// response, whose URL list is empty
+    /// The response's URL after redirects. A filtered opaque response hides
+    /// this from page script, but the engine still knows it: the empty URL
+    /// list is the page-script view, not a property of the outcome
     /// (<https://fetch.spec.whatwg.org/#concept-filtered-response-opaque>).
-    /// Only page script reads that view ([`RequestPolicy::exposes_response`]);
-    /// every engine consumer names its URL and reads [`Self::internal_url`].
-    pub final_url: Option<Url>,
+    pub final_url: Url,
     /// Every `Content-Type` response header value joined with `", "`, when
     /// the response sent any
     /// (<https://fetch.spec.whatwg.org/#concept-header-list-get-decode-split>).
@@ -1155,7 +1154,7 @@ impl DialOutcome {
         Self {
             status,
             status_text: String::new(),
-            final_url: Some(final_url),
+            final_url,
             content_type,
             headers,
             body: ResponseBody::Bytes(body),
@@ -1164,24 +1163,6 @@ impl DialOutcome {
             redirect_count: 0,
             referrer: None,
         }
-    }
-
-    /// The response URL an engine consumer reads.
-    ///
-    /// A response hides its URL only when it is opaque *and* page script is
-    /// the consumer, which is the [`RequestPolicy::exposes_response`] view. A
-    /// document, script, style sheet, or frame reads the unsafe response,
-    /// where the URL is always there.
-    ///
-    /// # Panics
-    ///
-    /// When a page-fetch view reaches an engine consumer, which would mean the
-    /// dial ran under a policy that hides what its consumer reads.
-    #[must_use]
-    pub fn internal_url(&self) -> &Url {
-        self.final_url
-            .as_ref()
-            .expect("an engine consumer reads a response that names its URL")
     }
 }
 
@@ -1302,17 +1283,33 @@ pub enum OpenerPolicy {
     NoReferrer,
 }
 
+/// The calling document's navigation inputs: the origin the request runs
+/// under, its `"client"` referrer source (the document URL, walked out of an
+/// `srcdoc` chain), and the policy that decides the `Referer` header.
+///
+/// The three travel together because every navigation seam needs all three,
+/// and splitting them let each caller reassemble a different answer
+/// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#window-open-steps>,
+/// <https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NavigationSource {
+    /// The calling document's serialized origin; opaque for a sandboxed or
+    /// non-network document.
+    pub origin: SerializedOrigin,
+    /// The `"client"` referrer source.
+    pub referrer: Url,
+    /// The concrete referrer policy the calling document determined.
+    pub referrer_policy: net::ReferrerPolicy,
+}
+
 /// Browsing-context effects the page engine asks its host to perform.
 pub trait BrowsingContextHost: Send + Sync + 'static {
     /// `window.open(url, target, features)`; `None` when the browser refused
     /// to open a window. `url` is absolute, or empty for `about:blank`.
     ///
-    /// `initiator` is the calling document's serialized origin, which the
-    /// navigation request runs under and `Sec-Fetch-Site` is computed from, and
-    /// `referrer` is its `"client"` referrer source: the document URL, walked
-    /// out of an `srcdoc` chain. `referrer_policy` is the policy that decides
-    /// the header. `noreferrer` is not applied here: the browser folds it into
-    /// the policy it receives, because it owns the feature's meaning
+    /// `source` is the calling document's origin, referrer source, and policy.
+    /// `noreferrer` is not applied here: the browser folds it into the policy
+    /// it receives, because it owns the feature's meaning
     /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#window-open-steps>,
     /// <https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
     fn window_open(
@@ -1320,9 +1317,7 @@ pub trait BrowsingContextHost: Send + Sync + 'static {
         url: &str,
         name: &str,
         opener: OpenerPolicy,
-        initiator: &SerializedOrigin,
-        referrer: &Url,
-        referrer_policy: net::ReferrerPolicy,
+        source: &NavigationSource,
     ) -> Option<WindowId>;
 
     /// `window.close()` on a window this realm opened.

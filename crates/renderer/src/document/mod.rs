@@ -3232,7 +3232,7 @@ impl Document {
         // (<https://w3c.github.io/webappsec-csp/#should-block-response>).
         let blocked = redirected
             && self.response_url_blocked(
-                outcome.final_url.as_ref(),
+                &outcome.final_url,
                 request_url,
                 crate::csp::Destination::Connect,
                 None,
@@ -3258,7 +3258,7 @@ impl Document {
             ancestors,
             integrity,
         } = done;
-        let redirected = outcome.final_url.as_ref() != Some(&req.url);
+        let redirected = outcome.final_url != req.url;
         match context {
             DialContext::JsFetch { id } => {
                 self.finish_js_fetch_dial(id, redirected, &req.url, outcome);
@@ -3282,7 +3282,7 @@ impl Document {
                 // <https://w3c.github.io/webappsec-csp/#should-block-response>
                 let blocked = redirected
                     && self.response_url_blocked(
-                        outcome.final_url.as_ref(),
+                        &outcome.final_url,
                         &req.url,
                         crate::csp::Destination::Script,
                         Some(element),
@@ -3308,7 +3308,7 @@ impl Document {
                     && (200..300).contains(&outcome.status)
                 {
                     let source = String::from_utf8_lossy(body);
-                    let filename = outcome.internal_url().to_string();
+                    let filename = outcome.final_url.to_string();
                     self.eval_classic(&source, Some(element), 1, &filename);
                     self.fire_js(|js| js.fire_node_load(element));
                 } else {
@@ -3325,15 +3325,11 @@ impl Document {
                 if redirected
                     && let Some(embedder) = embedder
                     && let Some(gate) = req.csp.as_deref()
-                    && self.note_frame_redirect(
-                        embedder,
-                        gate,
-                        outcome.final_url.as_ref(),
-                        &req.url,
-                    )
+                    && self.note_frame_redirect(embedder, gate, &outcome.final_url, &req.url)
                 {
                     // Leave the current document in place.
-                } else if let Some(url) = outcome.final_url.clone() {
+                } else {
+                    let url = outcome.final_url.clone();
                     // The flags enter the frame with the document they
                     // govern, so a failed or cancelled navigation leaves the
                     // current document under its own flags.
@@ -3415,15 +3411,9 @@ impl Document {
         cors_clean: bool,
     ) {
         let destination = request.destination;
-        let request_url = request.url.clone();
         let blocked = redirected
             && destination.is_some_and(|destination| {
-                self.response_url_blocked(
-                    outcome.final_url.as_ref(),
-                    &request_url,
-                    destination,
-                    None,
-                )
+                self.response_url_blocked(&outcome.final_url, &request.url, destination, None)
             });
         let body = match &outcome.body {
             crate::protocol::ResponseBody::Bytes(body) => Some(body.as_slice()),
@@ -3471,10 +3461,10 @@ impl Document {
                     .map(|(_, value)| value.as_str()),
             )
             .unwrap_or(inherited);
-            let final_url = outcome.internal_url();
+            let final_url = &outcome.final_url;
             self.style_policies.insert(final_url.to_string(), policy);
-            if &request_url != final_url {
-                self.style_policies.insert(request_url.to_string(), policy);
+            if &request.url != final_url {
+                self.style_policies.insert(request.url.to_string(), policy);
             }
         }
         if !succeeded {
@@ -3487,7 +3477,7 @@ impl Document {
             self.image_taint.insert(request.key.clone(), origin_clean);
         }
         Box::new(request.handler).bytes(
-            outcome.internal_url().to_string(),
+            outcome.final_url.to_string(),
             blitz_traits::net::Bytes::from(body.unwrap_or_default().to_vec()),
         );
         // The arrival changes style or layout; apply it now so the tree is
@@ -3937,14 +3927,10 @@ impl Document {
         &mut self,
         embedder: FrameId,
         gate: &crate::RedirectGate,
-        final_url: Option<&Url>,
+        final_url: &Url,
         request_url: &Url,
     ) -> bool {
-        let Some(response_url) = final_url else {
-            return false;
-        };
-        let document_url = self.url.clone();
-        let violations = gate.redirected_violations(&document_url, response_url, request_url);
+        let violations = gate.redirected_violations(&self.url, final_url, request_url);
         let blocked = crate::csp::blocks(&violations);
         if !violations.is_empty() {
             self.embedder_csp_reports.push((embedder, violations));
@@ -3994,20 +3980,17 @@ impl Document {
     /// (<https://w3c.github.io/webappsec-csp/#should-block-response>).
     pub(in crate::document) fn response_url_blocked(
         &mut self,
-        final_url: Option<&Url>,
+        final_url: &Url,
         request_url: &Url,
         destination: crate::csp::Destination,
         target: Option<crate::dom::tree::NodeId>,
     ) -> bool {
-        let Some(url) = final_url else {
-            return false;
-        };
         let violations = {
             let world = self.world.borrow();
             world.policy.csp.check_redirected_request(
                 &world.origin,
                 &world.document_url,
-                url,
+                final_url,
                 request_url,
                 destination,
             )

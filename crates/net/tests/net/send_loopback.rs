@@ -405,6 +405,42 @@ async fn redirect_hops_re_determine_the_referrer() {
     landed.assert_clean();
 }
 
+/// `net` writes `Sec-Fetch-Site` for every request, not just navigations: the
+/// first hop names the initiator's relationship, a redirect chain only widens
+/// it, and a request with no initiator says `none`
+/// (<https://w3c.github.io/webappsec-fetch-metadata/#abstract-opdef-set-site>).
+#[tokio::test]
+async fn every_hop_carries_the_fetch_site_relationship() {
+    let landed = scripted([canned_ok(&[], b"landed")]);
+    let mut cross_site = landed.url("/landed");
+    cross_site
+        .set_host(Some("localhost"))
+        .expect("host is replaceable");
+    let start = scripted([canned_redirect(302, cross_site.as_str())]);
+    let mut request = Request::new(Method::GET, start.url("/start"));
+    request.initiator = Some(start.url("/page").origin());
+    default_agent().send(request).await.expect("redirect chain");
+    assert_eq!(
+        start.requests()[0].header("sec-fetch-site"),
+        Some("same-origin"),
+        "the first hop is the initiator's own origin"
+    );
+    assert_eq!(
+        landed.requests()[0].header("sec-fetch-site"),
+        Some("cross-site"),
+        "the chain keeps the widest relationship"
+    );
+
+    let server = scripted([canned_ok(&[], b"none")]);
+    let request = Request::new(Method::GET, server.url("/"));
+    default_agent().send(request).await.expect("no initiator");
+    assert_eq!(
+        server.requests()[0].header("sec-fetch-site"),
+        Some("none"),
+        "the user agent, not a document, started it"
+    );
+}
+
 /// The redirect gate sees the next URL and the hop count before that hop is
 /// sent. A false answer is a protocol rejection, not a followed request.
 #[tokio::test]
