@@ -34,7 +34,7 @@ fn open_popup(
 
 /// The default policy is `strict-origin-when-cross-origin`, so a cross-site
 /// popup gets the opener's origin and not its path, and the navigation is
-/// `cross-site` rather than the blank `none` the new tab used to send.
+/// `cross-site`.
 #[test]
 fn a_cross_site_popup_sends_the_openers_origin_as_referrer() {
     let (popup, origin, _fixture, mut client, session) = open_popup("127.0.0.1", "", "");

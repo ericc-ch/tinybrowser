@@ -2,11 +2,6 @@
 //! window-open steps need it
 //! (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#concept-window-open-features-tokenize>).
 //!
-//! The parser reads the list once for the whole open: the page shim no longer
-//! splits it, so there is one grammar and one answer. The comma split the shim
-//! used to run and the whitespace split the browser ran disagreed on
-//! `noopener=1` and `noopener noreferrer`.
-//!
 //! Only `noopener` and `noreferrer` are read today, and both are booleans, so
 //! the tokenized map is two flags whose last value wins. A feature the window
 //! open steps never ask about — a size, `popup` — is tokenized and dropped; add

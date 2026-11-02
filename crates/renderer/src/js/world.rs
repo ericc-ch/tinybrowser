@@ -2081,20 +2081,20 @@ impl World {
     /// The origin of this frame's top-level traversable
     /// (<https://html.spec.whatwg.org/multipage/webappapis.html#concept-environment-top-level-origin>).
     ///
-    /// A top-level frame answers its own origin. A child whose top-level realm
-    /// this renderer does not host (it always does today) falls back to its
-    /// own origin, which errs toward keeping the opener rather than severing
-    /// it on a guess.
+    /// A top-level frame answers its own origin. A child realm only exists
+    /// inside the top-level realm that created it, so that realm is alive
+    /// whenever a child script asks.
     pub(crate) fn top_level_origin(&self) -> url::Origin {
         let frame = self.frame();
         let top = self.runtime.shared.borrow().tree.top_level(frame);
         if top == frame {
             return self.origin.clone();
         }
-        self.frame_world(top).map_or_else(
-            || self.origin.clone(),
-            |world| world.borrow().origin.clone(),
-        )
+        self.frame_world(top)
+            .expect("a child realm's top-level realm is alive")
+            .borrow()
+            .origin
+            .clone()
     }
 
     /// Whether this realm's environment is a secure context. The model is

@@ -1631,15 +1631,16 @@ mod tests {
     /// What each policy actually puts on the wire: the CORS triple, the
     /// fetch-metadata destination and mode, and the origin the browser
     /// authorized. The renderer's table is only a claim until this holds.
-    #[test]
-    // The table is the contract: one row per policy, readable in one place.
-    #[expect(clippy::too_many_lines, reason = "one table, one place")]
-    fn every_policy_reaches_the_wire_with_its_own_parameters() {
+    fn wire_table() -> [(
+        RequestPolicy,
+        net::cors::RequestMode,
+        net::cors::CredentialsMode,
+        net::cors::RedirectMode,
+        &'static str,
+        &'static str,
+    ); 10] {
         use net::cors::{CredentialsMode, RedirectMode, RequestMode};
 
-        let initiator = Url::parse("http://a.test/page").expect("page URL").origin();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let sheets = HashSet::new();
         let anonymous = Some(net::cors::CrossOrigin::Anonymous);
         let credentials = Some(net::cors::CrossOrigin::UseCredentials);
         let fetch = |mode, credentials| {
@@ -1649,7 +1650,7 @@ mod tests {
                 redirect: RedirectMode::Follow,
             })
         };
-        let table = [
+        [
             (
                 fetch(renderer::CorsMode::NoCors, CredentialsMode::Omit),
                 RequestMode::NoCors,
@@ -1736,8 +1737,15 @@ mod tests {
                 "no-cors",
                 "report",
             ),
-        ];
-        for (policy, mode, credentials, redirect, fetch_mode, destination) in table {
+        ]
+    }
+
+    #[test]
+    fn every_policy_reaches_the_wire_with_its_own_parameters() {
+        let initiator = Url::parse("http://a.test/page").expect("page URL").origin();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let sheets = HashSet::new();
+        for (policy, mode, credentials, redirect, fetch_mode, destination) in wire_table() {
             let request = dial(policy, "http://b.test/x");
             let outbound = outbound_request(&request, &initiator, deadline, &sheets)
                 .expect("outbound request");
