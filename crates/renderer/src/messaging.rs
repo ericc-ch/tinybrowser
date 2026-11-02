@@ -13,7 +13,7 @@ use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
 use crate::dom::tree::NodeId;
-use crate::protocol::FrameId;
+use crate::protocol::{FrameId, WindowId};
 
 /// One browsing-context target name, parsed once from the string a page
 /// supplied
@@ -781,6 +781,16 @@ pub(crate) struct Shared {
     /// `iframe` containers that owned them; the engine drops their documents
     /// at its next turn.
     removed_frames: Vec<(FrameId, Option<NodeId>)>,
+    /// Browser tabs this tab opened, by the name they were opened with.
+    ///
+    /// `window.open` searches this tab's own tree first and then the browsing
+    /// context group's other top-level contexts
+    /// (<https://html.spec.whatwg.org/multipage/document-sequences.html#the-rules-for-choosing-a-navigable>).
+    /// The tree holds the contexts this renderer hosts; this map holds the
+    /// ones the browser hosts, so a reused name selects the same tab instead
+    /// of opening a second one. Names created by another renderer's tab are
+    /// not here: only the browser can see the whole group.
+    tab_names: HashMap<String, WindowId>,
 }
 
 impl Default for Shared {
@@ -794,6 +804,7 @@ impl Default for Shared {
             document_ids: HashMap::new(),
             next_document: 0,
             removed_frames: Vec::new(),
+            tab_names: HashMap::new(),
         }
     }
 }
@@ -895,6 +906,23 @@ impl Shared {
     /// Takes the frames whose documents the engine must drop.
     pub(crate) fn take_removed_frames(&mut self) -> Vec<(FrameId, Option<NodeId>)> {
         std::mem::take(&mut self.removed_frames)
+    }
+
+    /// The browser tab this tab opened under `name`, when one is still open.
+    pub(crate) fn named_tab(&self, name: &str) -> Option<WindowId> {
+        self.tab_names.get(name).copied()
+    }
+
+    /// Records that a browser tab was opened under `name`, so a later
+    /// `window.open` with that name selects it
+    /// (<https://html.spec.whatwg.org/multipage/document-sequences.html#the-rules-for-choosing-a-navigable>).
+    pub(crate) fn remember_named_tab(&mut self, name: String, window: WindowId) {
+        self.tab_names.insert(name, window);
+    }
+
+    /// Forgets every name a closed tab answered to.
+    pub(crate) fn forget_named_tab(&mut self, window: WindowId) {
+        self.tab_names.retain(|_, named| *named != window);
     }
 }
 

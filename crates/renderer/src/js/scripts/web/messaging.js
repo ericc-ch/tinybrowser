@@ -1031,12 +1031,10 @@ Object.defineProperty(globalThis, 'name', {
 // (<https://html.spec.whatwg.org/multipage/window-object.html#dom-open>).
 (function() {
   const remoteWindows = new __tbPrivateMap();
-  const namedWindows = new __tbPrivateMap();
   const remoteSessions = new __tbPrivateMap();
-  // Tabs closed through `close()`: reported by `closed` and evicted from
-  // `namedWindows` so a later `open(url, name)` opens a fresh tab.
+  // Tabs closed through `close()`, so `closed` reports it. The host forgets
+  // the tab's name, so a later `open(url, name)` opens a fresh tab.
   const closedTabs = new __tbPrivateSet();
-  const tabNames = new __tbPrivateMap();
 
   function remoteWindow(tab) {
     const existing = remoteWindows.get(tab);
@@ -1047,11 +1045,6 @@ Object.defineProperty(globalThis, 'name', {
           case 'close': return () => {
             host.__tbWindowClose(tab);
             closedTabs.add(tab);
-            const name = tabNames.get(tab);
-            if (name !== undefined) {
-              namedWindows.delete(name);
-              tabNames.delete(tab);
-            }
           };
           case 'closed': return closedTabs.has(tab);
           case 'postMessage': return function(message, targetOrigin, transfer) {
@@ -1111,27 +1104,23 @@ Object.defineProperty(globalThis, 'name', {
 
   globalThis.open = function(url, target, features) {
     if (arguments.length < 1 || url === undefined || url === null) url = '';
-    const name = target === undefined || target === null ? '' : String(target);
     // The engine runs the window open steps: it encodes the URL, tokenizes the
     // features, applies the blob-URL opener rule, and picks the context. The
-    // shim keeps only what the engine cannot see, the name-to-proxy cache
+    // shim only turns the selected context into a `WindowProxy`
     // (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#window-open-steps>).
+    //
+    // `target` defaults to `_blank` per the IDL, and the engine also treats an
+    // empty or absent target as `_blank`, so passing `undefined` through is
+    // enough.
+    const name = target === undefined || target === null ? '' : String(target);
     const featureString = features === undefined || features === null ? '' : String(features);
-    const special = name === '' || name.startsWith('_');
-    const known = !special && namedWindows.has(name);
-    const answer = host.__tbOpen(String(url), name, featureString, known);
+    const answer = host.__tbOpen(String(url), name, featureString);
     if (answer === null || answer === undefined) return null;
     let proxy;
-    if (answer.kind === 'cached') {
-      proxy = namedWindows.get(name);
-    } else if (answer.kind === 'frame') {
-      proxy = __tbFrameProxy(answer.id);
-    } else {
-      proxy = remoteWindow(answer.id);
-      if (!special) {
-        namedWindows.set(name, proxy);
-        tabNames.set(answer.id, name);
-      }
+    switch (answer.kind) {
+      case 'frame': proxy = __tbFrameProxy(answer.id); break;
+      case 'tab': proxy = remoteWindow(answer.id); break;
+      default: throw new TypeError(`unknown window open answer: ${answer.kind}`);
     }
     // `noopener` still selects and navigates the context, and never hands back
     // its `WindowProxy`

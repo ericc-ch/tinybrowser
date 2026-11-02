@@ -47,6 +47,9 @@ use rquickjs::{
 };
 use url::Url;
 
+use crate::messaging::TargetName;
+use crate::protocol::{FrameId, WindowId};
+
 pub(crate) use world::{CreatorInfo, NavigationReferrer, PolicyContainer, RealmRequest, World};
 
 /// Shared `QuickJS` heap cap. Forty live subframe realms need more than
@@ -1389,23 +1392,28 @@ fn random_bytes(ctx: Ctx<'_>, length: usize) -> rquickjs::Result<TypedArray<'_, 
 
 /// `window.open`/`window.close` hooks the JS shim calls.
 fn install_window_host_functions(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<(), JsError> {
-    // The window open steps are one algorithm, so the engine runs them and the
-    // shim keeps only the name cache: `__tbOpen` encodes the URL once, reads
-    // the features once, decides the opener policy (including the blob rule,
-    // which needs the top-level origin), and picks the context
+    // The window open steps are one algorithm, so the engine runs them:
+    // `__tbOpen` encodes the URL once, reads the features once, decides the
+    // opener policy (including the blob rule, which needs the top-level
+    // origin), and picks the context. The shim only turns the answer into a
+    // `WindowProxy`
     // (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#window-open-steps>).
     let window_open = world.clone();
-    bridge::object(ctx)?.set("__tbOpen", Func::from(open_window_hook(window_open)))?;
+    bridge::object(ctx)?.set(
+        "__tbOpen",
+        Func::from(move |url: String, name: String, features: String| {
+            open_window(&window_open, &url, &name, &features)
+        }),
+    )?;
 
     let window_close = world.clone();
     bridge::object(ctx)?.set(
         "__tbWindowClose",
         Func::from(move |window: u64| {
-            window_close
-                .borrow()
-                .runtime
-                .services
-                .window_close(crate::protocol::WindowId::new(window));
+            let window = crate::protocol::WindowId::new(window);
+            let world = window_close.borrow();
+            world.runtime.shared.borrow_mut().forget_named_tab(window);
+            world.runtime.services.window_close(window);
         }),
     )?;
 
@@ -1517,57 +1525,65 @@ fn install_window_messaging_functions(
     Ok(())
 }
 
-/// Binds [`open_window`] to one realm as the `__tbOpen` host function.
+/// What one `window.open` call selected.
 ///
-/// The closure must accept any JS lifetime, which `Func::from` reads from a
-/// `Ctx<'js>`, so the bound is written here instead of inferred.
-fn open_window_hook(
-    world: Rc<RefCell<World>>,
-) -> impl for<'js> Fn(Ctx<'js>, String, String, String, bool) -> rquickjs::Result<Value<'js>> {
-    move |ctx, url, name, features, known| open_window(&ctx, &world, &url, &name, &features, known)
+/// The context is a tagged union because a `FrameId` and a `WindowId` are
+/// different kinds of identity: this renderer hosts the first and the browser
+/// hosts the second.
+///
+/// `noopener` still selects and navigates a context; it only withholds the
+/// `WindowProxy`, which is [`withholds`](Self::withholds)
+/// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#window-open-steps>).
+struct WindowOpenAnswer {
+    context: OpenedContext,
+    withholds: bool,
 }
 
-/// One `window.open` call, split where the engine ends and the shim's name
-/// cache begins
+/// The context one `window.open` call selected.
+enum OpenedContext {
+    /// A context this renderer hosts: an auxiliary one it created, or the
+    /// navigable a name selected.
+    Frame(FrameId),
+    /// A browser tab.
+    Tab(WindowId),
+}
+
+impl<'js> rquickjs::IntoJs<'js> for WindowOpenAnswer {
+    fn into_js(self, ctx: &Ctx<'js>) -> rquickjs::Result<Value<'js>> {
+        let (kind, id) = match self.context {
+            OpenedContext::Frame(frame) => ("frame", frame.get()),
+            OpenedContext::Tab(window) => ("tab", window.get()),
+        };
+        let opened = Object::new(ctx.clone())?;
+        opened.set("kind", kind)?;
+        opened.set("id", js_number(id))?;
+        opened.set("withholds", self.withholds)?;
+        Ok(opened.into_value())
+    }
+}
+
+/// One `window.open` call
 /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#window-open-steps>).
 ///
-/// The answer is `null` when the call opens nothing, or an object naming the
-/// context the call selected — `cached` for a name the shim already holds,
-/// `frame` for a context this renderer hosts, `tab` for a browser tab — with
-/// `withholds` saying whether the call still returns no `WindowProxy`.
-fn open_window<'js>(
-    ctx: &Ctx<'js>,
+/// `None` when the call opens nothing.
+fn open_window(
     world: &Rc<RefCell<World>>,
     url: &str,
     name: &str,
     features: &str,
-    known: bool,
-) -> rquickjs::Result<Value<'js>> {
+) -> Option<WindowOpenAnswer> {
     // The window open steps treat an absent target as `_blank`, unlike a link
     // navigation where the empty string selects the current context
     // (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#window-open-steps>).
     let target = if name.is_empty() {
-        crate::messaging::TargetName::Blank
+        TargetName::Blank
     } else {
-        crate::messaging::TargetName::parse(name)
+        TargetName::parse(name)
     };
-    let plan = {
-        let world = world.borrow();
-        world.plan_window_open(url, &target, features)
-    };
-    let Some(plan) = plan else {
-        return Ok(Value::new_null(ctx.clone()));
-    };
-    // A name the shim already holds selects that context: the engine answers
-    // only the policy question, and the shim returns its cached proxy.
-    if known {
-        return opened_window(ctx, "cached", None, plan.withholds);
-    }
-    // The one creation decision: a target that chooses no navigable creates a
-    // context. A sandboxed document without `allow-popups` cannot create one,
-    // whether this renderer or the browser would host it; spelling the name
-    // `_BLANK` or choosing an unknown `_x` must not change that
-    // (<https://html.spec.whatwg.org/multipage/browsers.html#sandboxed-auxiliary-navigation-browsing-context-flag>).
+    let plan = world.borrow().plan_window_open(url, &target, features)?;
+    // The rules for choosing a navigable search this tab's tree, then the
+    // browsing context group's browser-hosted tabs
+    // (<https://html.spec.whatwg.org/multipage/document-sequences.html#the-rules-for-choosing-a-navigable>).
     let creates = {
         let world = world.borrow();
         world
@@ -1578,37 +1594,56 @@ fn open_window<'js>(
             .choose_navigable(&target, world.frame())
             .is_none()
     };
-    if creates && !world.borrow().allows_auxiliary_navigation() {
-        return Ok(Value::new_null(ctx.clone()));
+    if !creates {
+        // A context this renderer hosts keeps same-origin access to the
+        // opener: an auxiliary context for a blank or same-origin URL, or the
+        // navigable a name already selects.
+        let frame = World::open_auxiliary(world, &plan.url, &target, plan.opener)?;
+        return Some(WindowOpenAnswer {
+            context: OpenedContext::Frame(frame),
+            withholds: plan.withholds,
+        });
     }
-    // A context this renderer hosts keeps same-origin access to the opener: an
-    // auxiliary context for a blank or same-origin URL, or the navigable a
-    // name already selects. A cross-origin popup stays a browser tab.
+    if let TargetName::Named(name) = &target
+        && let Some(tab) = world.borrow().runtime.shared.borrow().named_tab(name)
+    {
+        return Some(WindowOpenAnswer {
+            context: OpenedContext::Tab(tab),
+            withholds: plan.withholds,
+        });
+    }
+    // Nothing in this tab created the context: the call creates one. A
+    // sandboxed document without `allow-popups` cannot create an auxiliary
+    // context, whether this renderer or the browser would host it; spelling
+    // the name `_BLANK` or choosing an unknown `_x` must not change that
+    // (<https://html.spec.whatwg.org/multipage/browsers.html#sandboxed-auxiliary-navigation-browsing-context-flag>).
+    if !world.borrow().allows_auxiliary_navigation() {
+        return None;
+    }
+    // A cross-origin popup stays a browser tab.
     if let Some(frame) = World::open_auxiliary(world, &plan.url, &target, plan.opener) {
-        return opened_window(ctx, "frame", Some(js_number(frame.get())), plan.withholds);
+        return Some(WindowOpenAnswer {
+            context: OpenedContext::Frame(frame),
+            withholds: plan.withholds,
+        });
     }
+    // The check above refused an unpermitted call, so this one may create. The
+    // browser re-checks the bit because it is the trust boundary.
     let allow_popups = world.borrow().allows_auxiliary_navigation();
     let services = world.borrow().runtime.services.clone();
-    let Some(tab) = services.window_open(&plan.url, plan.opener, &plan.source, allow_popups) else {
-        return Ok(Value::new_null(ctx.clone()));
-    };
-    opened_window(ctx, "tab", Some(js_number(tab.get())), plan.withholds)
-}
-
-/// One [`open_window`] answer, as the shim reads it.
-fn opened_window<'js>(
-    ctx: &Ctx<'js>,
-    kind: &str,
-    id: Option<f64>,
-    withholds: bool,
-) -> rquickjs::Result<Value<'js>> {
-    let opened = Object::new(ctx.clone())?;
-    opened.set("kind", kind)?;
-    if let Some(id) = id {
-        opened.set("id", id)?;
+    let tab = services.window_open(&plan.url, plan.opener, &plan.source, allow_popups)?;
+    if let Some(name) = target.new_context_name() {
+        world
+            .borrow()
+            .runtime
+            .shared
+            .borrow_mut()
+            .remember_named_tab(name.to_owned(), tab);
     }
-    opened.set("withholds", withholds)?;
-    Ok(opened.into_value())
+    Some(WindowOpenAnswer {
+        context: OpenedContext::Tab(tab),
+        withholds: plan.withholds,
+    })
 }
 
 /// `window.open`'s auxiliary-context hooks: reading and closing the opener.

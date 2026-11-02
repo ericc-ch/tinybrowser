@@ -96,6 +96,43 @@ fn a_same_site_popup_is_same_site_and_not_same_origin() {
     assert!(head.contains("sec-fetch-site: same-site"), "{head}");
 }
 
+/// A named browser-tab popup is one browsing context: opening the same name
+/// twice selects the tab the first call opened instead of creating a second
+/// one
+/// (<https://html.spec.whatwg.org/multipage/document-sequences.html#the-rules-for-choosing-a-navigable>).
+#[test]
+fn a_named_popup_is_reused() {
+    let popup = TestServer::start(vec![("/", "text/html", b"<!doctype html>peer")], None);
+    let target = format!("http://localhost:{}/", popup.address().port());
+    let (listener, address) = server();
+    // The page is `127.0.0.1`, so the popup is cross-site and stays a browser
+    // tab; the engine has to remember the name for that case.
+    let page = format!(
+        r#"<!doctype html><script>
+window.__first = window.open({target:?}, "shared");
+window.__second = window.open({target:?}, "shared");
+window.__same = window.__first === window.__second;
+</script>"#
+    );
+    serve_on(listener, vec![("/start", ok("text/html", page.as_bytes()))]);
+    let (_fixture, mut client, session) = open_page(
+        "tinybrowser-window-open",
+        &format!("http://127.0.0.1:{}/start", address.port()),
+    );
+    popup.wait("/");
+    assert_eq!(
+        evaluate(&mut client, &session, "window.__same"),
+        serde_json::json!(true),
+        "the second call with the same name selects the first tab"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert_eq!(
+        popup.history("/").len(),
+        1,
+        "the reused name did not open a second tab"
+    );
+}
+
 /// A sandboxed document without `allow-popups` cannot create a context, no
 /// matter how the target is spelled. The old check tested for the literal
 /// `_blank`, so `_BLANK` and any unknown `_`-prefixed name walked past it and
