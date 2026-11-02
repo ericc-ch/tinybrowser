@@ -274,6 +274,31 @@ pub(super) fn note_rejection<'js>(
     });
 }
 
+/// Drops the queued rejection state that belongs to `current`'s realm.
+///
+/// The queues are thread-local and hold `Persistent` values, so an entry
+/// left behind keeps its context alive past teardown and trips
+/// `JS_FreeRuntime`'s live-object assertion. Entries whose realm is already
+/// gone are dead weight too.
+pub(super) fn forget_rejections(current: &Rc<RefCell<World>>) {
+    PENDING_REJECTIONS.with(|queue| {
+        queue.borrow_mut().retain(|entry| {
+            entry
+                .world
+                .upgrade()
+                .is_some_and(|world| !Rc::ptr_eq(&world, current))
+        });
+    });
+    LATE_HANDLED.with(|queue| {
+        queue.borrow_mut().retain(|entry| {
+            entry
+                .world
+                .upgrade()
+                .is_some_and(|world| !Rc::ptr_eq(&world, current))
+        });
+    });
+}
+
 /// Fires the queued rejection events for `current`'s realm: one
 /// `unhandledrejection` per newly unhandled rejection, then any
 /// `rejectionhandled` a late handler queued. Called after a microtask

@@ -1718,6 +1718,7 @@ fn install_storage_host_functions(
 
 impl Drop for JsRealm {
     fn drop(&mut self) {
+        bindings::forget_rejections(&self.world);
         bindings::forget_world(&self.context);
         self.context.with(|ctx| bridge::release(&ctx, &self.world));
         let world = self.world.clone();
