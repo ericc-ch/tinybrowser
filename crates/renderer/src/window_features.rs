@@ -196,21 +196,4 @@ mod tests {
             OpenerPolicy::NoReferrer
         );
     }
-
-    /// The blob branch compares against the top-level origin, not the calling
-    /// frame's: a blob same-origin with a cross-site iframe still severs the
-    /// opener, because the top-level document is what keeps it.
-    #[test]
-    fn a_blob_must_match_the_top_level_origin() {
-        let frame = origin("https://frame.test/");
-        let top = origin("https://top.test/");
-        assert_eq!(
-            WindowFeatures::parse("").opener_policy(Some(&frame), &top),
-            OpenerPolicy::NoOpener
-        );
-        assert_eq!(
-            WindowFeatures::parse("").opener_policy(Some(&top), &top),
-            OpenerPolicy::Keep
-        );
-    }
 }

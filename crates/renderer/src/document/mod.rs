@@ -1047,6 +1047,7 @@ impl Document {
         };
         let mut loaded = Vec::with_capacity(pending.len());
         let inherited = self.world.borrow().policy.clone();
+        let top_level = self.world.borrow().top_level_origin();
         for (frame, container) in pending {
             // Parser-created and script-created frames share this funnel's
             // rule: the container's `sandbox` attribute unioned with this
@@ -1070,6 +1071,7 @@ impl Document {
                 let mut world = world_handle.borrow_mut();
                 world.policy = inherited.clone();
                 world.sandbox = sandbox;
+                world.top_level = Some(top_level.clone());
             }
             document.load_about_blank(Some(&base_url), Some(origin));
             document.set_document_referrer(Some(referrer_url.clone()));

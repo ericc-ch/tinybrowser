@@ -258,6 +258,89 @@ fn a_sandbox_without_allow_popups_cannot_open_a_context_by_spelling() {
     }
 }
 
+/// The blob branch of the window open steps compares the blob entry's origin
+/// with the *top-level* origin, not the calling frame's: a blob minted by a
+/// cross-site iframe still severs the opener, while one minted by the
+/// top-level document keeps it
+/// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#get-noopener-for-window-open>).
+#[test]
+fn a_blob_popup_compares_its_entry_with_the_top_level_origin() {
+    // The page and its cross-site iframe share one server: the page claims
+    // `127.0.0.1`, the iframe `localhost`, so they are different sites.
+    let (listener, address) = server();
+    let port = address.port();
+    let page = format!(
+        r#"<!doctype html><script>
+window.__cross_site_refused = null;
+window.addEventListener('message', function (event) {{
+  window.__cross_site_refused = event.data;
+}});
+const blob = new Blob(['<!doctype html>same'], {{type: 'text/html'}});
+window.__same_site = window.open(URL.createObjectURL(blob), '_blank');
+</script>
+<iframe src="http://localhost:{port}/frame"></iframe>"#
+    );
+    let frame = "<!doctype html><script>
+const blob = new Blob(['<!doctype html>peer'], {type: 'text/html'});
+parent.postMessage(String(window.open(URL.createObjectURL(blob), '_blank') === null), '*');
+</script>";
+    serve_on(
+        listener,
+        vec![
+            ("/start", ok("text/html", page.as_bytes())),
+            ("/frame", ok("text/html", frame.as_bytes())),
+        ],
+    );
+    let (_fixture, mut client, session) = open_page(
+        "tinybrowser-window-open",
+        &format!("http://127.0.0.1:{port}/start"),
+    );
+
+    // The top-level document's blob is same-site with the top-level origin, so
+    // the call returns the popup's proxy and the popup keeps its opener.
+    assert_eq!(
+        evaluate(
+            &mut client,
+            &session,
+            "window.__same_site !== null && window.__same_site.opener != null"
+        ),
+        serde_json::json!(true),
+        "a same-site blob keeps the opener"
+    );
+    // The iframe's blob is same-origin with the iframe and cross-site with the
+    // top-level document, so the call withholds the popup's proxy. Comparing
+    // against the calling frame's site instead would have kept it.
+    wait_for_value(
+        &mut client,
+        &session,
+        "window.__cross_site_refused !== null",
+        &serde_json::json!(true),
+    );
+    assert_eq!(
+        evaluate(&mut client, &session, "window.__cross_site_refused"),
+        serde_json::json!("true"),
+        "a cross-site iframe's blob severs the opener"
+    );
+}
+
+/// Waits until `expression` equals `expected`, so a frame's `postMessage` can
+/// arrive after the page has loaded.
+fn wait_for_value(
+    client: &mut cdp::Client,
+    session: &str,
+    expression: &str,
+    expected: &serde_json::Value,
+) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if &evaluate(client, session, expression) == expected {
+            return;
+        }
+        assert!(Instant::now() < deadline, "{expression} never became true");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// Waits until each sandboxed frame has posted its one answer.
 fn wait_for_answers(client: &mut cdp::Client, session: &str) {
     let deadline = Instant::now() + Duration::from_secs(10);
