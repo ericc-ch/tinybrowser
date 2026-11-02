@@ -586,13 +586,12 @@ async fn race_dial(
     }
 }
 
-/// The initiator a dial from an opaque document goes out with. The `data:`
-/// URL's origin is opaque and never equal to the request's client environment,
-/// so the referrer and the same-origin credential rules treat it as the
-/// isolated origin it is. The serialized `Origin` header is `null`
-/// (<https://fetch.spec.whatwg.org/#concept-request-origin>).
+/// The initiator a dial or popup from an opaque document goes out with. Every
+/// opaque origin is distinct, so the referrer and the same-origin credential
+/// rules treat it as the isolated origin it is. The serialized `Origin` header
+/// is `null` (<https://fetch.spec.whatwg.org/#concept-request-origin>).
 fn opaque_initiator() -> url::Url {
-    url::Url::parse("data:,").expect("data:, is a valid URL")
+    url::Url::parse("about:blank").expect("about:blank is a valid URL")
 }
 
 /// The origin URL a renderer names as a request initiator, when this
@@ -832,15 +831,15 @@ async fn route_window_call(
             // makes the same check
             // (<https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
             let origin = match authorized_initiator(&assignment.site, &initiator) {
-                Some(origin) => origin,
-                None if initiator.is_opaque() => opaque_initiator(),
+                Some(origin) => origin.origin(),
+                None if initiator.is_opaque() => opaque_initiator().origin(),
                 None => return Err(RendererViolation),
             };
             let referrer = assignment
                 .site
                 .allows(&referrer)
                 .then_some(referrer)
-                .filter(|referrer| referrer.origin() == origin.origin());
+                .filter(|referrer| referrer.origin() == origin);
             let initiator = crate::actor::NavigationInitiator {
                 origin,
                 referrer,

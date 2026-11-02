@@ -638,17 +638,16 @@ impl Drop for TabTask {
 /// The document a navigation starts from: the request origin, the referrer
 /// source, and the policy that decides the `Referer` header.
 ///
-/// A browser-initiated navigation has none: it sends no `Referer` and
-/// `Sec-Fetch-Site: none`. An opaque origin is carried as a URL whose origin
-/// is opaque (`data:,`), the same sentinel renderer dials use.
+/// A browser-initiated navigation has none: it sends no `Referer`,
+/// `Sec-Fetch-Site: none`, and no `SameSite` initiator. The origin is a
+/// [`url::Origin`], so an opaque document carries `Origin::Opaque` rather than
+/// a URL sentinel
 /// (<https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
 #[derive(Clone, Debug)]
 pub(crate) struct NavigationInitiator {
-    /// The initiating document's origin; a URL only so the network seam keeps
-    /// one shape for tuple and opaque origins. Only [`Url::origin`] is read,
-    /// and the browser authorized it against the renderer's site lock before
-    /// constructing this.
-    pub(crate) origin: Url,
+    /// The initiating document's origin. The browser authorized it against
+    /// the renderer's site lock before constructing this.
+    pub(crate) origin: url::Origin,
     /// The `"client"` referrer source, walked out of any `srcdoc` chain, when
     /// the browser authorized it against the renderer's site lock.
     pub(crate) referrer: Option<Url>,
@@ -1056,24 +1055,15 @@ impl Tab {
         }
         let epoch = nav.epoch;
         let url = nav.url.clone();
-        // A browser-initiated navigation runs with the tab's own document as
-        // its request origin, as it always has, but sends no referrer and
-        // `Sec-Fetch-Site: none`: no document asked for it.
-        let origin = nav
-            .initiator
-            .as_ref()
-            .map_or_else(|| self.document_url.clone(), |source| source.origin.clone());
+        // A browser-initiated navigation has no initiator: it sends no
+        // referrer, `Sec-Fetch-Site: none`, and a same-site cookie context.
+        // The tab's current document is not its initiator.
         let initiator = nav.initiator.clone();
         self.cancel_dial();
         let (cancel, cancel_rx) = watch::channel(false);
-        let guard = self.network.dial_navigation(
-            epoch,
-            url,
-            origin,
-            initiator,
-            self.dial_tx.clone(),
-            cancel_rx,
-        );
+        let guard =
+            self.network
+                .dial_navigation(epoch, url, initiator, self.dial_tx.clone(), cancel_rx);
         self.dial_cancel = Some(cancel);
         self.dial_guard = Some(guard);
         if let Some(nav) = self.nav.as_mut() {

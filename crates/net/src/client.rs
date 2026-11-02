@@ -191,14 +191,19 @@ impl Agent {
     }
 
     /// Operation for a `document.cookie` or `WebDriver` view of `url`.
-    fn fetch_op<'a>(&self, url: &'a Url, kind: RetrievalKind) -> CookieOp<'a> {
+    fn fetch_op<'a>(
+        &self,
+        url: &'a Url,
+        origin: &'a url::Origin,
+        kind: RetrievalKind,
+    ) -> CookieOp<'a> {
         CookieOp {
             url,
             now: self.clock.now(),
             kind,
             initiator_kind: InitiatorKind::Fetch,
             method_is_safe: true,
-            initiator: Some(url),
+            initiator: Some(origin),
             cross_site_redirect: false,
         }
     }
@@ -206,14 +211,16 @@ impl Agent {
     /// `document.cookie` getter for `uri`: non-HTTP cookies, semicolon-separated.
     #[must_use]
     pub fn cookies_for(&self, uri: &Url) -> String {
+        let origin = uri.origin();
         self.jar()
-            .cookie_string(self.fetch_op(uri, RetrievalKind::NonHttp))
+            .cookie_string(self.fetch_op(uri, &origin, RetrievalKind::NonHttp))
     }
 
     /// `document.cookie` setter for `uri`. Invalid `Set-Cookie` lines are ignored.
     pub fn set_cookie(&self, value: &str, uri: &Url) {
+        let origin = uri.origin();
         self.jar()
-            .store(value, self.fetch_op(uri, RetrievalKind::NonHttp));
+            .store(value, self.fetch_op(uri, &origin, RetrievalKind::NonHttp));
     }
 
     /// Stores one `Set-Cookie` line with HTTP-level rules, so an `HttpOnly`
@@ -221,8 +228,9 @@ impl Agent {
     /// whether the jar stored the cookie
     /// (<https://w3c.github.io/webdriver/#add-cookie>).
     pub fn store_cookie_http(&self, value: &str, uri: &Url) -> bool {
+        let origin = uri.origin();
         self.jar()
-            .store(value, self.fetch_op(uri, RetrievalKind::Http))
+            .store(value, self.fetch_op(uri, &origin, RetrievalKind::Http))
     }
 
     /// Cookies visible to `uri`, including session and `HttpOnly` cookies.
@@ -230,8 +238,9 @@ impl Agent {
     /// (<https://w3c.github.io/webdriver/#get-all-cookies>).
     #[must_use]
     pub fn cookie_records(&self, uri: &Url) -> Vec<crate::CookieRecord> {
+        let origin = uri.origin();
         self.jar()
-            .records_for(self.fetch_op(uri, RetrievalKind::Http))
+            .records_for(self.fetch_op(uri, &origin, RetrievalKind::Http))
     }
 
     /// Drops every cookie from the live jar
@@ -690,8 +699,12 @@ pub struct Request {
     pub headers: HeaderMap,
     /// Initiator class used for `SameSite` and (later) `Sec-Fetch-*`.
     pub initiator_kind: InitiatorKind,
-    /// Document URL used as the `SameSite` initiator.
-    pub initiator: Option<Url>,
+    /// The request's initiator origin, or `None` when the user agent started
+    /// it. `Sec-Fetch-Site`, the `SameSite` cookie context, and the request
+    /// origin all read this one field, so they cannot disagree about who
+    /// asked (<https://w3c.github.io/webappsec-fetch-metadata/#abstract-opdef-set-site>,
+    /// <https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#name-same-site-requests>).
+    pub initiator: Option<url::Origin>,
     /// Request body bytes. Redirects that convert to GET drop this.
     pub body: Option<Vec<u8>>,
     /// Absolute deadline for this call, covering every redirect hop.
@@ -920,7 +933,7 @@ struct Dial<'a> {
     cors: &'a crate::cors::CorsSettings,
     client_hints: &'a crate::ClientHints,
     initiator_kind: InitiatorKind,
-    initiator: Option<&'a Url>,
+    initiator: Option<&'a url::Origin>,
     on_redirect: Option<&'a RedirectGate>,
 }
 

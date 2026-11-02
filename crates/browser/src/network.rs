@@ -637,14 +637,13 @@ impl TabNetworkHandle {
     /// aborts the handle to cancel the request. The completion returns on
     /// `reply` tagged with `epoch`.
     ///
-    /// `origin` is the origin the request runs under, and `initiator` is the
-    /// document that started it, when one did. A browser-issued navigation
-    /// passes `None`: it sends no referrer and `Sec-Fetch-Site: none`.
+    /// `initiator` is the document that started it, when one did. A
+    /// browser-issued navigation passes `None`: it sends no referrer,
+    /// `Sec-Fetch-Site: none`, and same-site cookies.
     pub(crate) fn dial_navigation(
         &self,
         epoch: u64,
         url: Url,
-        origin: Url,
         initiator: Option<NavigationInitiator>,
         reply: UnboundedSender<(u64, Result<NavOutcome, DialFailure>)>,
         mut cancel: tokio::sync::watch::Receiver<bool>,
@@ -654,7 +653,7 @@ impl TabNetworkHandle {
             let result = tokio::select! {
                 biased;
                 _ = cancel.changed() => Err(DialFailure::Cancelled),
-                result = network.navigate(&url, &origin, initiator.as_ref()) => result,
+                result = network.navigate(&url, initiator.as_ref()) => result,
             };
             let _send_result = reply.send((epoch, result));
         })
@@ -663,7 +662,6 @@ impl TabNetworkHandle {
     async fn navigate(
         &self,
         url: &Url,
-        origin: &Url,
         source: Option<&NavigationInitiator>,
     ) -> Result<NavOutcome, DialFailure> {
         // Browser-seam timeline for `profile` in tools/wpt: a stalled test is
@@ -674,14 +672,18 @@ impl TabNetworkHandle {
         let deadline = started + PAGE_FETCH_TIMEOUT;
         let permits = Self::acquire(&self.permits.navigation, deadline).await?;
         let mut request = Request::new(Method::GET, url.clone());
-        chrome_navigation_request(&mut request, url, origin, source);
+        chrome_navigation_request(&mut request, url, source);
         request.initiator_kind = InitiatorKind::Navigation;
-        request.initiator = Some(origin.clone());
+        // One initiator origin feeds `Sec-Fetch-Site`, the cookie context, and
+        // the request origin. `None` means a fresh opaque origin: no document
+        // speaks for this navigation and none of the three may pretend one
+        // does (<https://w3c.github.io/webappsec-fetch-metadata/#abstract-opdef-set-site>).
+        request.initiator = source.map(|source| source.origin.clone());
         request.cors = net::cors::CorsSettings {
             mode: net::cors::RequestMode::Navigate,
             credentials: net::cors::CredentialsMode::Include,
             redirect: net::cors::RedirectMode::Follow,
-            origin: origin.origin(),
+            origin: source.map_or_else(opaque_origin, |source| source.origin.clone()),
         };
         request.deadline = Some(deadline);
         if let Some(source) = source {
@@ -691,7 +693,7 @@ impl TabNetworkHandle {
             // (<https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
             request.referrer = match &source.referrer {
                 Some(referrer) => net::Referrer::Client(net::ReferrerClient {
-                    origin: origin.origin(),
+                    origin: source.origin.clone(),
                     url: referrer.clone(),
                 }),
                 None => net::Referrer::NoReferrer,
@@ -1256,7 +1258,7 @@ fn outbound_request(
         outbound.body = Some(request.body.clone());
     }
     outbound.initiator_kind = InitiatorKind::Fetch;
-    outbound.initiator = Some(initiator.clone());
+    outbound.initiator = Some(initiator.origin());
     outbound.deadline = Some(deadline);
     // The renderer picks the referrer kind and policy; the browser owns the
     // client environment and the origin check. A referrer URL that is neither
@@ -1487,6 +1489,17 @@ pub(crate) fn dial_failure(error: &net::NetError) -> DialFailure {
     }
 }
 
+/// A fresh opaque origin.
+///
+/// A browser-initiated navigation has no initiating document, so nothing can
+/// claim its origin. The `url` crate mints an opaque origin for a non-special
+/// URL, and every mint is distinct, which is exactly "no principal".
+fn opaque_origin() -> url::Origin {
+    Url::parse("about:blank")
+        .expect("about:blank is a valid URL")
+        .origin()
+}
+
 /// The browser's default headers for one top-level (or popup) document
 /// request, matching Chrome's document navigation.
 ///
@@ -1496,7 +1509,7 @@ pub(crate) fn dial_failure(error: &net::NetError) -> DialFailure {
 /// navigation request
 /// (<https://w3c.github.io/webappsec-fetch-metadata/>). `Sec-Fetch-Site` is
 /// `none` for a browser-initiated navigation and otherwise computed from the
-/// request origin over the URL list; the net client widens it on redirects
+/// initiator origin over the URL list; the net client widens it on redirects
 /// (<https://w3c.github.io/webappsec-fetch-metadata/#abstract-opdef-set-site>).
 ///
 /// Low-entropy UA client hints are sent only to potentially trustworthy URLs
@@ -1505,7 +1518,6 @@ pub(crate) fn dial_failure(error: &net::NetError) -> DialFailure {
 fn chrome_navigation_request(
     request: &mut Request,
     url: &Url,
-    origin: &Url,
     source: Option<&NavigationInitiator>,
 ) {
     static_header(request, "Upgrade-Insecure-Requests", "1");
@@ -1514,12 +1526,9 @@ fn chrome_navigation_request(
         "Accept",
         "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
     );
-    let site = match source {
-        // With one URL this is the whole answer; the net client widens it as
-        // redirects add URLs.
-        Some(_) => net::sec_fetch_site(&origin.origin(), url),
-        None => "none",
-    };
+    // With one URL this is the whole answer; the net client widens it as
+    // redirects add URLs.
+    let site = source.map_or("none", |source| net::sec_fetch_site(&source.origin, url));
     static_header(request, "Sec-Fetch-Site", site);
     static_header(request, "Sec-Fetch-Mode", "navigate");
     static_header(request, "Sec-Fetch-User", "?1");
@@ -2327,7 +2336,7 @@ mod tests {
     fn chrome_navigation_headers_are_limited_to_trustworthy_urls() {
         let secure = Url::parse("https://example.com/").expect("https url");
         let mut secure_request = net::Request::new(net::Method::GET, secure.clone());
-        chrome_navigation_request(&mut secure_request, &secure, &secure, None);
+        chrome_navigation_request(&mut secure_request, &secure, None);
         assert!(
             secure_request
                 .headers
@@ -2338,7 +2347,7 @@ mod tests {
 
         let insecure = Url::parse("http://example.com/").expect("http url");
         let mut insecure_request = net::Request::new(net::Method::GET, insecure.clone());
-        chrome_navigation_request(&mut insecure_request, &insecure, &insecure, None);
+        chrome_navigation_request(&mut insecure_request, &insecure, None);
         assert!(
             insecure_request
                 .headers
@@ -2356,7 +2365,7 @@ mod tests {
     #[test]
     fn a_navigation_names_its_fetch_site_only_when_a_document_started_it() {
         let source = |spec: &str| NavigationInitiator {
-            origin: Url::parse(spec).expect("origin URL"),
+            origin: Url::parse(spec).expect("origin URL").origin(),
             referrer: None,
             referrer_policy: net::ReferrerPolicy::default(),
         };
@@ -2370,7 +2379,7 @@ mod tests {
             let target = Url::parse(target).expect("target URL");
             let initiator = source(initiator);
             let mut request = net::Request::new(net::Method::GET, target.clone());
-            chrome_navigation_request(&mut request, &target, &initiator.origin, Some(&initiator));
+            chrome_navigation_request(&mut request, &target, Some(&initiator));
             assert_eq!(
                 request.headers.get("sec-fetch-site"),
                 Some(expected.as_bytes()),
@@ -2380,7 +2389,7 @@ mod tests {
 
         let target = Url::parse("https://a.test/").expect("target URL");
         let mut request = net::Request::new(net::Method::GET, target.clone());
-        chrome_navigation_request(&mut request, &target, &target, None);
+        chrome_navigation_request(&mut request, &target, None);
         assert_eq!(
             request.headers.get("sec-fetch-site"),
             Some(b"none".as_slice()),

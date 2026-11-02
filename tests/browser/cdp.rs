@@ -2,7 +2,7 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
-use crate::fixture::{Fixture, evaluate};
+use crate::fixture::{Fixture, TestServer, evaluate, load_page};
 use serde_json::json;
 
 fn start() -> (Fixture, cdp::Client) {
@@ -296,6 +296,46 @@ fn page_navigate_loads_http_document() {
         )
         .expect("eval");
     assert_eq!(evaluated["result"]["value"], json!("hi"));
+}
+
+/// A browser-driven navigation has no initiating document, so its cookies are
+/// same-site while `Sec-Fetch-Site` is `none`. The tab's blank document is not
+/// its initiator: treating it as one withheld `SameSite=Strict` cookies on the
+/// path every CDP client drives
+/// (<https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#name-same-site-requests>).
+#[test]
+fn page_navigate_from_a_fresh_tab_is_same_site_for_cookies() {
+    let server = TestServer::start(
+        vec![
+            ("/", "text/html", b"<!doctype html><p>first</p>"),
+            ("/again", "text/html", b"<!doctype html><p>again</p>"),
+        ],
+        None,
+    );
+    let origin = format!("http://{}/", server.address());
+    let (_fixture, mut client) = start();
+    let session = load_page(&mut client, &origin, Duration::from_secs(10));
+    evaluate(
+        &mut client,
+        &session,
+        "document.cookie = 'sid=1; SameSite=Strict; Path=/'",
+    );
+    assert_eq!(
+        evaluate(&mut client, &session, "document.cookie"),
+        json!("sid=1")
+    );
+
+    load_page(
+        &mut client,
+        &format!("{origin}again"),
+        Duration::from_secs(10),
+    );
+    let head = server.wait("/again").to_ascii_lowercase();
+    assert!(
+        head.contains("cookie: sid=1"),
+        "a browser-initiated navigation is same-site for cookies: {head}"
+    );
+    assert!(head.contains("sec-fetch-site: none"), "{head}");
 }
 
 fn http_get(addr: std::net::SocketAddr, path: &str) -> (u16, String) {

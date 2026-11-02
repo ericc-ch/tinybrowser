@@ -100,8 +100,10 @@ pub struct CookieOp<'a> {
     /// cookies go with a cross-site request only when its method is safe;
     /// callers must pass the real method's safety.
     pub method_is_safe: bool,
-    /// Document URL the request started from, for the same-site check.
-    pub initiator: Option<&'a Url>,
+    /// The request's initiator origin, or `None` when the user agent started
+    /// it: a request with no initiating context is same-site
+    /// (<https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#name-same-site-requests>).
+    pub initiator: Option<&'a Origin>,
     /// Whether a redirect chain has crossed sites before this request.
     pub cross_site_redirect: bool,
 }
@@ -791,7 +793,7 @@ impl CookieOp<'_> {
         }
         match self.initiator {
             None => true,
-            Some(from) => schemeful_same_site(from, self.url),
+            Some(from) => origins_same_site(from, &self.url.origin()),
         }
     }
 }
@@ -1649,7 +1651,7 @@ mod tests {
     #[test]
     fn lax_cookie_follows_a_cross_site_navigation_only_with_a_safe_method() {
         let page = url("https://example.com/");
-        let other = url("https://other.test/");
+        let other = url("https://other.test/").origin();
         let mut jar = CookieJar::default();
         assert!(jar.store("lax=1; SameSite=Lax", http(&page, at(NOW))));
         let cross_site = |method_is_safe| CookieOp {

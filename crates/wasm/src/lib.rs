@@ -339,8 +339,10 @@ fn start_hop(owner: u64, chain: Chain, completion: DialCompletion) {
 
 /// The `Cookie` header for the hop in flight.
 fn cookie_header(chain: &Chain) -> String {
-    let initiator = chain.initiator.as_ref();
-    let cross_origin = initiator.is_some_and(|initiator| initiator.origin() != chain.url.origin());
+    let initiator = chain.initiator.as_ref().map(Url::origin);
+    let cross_origin = initiator
+        .as_ref()
+        .is_some_and(|initiator| *initiator != chain.url.origin());
     if !net::cors::credentials_admitted(chain.cors.credentials, cross_origin) {
         return String::new();
     }
@@ -350,7 +352,7 @@ fn cookie_header(chain: &Chain) -> String {
         kind: RetrievalKind::Http,
         initiator_kind: InitiatorKind::Fetch,
         method_is_safe: true,
-        initiator: chain.initiator.as_ref(),
+        initiator: initiator.as_ref(),
         cross_site_redirect: chain.cross_site_redirect,
     })
 }
@@ -375,6 +377,7 @@ fn store_hop_cookies(url: &Url, chain: &Chain, response: &FetchResponse) {
         return;
     }
     let now = SystemTime::now();
+    let initiator = chain.initiator.as_ref().map(Url::origin);
     let mut jar = lock(cookie_jar());
     for line in &response.set_cookies {
         jar.store(
@@ -385,7 +388,7 @@ fn store_hop_cookies(url: &Url, chain: &Chain, response: &FetchResponse) {
                 kind: RetrievalKind::Http,
                 initiator_kind: InitiatorKind::Fetch,
                 method_is_safe: true,
-                initiator: chain.initiator.as_ref(),
+                initiator: initiator.as_ref(),
                 cross_site_redirect: chain.cross_site_redirect,
             },
         );
@@ -537,18 +540,20 @@ impl NetworkHost for WasmServices {
     }
 
     fn cookies_for(&self, url: &Url) -> String {
+        let origin = url.origin();
         lock(cookie_jar()).cookie_string(CookieOp {
             url,
             now: SystemTime::now(),
             kind: RetrievalKind::NonHttp,
             initiator_kind: InitiatorKind::Fetch,
             method_is_safe: true,
-            initiator: Some(url),
+            initiator: Some(&origin),
             cross_site_redirect: false,
         })
     }
 
     fn set_cookie(&self, value: &str, url: &Url) {
+        let origin = url.origin();
         lock(cookie_jar()).store(
             value,
             CookieOp {
@@ -557,7 +562,7 @@ impl NetworkHost for WasmServices {
                 kind: RetrievalKind::NonHttp,
                 initiator_kind: InitiatorKind::Fetch,
                 method_is_safe: true,
-                initiator: Some(url),
+                initiator: Some(&origin),
                 cross_site_redirect: false,
             },
         );
