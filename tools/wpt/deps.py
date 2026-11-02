@@ -107,6 +107,7 @@ def sources_for(
     )
     if export.returncode != 0:
         raise RuntimeError(export.stderr.strip() or "llvm-cov failed")
+    merged.unlink(missing_ok=True)
     files: list[str] = []
     current: str | None = None
     covered = False
@@ -206,7 +207,9 @@ def build(args: argparse.Namespace) -> int:
         for index in range(0, len(tests), args.batch)
     ]
     print(f"deps: {len(batches)} batches of up to {args.batch}", file=sys.stderr)
-    with tempfile.TemporaryDirectory(prefix="wpt-deps-") as scratch_dir:
+    with tempfile.TemporaryDirectory(
+        prefix="wpt-deps-", dir=args.scratch
+    ) as scratch_dir:
         scratch = Path(scratch_dir)
         tests_map: dict[str, list[str]] = {}
         with concurrent.futures.ThreadPoolExecutor(args.jobs) as pool:
@@ -240,6 +243,12 @@ def main() -> int:
     build_parser.add_argument("--binary", required=True)
     build_parser.add_argument("--out", required=True)
     build_parser.add_argument("--llvm-tools", default=None)
+    build_parser.add_argument(
+        "--scratch",
+        default=None,
+        help="directory for raw profiles (tens of MB each; /tmp is often a "
+        "small tmpfs, so point this at real disk)",
+    )
     build_parser.add_argument("--jobs", type=int, default=os.cpu_count() or 1)
     build_parser.add_argument(
         "--batch",
