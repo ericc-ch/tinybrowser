@@ -66,7 +66,11 @@ for directories where layout or paint can panic (html/ currently does): a
 panic in-process bypasses the harness's per-file error framing, and unwinding
 a half-torn engine can abort outright. dom/ needs no sharding and runs 692
 files in ~25 s at 16 jobs, with 557/557 file verdicts matching the nightly
-report and 93 files skipped (testdriver/reftest).
+report and 93 files skipped (testdriver/reftest). html/ (11,252 files, 58
+shards) took ~322 s of shard wall with 5 crashing files isolated, and
+6,238/6,238 verdicts matched. fetch+xhr+url+encoding+FileAPI+streams (638
+files) is 45 s cold and 0.6 s warm, 325/325 matched. The nightly report
+gives 8,140 s of per-test time for those three slices together.
 
 Known gap: an async listener that leaves a host object borrowed makes
 rquickjs panic with `AlreadyBorrowed` in `Class::borrow_mut`; rquickjs
