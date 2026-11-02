@@ -2404,9 +2404,8 @@ fn note_inserted_creators(ctx: &Ctx<'_>, inserted: &[NodeId]) {
         }
         targets
     };
-    // Only capture a stack when an attribution target exists: most insertions
-    // are text and plain elements, and building an `Error` for each is pure
-    // overhead.
+    // Only capture a frame when an attribution target exists: most insertions
+    // are text and plain elements, and the lookup is pure overhead.
     if targets.is_empty() {
         return;
     }

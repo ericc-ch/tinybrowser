@@ -69,6 +69,7 @@ Exotic hooks for WebIDL legacy platform objects (dcd8edd, 9bcc543, 42688aa, 31e1
   - Deferred direction: redesign the fork so it never catches a panic to begin with (no `catch_unwind`, callbacks assumed panic-free), which makes the abort profile the documented contract instead of an exception to the guard.
 - ad2fb33 expose the string compilation host hook. `Runtime::set_can_compile_strings` binds `JS_SetCanCompileStringsHandler` with the callback's `Ctx` and source, mirroring the interrupt and rejection handlers; bundle the new symbol for every target.
 - ba4e459 safe `TypedArray::to_vec`. Embedders needed a copy that survives JavaScript execution, detach, and resize; the only alternatives were `as_slice` under `unsafe` or an `Array.from` round trip per element. Form bodies, page/XHR request bodies, the XML response decoder, and TextDecoder input now cross as `Uint8Array`.
+- f2dff4f `Ctx::stack_frame` reads a frame's script and position from the interpreter. An embedder that wants to attribute a violation or a fetch to a source location could only build an `Error` and parse its `.stack` text, which the page controls: `Error.prepareStackTrace` decides what it says and `Error.stackTraceLimit` decides how much survives, so the answer is spoofable and can be emptied. `stack_frame` calls no JS and ignores both, and the entry point is declared by hand in `sys/src/inlines/stack_frame.rs` so the per-target bindings need no regeneration.
 - Tracking (11c770e, 7ca6024, 38c4d87, a86ed40, 3587d7e, 50b403e, c161d25): pull quickjs engine fixes and regenerate bindings; wasm OOM/atom-table/inline mirrors.
 
 ### quickjs (third_party/rquickjs/sys/quickjs, fork branch)
@@ -78,6 +79,7 @@ Exotic fallthrough machinery the stock engine lacks (2afa33b, 88a9be3, 2339e92, 
 - 712757e native closures retain and enter their home realm. C closures lacked the context ownership and GC edge C functions had; also adds length-zero stack checks and fallible init before opaque adoption.
 - ac85002 keep the callback's exotic key order. The engine re-sorted host keys; now it copies the host order and appends only unreported ordinary keys.
 - 12c216c consult the host before compiling strings from JS. `JS_SetCanCompileStringsHandler` runs at `JS_EvalObject`, the one choke point under `eval` (direct and indirect) and the `Function` constructor; host evaluation (`JS_Eval`) is untouched. An `eval`/`Function` JS wrapper cannot substitute: it is observable and makes every direct eval indirect.
+- 6422d41 `JS_GetStackFrameLocation` reports one frame's script, 1-based line and column, and whether it runs bytecode, straight from the interpreter's stack. `JS_GetScriptOrModuleName` gives the script alone, so an embedder that needs the position had to walk `Error.stack`, whose text and length the page's `prepareStackTrace` and `stackTraceLimit` control. The read never calls JS and allocates nothing beyond the atom the caller frees.
 
 ### Vendored crates (no commits, recorded deltas)
 

@@ -2194,24 +2194,33 @@ fn throw_eval_error(ctx: &Ctx<'_>, message: &str) -> rquickjs::Error {
     }
 }
 
-/// The executing script's URL, line, and column: the top frame of a freshly
-/// constructed `Error`'s stack trace. Subresource triggers (an element
-/// insertion, a `src` set) capture this so a later CSP violation for the load
-/// can report `sourceFile`, `lineNumber`, and `columnNumber`
+/// The executing script's URL, line, and column: the innermost script frame of
+/// the interpreter's stack. Subresource triggers (an element insertion, a `src`
+/// set) capture this so a later CSP violation for the load can report
+/// `sourceFile`, `lineNumber`, and `columnNumber`
 /// (<https://w3c.github.io/webappsec-csp/#create-violation-for-global>).
-/// The constructor is the pristine one captured at install, passed as an
-/// argument: a page that replaces the `Error` global neither spoofs the
-/// capture nor runs code inside the bindings. Returns `None` outside script
-/// execution or when no frame parses.
+///
+/// The frame is read from the interpreter directly, so a page that rewrites
+/// `Error.stackTraceLimit` or `Error.prepareStackTrace` cannot spoof it, no
+/// page code runs during the capture, and nothing is allocated for a stack
+/// string. Frames of the engine's own bundle are skipped, as are frames that
+/// name no script; `None` means no page script is running (a parser insertion).
 pub(crate) fn error_stack_top(ctx: &Ctx<'_>) -> Option<(String, u32, u32)> {
-    let factory: Function = ctx.eval("(function(E){ return new E(); })").ok()?;
-    let error_ctor = bindings::world(ctx).ok()?.borrow().pristine_error.clone()?;
-    let error: Object = factory.call((error_ctor.restore(ctx).ok()?,)).ok()?;
-    let stack: String = error.get("stack").ok()?;
-    // The capture runs inside a binding, so engine dispatch frames sit
-    // between the capture and the executing page script; `user_frame` skips
-    // them to the script the violation attributes to.
-    CreatorInfo::user_frame(&stack).map(|creator| (creator.url, creator.line, creator.column))
+    let mut level = 0;
+    loop {
+        let frame = ctx.stack_frame(level)?;
+        level += 1;
+        if frame.native {
+            continue;
+        }
+        let Some(url) = frame.filename.and_then(|atom| atom.to_string().ok()) else {
+            continue;
+        };
+        if url == crate::js::bridge::ENGINE_FILENAME {
+            continue;
+        }
+        return Some((url, frame.line, frame.column));
+    }
 }
 
 fn eval_classic<'js, V: FromJs<'js>>(ctx: &rquickjs::Ctx<'js>, source: &str) -> Result<V, JsError> {
@@ -2342,71 +2351,4 @@ fn millis(delay: f64) -> u32 {
     }
     let duration = Duration::from_secs_f64((delay / 1000.0).clamp(0.0, 86_400.0));
     u32::try_from(duration.as_millis()).unwrap_or(u32::MAX)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::CreatorInfo;
-
-    #[test]
-    fn stack_top_frame_parses() {
-        // Direct page-script frame past the capture `eval`.
-        let frame = CreatorInfo::user_frame(
-            "    at <eval> (eval_script:1:5)\n    at appendChild (http://example.test/page.html:3:15)\n    at <eval> (http://example.test/page.html:1:1)",
-        )
-        .expect("frame");
-        assert_eq!(frame.url, "http://example.test/page.html");
-        assert_eq!(frame.line, 3);
-        assert_eq!(frame.column, 15);
-        // Bare `url:line:col` frames parse too.
-        let anonymous = CreatorInfo::user_frame(
-            "    at <eval> (eval_script:1:5)\n    at http://example.test/a.js:2:1",
-        )
-        .expect("anonymous");
-        assert_eq!(anonymous.url, "http://example.test/a.js");
-        assert_eq!(anonymous.line, 2);
-        assert_eq!(anonymous.column, 1);
-        assert!(CreatorInfo::user_frame("no frames here").is_none());
-        assert!(
-            CreatorInfo::user_frame(
-                "    at <eval> (eval_script:1:5)\n    at broken (http://example.test/a.js)"
-            )
-            .is_none()
-        );
-    }
-
-    #[test]
-    fn user_frame_skips_engine_frames() {
-        // A binding capture: frame zero is the capture `eval`, then native
-        // dispatch and the shim bundle, then the executing page script.
-        let stack = "    at <eval> (eval_script:1:5)\n    at appendChild (native)\n    at apply (native)\n    at insertion (tinybrowser-shim:3346:48)\n    at <eval> (http://example.test/inject.js:3:15)";
-        let user = CreatorInfo::user_frame(stack).expect("user frame");
-        assert_eq!(user.url, "http://example.test/inject.js");
-        assert_eq!(user.line, 3);
-        assert_eq!(user.column, 15);
-        // No page script on the stack (parser insertion): no attribution.
-        assert!(
-            CreatorInfo::user_frame(
-                "    at <eval> (eval_script:1:5)\n    at insertion (tinybrowser-shim:10:2)"
-            )
-            .is_none()
-        );
-        // A `data:` script URL carries its own parentheses; the location
-        // still splits at the frame wrapper, not inside the URL.
-        let paren_url = CreatorInfo::user_frame(
-            "    at <eval> (eval_script:1:5)\n    at <eval> (data:text/javascript,eval(%22x('y')%22):3:17)",
-        )
-        .expect("paren url");
-        assert_eq!(paren_url.url, "data:text/javascript,eval(%22x('y')%22)");
-        assert_eq!(paren_url.line, 3);
-        assert_eq!(paren_url.column, 17);
-        // Page script evaluated without a URL is still page code.
-        let eval_code = CreatorInfo::user_frame(
-            "    at <eval> (eval_script:1:5)\n    at run (tinybrowser-shim:7471:46)\n    at <eval> (<input>:2:8)",
-        )
-        .expect("eval frame");
-        assert_eq!(eval_code.url, "<input>");
-        assert_eq!(eval_code.line, 2);
-        assert_eq!(eval_code.column, 8);
-    }
 }

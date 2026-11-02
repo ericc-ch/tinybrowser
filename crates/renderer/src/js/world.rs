@@ -1443,10 +1443,6 @@ pub(crate) struct World {
     pub(crate) pristine_boolean: Option<Persistent<Function<'static>>>,
     pub(crate) pristine_reflect_set: Option<Persistent<Function<'static>>>,
     pub(crate) pristine_queue_microtask: Option<Persistent<Function<'static>>>,
-    /// The pristine `Error` constructor, so violation source capture never
-    /// resolves the page-replaceable global: a page that swaps `Error` must
-    /// neither spoof `sourceFile` nor run code inside the bindings.
-    pub(crate) pristine_error: Option<Persistent<rquickjs::function::Constructor<'static>>>,
     /// The pristine `EvalError` constructor, so a refused string compilation
     /// raises the realm's own exception: a page that swaps `EvalError` must
     /// neither run code inside the bindings nor substitute another value.
@@ -1662,59 +1658,6 @@ pub(crate) struct CreatorInfo {
     pub column: u32,
 }
 
-impl CreatorInfo {
-    /// Parses one `at`-prefixed stack line into its `(url, line, column)`.
-    /// The trailing `:line:col` is stripped first, so URLs carrying their
-    /// own parentheses (a `data:` script's encoded source) do not confuse
-    /// the frame wrapper split. `(native)` dispatch lines and malformed
-    /// frames parse to `None`.
-    fn parse_frame(line: &str) -> Option<(&str, u32, u32)> {
-        let frame = line.trim().strip_prefix("at ")?.trim();
-        let frame = frame.strip_suffix(')').unwrap_or(frame);
-        // Line and column are the last two colon segments, both numeric.
-        let (rest, column) = frame.rsplit_once(':')?;
-        let (rest, line) = rest.rsplit_once(':')?;
-        let (Some(line), Some(column)) = (line.parse::<u32>().ok(), column.parse::<u32>().ok())
-        else {
-            return None;
-        };
-        // `name (url)` or a bare `url`: the name never holds a paren, so
-        // the first `(` opens the location even when the URL has its own.
-        // A URL may itself end in `)`; the wrapper close is already gone.
-        let url = rest.split_once('(').map_or(rest, |(_, url)| url);
-        if url.is_empty() {
-            return None;
-        }
-        Some((url, line, column))
-    }
-
-    /// The first engine-external frame of a stack trace captured inside a
-    /// binding: frame zero is the capture `eval` itself, `(native)` lines
-    /// are dispatch with no page location, and `tinybrowser-shim` frames are
-    /// the engine bundle between page script and the binding. What remains
-    /// is the executing page script, whose URL names the violation source.
-    /// Page script evaluated without a URL (direct `eval`, `WebDriver`
-    /// `execute`) still counts: it is genuinely page code, only oddly
-    /// labeled. Returns `None` when no page frame is on the stack (parser
-    /// insertions run with no script executing).
-    pub(crate) fn user_frame(stack: &str) -> Option<Self> {
-        let mut frames = stack.lines().filter_map(Self::parse_frame).peekable();
-        // The capture `eval` is always innermost.
-        frames.next()?;
-        for (url, line, column) in frames {
-            if url == crate::js::bridge::ENGINE_FILENAME {
-                continue;
-            }
-            return Some(Self {
-                url: url.to_owned(),
-                line,
-                column,
-            });
-        }
-        None
-    }
-}
-
 /// One streaming `TextDecoder` session: the decoder plus what recreates it.
 /// A `last=true` call ends the decoder (`encoding_rs` panics on reuse), so
 /// every non-streaming `decode()` replaces it with a fresh one. `carry`
@@ -1816,7 +1759,6 @@ impl World {
             pristine_boolean: None,
             pristine_reflect_set: None,
             pristine_queue_microtask: None,
-            pristine_error: None,
             pristine_eval_error: None,
             event_ctors: HashMap::new(),
             weak_references: None,
@@ -3078,7 +3020,6 @@ impl World {
         self.pristine_boolean = None;
         self.pristine_reflect_set = None;
         self.pristine_queue_microtask = None;
-        self.pristine_error = None;
         self.pristine_eval_error = None;
         self.event_ctors.clear();
         self.weak_references = None;

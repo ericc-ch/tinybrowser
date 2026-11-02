@@ -65,6 +65,12 @@ pub(crate) struct Response {
 }
 
 impl Response {
+    /// The same response with one extra header.
+    pub(crate) fn header(mut self, name: &str, value: &str) -> Self {
+        self.headers.push((name.to_owned(), value.to_owned()));
+        self
+    }
+
     fn not_found() -> Self {
         Self {
             status: 404,
