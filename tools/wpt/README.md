@@ -58,12 +58,10 @@ changes. On dom/nodes/ (100 files) a cold run is ~6 s at 8 jobs; a warm run is
 `interrupted` when the engine cuts a script short, and the runner gives each
 file one drain with its whole budget instead of a short slice.
 
-Known gap: a few files leave a generated binding's `Persistent` reachable at
-realm teardown, and QuickJS aborts in `JS_FreeRuntime` when that engine is
-dropped (reproduced by `dom/ranges/crashtests/Range-setEnd-to-node-removed-by-extractContents.html`,
-whose `CSS.highlights` registry is a maplike). The process then dies after
-the results it already collected. This is an engine lifecycle bug, not a
-harness one; until it is fixed, treat a non-zero exit as a truncated run.
+Known gap: an async listener that leaves a host object borrowed makes
+rquickjs panic with `AlreadyBorrowed` in `Class::borrow_mut`; rquickjs
+converts that panic into a script exception, so the run still finishes and
+writes its report. It is an engine re-entrancy bug to fix, not a harness one.
 
 A conformance change is a failure-list diff: failures prints the
 canonical list of a --score log, baseline runs both sides in a detached
