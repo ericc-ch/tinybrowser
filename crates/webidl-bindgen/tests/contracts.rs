@@ -1,6 +1,11 @@
 use quote::ToTokens;
 use webidl_bindgen::{Source, compile_contracts, compile_javascript, validate_sources};
 
+/// Generated token streams are whitespace-insensitive; assertions can be too.
+fn squash(source: &str) -> String {
+    source.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
 fn generated_trait(rust: &str) -> String {
     let syntax = syn::parse_file(rust).expect("generated syntax");
     let [syn::Item::Mod(module)] = syntax.items.as_slice() else {
@@ -1020,6 +1025,61 @@ fn javascript_unsupported_implementations_fail_the_build() {
         assert!(
             compile_javascript(&idl, &source).is_err(),
             "accepted {text}"
+        );
+    }
+}
+
+#[test]
+fn a_secure_context_constant_is_gated_where_it_is_installed() {
+    // `[SecureContext]` const is rejected on the member itself, but a
+    // `[SecureContext] partial interface` is a resolved scope, so the constant
+    // must carry the gate to the installer
+    // (<https://webidl.spec.whatwg.org/#SecureContext>).
+    let idl = [Source {
+        name: "dom.idl",
+        text: "[Exposed=Window] interface Sample { readonly attribute boolean open; }; [SecureContext] partial interface Sample { const unsigned short SECRET = 7; };",
+    }];
+    let rust = [Source {
+        name: "sample.rs",
+        text: "impl<'js> sample_generated::Sample<'js> for Payload { fn get_open(&self, ctx: &Ctx<'js>) -> Result<bool> { Ok(true) } }",
+    }];
+    let bindings = compile_contracts(&idl, &rust).expect("compile secure constant");
+    let source = squash(&bindings[0].rust);
+    for fragment in [
+        "CONSTANTS:&[host::Constant]=&[host::Constant{name:\"SECRET\",value:7u16,secure_context:true,},]",
+        "host::Member{name:\"open\",secure_context:false",
+    ] {
+        assert!(
+            source.contains(&squash(fragment)),
+            "missing {fragment}: {source}"
+        );
+    }
+}
+
+#[test]
+fn an_interface_secure_context_gates_the_interface_not_its_members() {
+    // The interface object and prototype are gated whole, so a member of a
+    // `[SecureContext] interface` carries no gate of its own: only a member or
+    // an enclosing partial/mixin scope can gate one member
+    // (<https://webidl.spec.whatwg.org/#SecureContext>).
+    let idl = [Source {
+        name: "dom.idl",
+        text: "[Exposed=Window, SecureContext] interface Sample { readonly attribute boolean open; [SecureContext] undefined secret(); };",
+    }];
+    let rust = [Source {
+        name: "sample.rs",
+        text: "impl<'js> sample_generated::Sample<'js> for Payload { fn get_open(&self, ctx: &Ctx<'js>) -> Result<bool> { Ok(true) } fn secret(&self, ctx: &Ctx<'js>) -> Result<()> { Ok(()) } }",
+    }];
+    let bindings = compile_contracts(&idl, &rust).expect("compile secure interface");
+    let source = squash(&bindings[0].rust);
+    for fragment in [
+        "if!host::is_secure_context(ctx)?{returnOk(None);}",
+        "host::Member{name:\"open\",secure_context:false",
+        "host::Member{name:\"secret\",secure_context:true",
+    ] {
+        assert!(
+            source.contains(&squash(fragment)),
+            "missing {fragment}: {source}"
         );
     }
 }

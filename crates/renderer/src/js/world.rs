@@ -1,6 +1,5 @@
 //! Shared JS world for the renderer.
 
-use enumerated::Enumerated;
 use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
@@ -1317,12 +1316,15 @@ impl SandboxFlags {
 /// CORS settings state and its `referrerpolicy` override
 /// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#cors-settings-attributes>,
 /// <https://html.spec.whatwg.org/multipage/urls-and-fetching.html#referrer-policy-attributes>).
+///
+/// Both are the attribute's state as the engine parses it; the dial's wire
+/// types are a translation at the call site.
 #[derive(Default)]
 pub(crate) struct SubresourceOptions {
     /// The `crossorigin` CORS settings state; `None` is the `No CORS` state.
     pub(crate) crossorigin: Option<blitz_traits::net::CorsSetting>,
     /// The element's `referrerpolicy`, when it names one.
-    pub(crate) referrer_policy: Option<net::ReferrerPolicy>,
+    pub(crate) referrer_policy: Option<blitz_traits::net::ReferrerPolicy>,
 }
 
 pub(crate) struct World {
@@ -1959,7 +1961,7 @@ impl World {
             crossorigin: crate::dom::tree::attr(base, element.node, "crossorigin")
                 .map(blitz_traits::net::CorsSetting::parse),
             referrer_policy: crate::dom::tree::attr(base, element.node, "referrerpolicy")
-                .and_then(net::ReferrerPolicy::parse),
+                .and_then(blitz_traits::net::ReferrerPolicy::parse),
         }
     }
 

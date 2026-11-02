@@ -55,6 +55,9 @@ pub(crate) enum MemberKind {
 pub(crate) struct Constant {
     pub(crate) name: &'static str,
     pub(crate) value: u16,
+    /// `[SecureContext]`: the constant is absent outside a secure context
+    /// (<https://webidl.spec.whatwg.org/#SecureContext>).
+    pub(crate) secure_context: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -417,7 +420,11 @@ pub(crate) fn constructor_prototype<'js, T: JsClass<'js>>(
 
 pub(crate) fn install_constants(target: &Object<'_>, constants: &[Constant]) -> Result<()> {
     // https://webidl.spec.whatwg.org/#define-the-constants
+    let secure_context = is_secure_context(target.ctx())?;
     for constant in constants {
+        if constant.secure_context && !secure_context {
+            continue;
+        }
         target.prop(constant.name, Property::from(constant.value).enumerable())?;
     }
     Ok(())

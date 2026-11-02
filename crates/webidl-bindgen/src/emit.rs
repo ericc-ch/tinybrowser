@@ -132,7 +132,8 @@ fn member_tables(interface: &Interface) -> TokenStream {
     let constants = interface.constants.iter().map(|constant| {
         let name = &constant.name;
         let value = constant.value;
-        quote! { host::Constant { name: #name, value: #value } }
+        let secure_context = constant.exposure.secure_context;
+        quote! { host::Constant { name: #name, value: #value, secure_context: #secure_context } }
     });
     quote! {
         const MEMBERS: &[host::Member] = &[#(#members),*];

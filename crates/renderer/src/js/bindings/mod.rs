@@ -1354,10 +1354,6 @@ pub(super) fn set_pi_attributes(
     }
     let old_value = parsed.document.character_data(id.node);
     let old_length = old_value.units().len();
-    // The fork serializes the map into the data itself and reloads an
-    // `xml-stylesheet` sheet the instruction names. It returns the string the
-    // tree now holds, so the exact-unit bookkeeping below keys off that copy
-    // rather than a second serialization of the same map.
     let data = crate::dom_string::DomString::from(
         parsed
             .document

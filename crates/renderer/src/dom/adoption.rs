@@ -220,7 +220,11 @@ pub(crate) fn materialize_import(
             attributes,
         } => {
             let text = data.to_string_lossy().into_owned();
-            let blitz_id = doc.create_processing_instruction(target, &text, attributes.clone());
+            let blitz_id = doc.create_processing_instruction_with_attributes(
+                target,
+                &text,
+                attributes.clone(),
+            );
             Ok(NodeId {
                 document,
                 node: blitz_id,

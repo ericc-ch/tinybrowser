@@ -2,7 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use weedle::attribute::{ExtendedAttribute, ExtendedAttributeList};
 use weedle::interface::{
-    InterfaceMember, Special, StringifierOrInheritOrStatic, StringifierOrStatic,
+    AsyncIterableInterfaceMember, InterfaceMember, IterableInterfaceMember, Special,
+    StringifierOrInheritOrStatic, StringifierOrStatic,
 };
 use weedle::mixin::MixinMember;
 use weedle::{Definition, Definitions, Parse};
@@ -30,10 +31,12 @@ pub(crate) struct Member<'idl> {
 /// What a member's declaration and enclosing scopes say about its exposure.
 ///
 /// `[SecureContext]` is one fact no matter where it is declared: on the member,
-/// on its interface, or on a partial interface or mixin the interface includes
-/// (<https://webidl.spec.whatwg.org/#SecureContext>). Both emitters read this
-/// one value.
-#[derive(Clone, Copy, Default)]
+/// or on a partial interface or mixin the interface includes
+/// (<https://webidl.spec.whatwg.org/#SecureContext>). An interface-level
+/// `[SecureContext]` is not part of this: it gates the interface object and
+/// prototype themselves, so its members are never installed outside a secure
+/// context in the first place. Both emitters read this one value.
+#[derive(Clone, Copy)]
 pub(crate) struct Exposure {
     pub(crate) secure_context: bool,
 }
@@ -50,17 +53,36 @@ impl Clone for Member<'_> {
 impl Member<'_> {
     pub(crate) fn attributes(&self) -> Option<&ExtendedAttributeList<'_>> {
         match &self.declaration {
+            InterfaceMember::Const(member) => member.attributes.as_ref(),
             InterfaceMember::Attribute(member) => member.attributes.as_ref(),
-            InterfaceMember::Operation(member) => member.attributes.as_ref(),
             InterfaceMember::Constructor(member) => member.attributes.as_ref(),
-            _ => None,
+            InterfaceMember::Operation(member) => member.attributes.as_ref(),
+            InterfaceMember::Iterable(IterableInterfaceMember::Single(member)) => {
+                member.attributes.as_ref()
+            }
+            InterfaceMember::Iterable(IterableInterfaceMember::Double(member)) => {
+                member.attributes.as_ref()
+            }
+            InterfaceMember::AsyncIterable(AsyncIterableInterfaceMember::Single(member)) => {
+                member.attributes.as_ref()
+            }
+            InterfaceMember::AsyncIterable(AsyncIterableInterfaceMember::Double(member)) => {
+                member.attributes.as_ref()
+            }
+            InterfaceMember::Maplike(member) => member.attributes.as_ref(),
+            InterfaceMember::Setlike(member) => member.attributes.as_ref(),
+            InterfaceMember::Stringifier(member) => member.attributes.as_ref(),
         }
     }
 
-    pub(crate) fn exposure(&self, interface: &Interface<'_>) -> Exposure {
+    /// The exposure of this member's own declaration and enclosing scopes.
+    ///
+    /// The interface's own `[SecureContext]` is deliberately absent: it gates
+    /// the interface object and prototype, so no member of it is installed
+    /// outside a secure context anyway.
+    pub(crate) fn exposure(&self) -> Exposure {
         Exposure {
             secure_context: has_no_args(self.attributes(), "SecureContext")
-                || has_no_args(interface.attributes.as_ref(), "SecureContext")
                 || self
                     .scopes
                     .iter()

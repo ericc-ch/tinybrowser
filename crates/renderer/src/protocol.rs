@@ -17,7 +17,8 @@ use net::cors::CrossOrigin;
 
 /// The CORS settings state a request carried, as the policy the carrier sends
 /// the dial under. This is the one translation from the element-level type to
-/// the wire type
+/// the wire type; the browser process does not link the engine, so the wire
+/// cannot carry `blitz_traits`'s
 /// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#cors-settings-attributes>).
 pub(crate) fn cross_origin(setting: Option<blitz_traits::net::CorsSetting>) -> Option<CrossOrigin> {
     setting.map(|setting| match setting {

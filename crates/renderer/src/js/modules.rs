@@ -105,6 +105,7 @@ pub(super) fn load_module<'js>(ctx: &Ctx<'js>, name: &str) -> Result<Module<'js,
             world.referrer_url.clone(),
             options
                 .referrer_policy
+                .map(crate::protocol::referrer_policy)
                 .or(world.policy.referrer_policy)
                 .unwrap_or_default(),
             crate::protocol::cross_origin(options.crossorigin),

@@ -8,6 +8,7 @@ use weedle::literal::{ConstValue, IntegerLit};
 use weedle::types::{ConstType, IntegerType};
 
 use crate::Error;
+use crate::database::Exposure;
 
 /// One platform type implementing an interface. The primary payload owns the
 /// interface's prototype and class; alternates are additional Rust types the
@@ -358,10 +359,14 @@ pub(crate) enum DictionaryFieldType {
 pub(crate) struct Constant {
     pub(crate) name: String,
     pub(crate) value: u16,
+    pub(crate) exposure: Exposure,
 }
 
 impl Constant {
-    pub(crate) fn parse(member: &weedle::interface::ConstMember<'_>) -> Result<Self, Error> {
+    pub(crate) fn parse(
+        member: &weedle::interface::ConstMember<'_>,
+        exposure: Exposure,
+    ) -> Result<Self, Error> {
         let ConstType::Integer(type_) = member.const_type else {
             return Err(Error("expected an unsigned short constant".into()));
         };
@@ -383,6 +388,7 @@ impl Constant {
         Ok(Self {
             name: identifier(member.identifier.0)?.into(),
             value,
+            exposure,
         })
     }
 }

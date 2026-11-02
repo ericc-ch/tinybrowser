@@ -84,15 +84,17 @@ impl CredentialsMode {
 }
 
 enumerated::enumerated! {
-    /// The state of a present `crossorigin` content attribute
+    /// The keyword set of a present `crossorigin` content attribute, as it
+    /// travels on the renderer-to-browser wire
     /// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#cors-settings-attributes>).
     ///
-    /// An absent attribute is `None`, which is the `No CORS` state: `no-cors`
-    /// with credentials included. A present attribute is `Anonymous` or
-    /// `Use Credentials`; an empty or unknown spelling is `Anonymous`, the
-    /// enumerated attribute's invalid value default, so a bad spelling never
-    /// sends credentials
-    /// (<https://html.spec.whatwg.org/multipage/common-microsyntaxes.html#enumerated-attribute>).
+    /// This is a wire type, not an attribute parser: an absent attribute is
+    /// `None`, the `No CORS` state, and the attribute's invalid value default
+    /// (`Anonymous`) is applied where the attribute is read, by
+    /// `blitz_traits::net::CorsSetting::parse` in the renderer. A present
+    /// attribute is therefore always one of these two keywords here; the
+    /// browser process does not link the engine, so it cannot use the
+    /// element-level type.
     #[derive(serde::Serialize, serde::Deserialize)]
     #[serde(rename_all = "kebab-case")]
     pub CrossOrigin {

@@ -222,7 +222,7 @@ fn lower_members(
     let mut members = Vec::new();
     let mut missing = Vec::new();
     for resolved in &declaration.members {
-        let exposure = resolved.exposure(declaration);
+        let exposure = resolved.exposure();
         match &resolved.declaration {
             InterfaceMember::Constructor(member)
                 if provided.contains(&("constructor".into(), Kind::Constructor)) =>

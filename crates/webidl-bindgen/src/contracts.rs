@@ -8,7 +8,7 @@ use weedle::interface::{InterfaceMember, Special};
 use weedle::literal::DefaultValue;
 use weedle::types::{IntegerType, NonAnyType, SingleType, Type, UnionMemberType};
 
-use crate::database::{Database, has_no_args};
+use crate::database::{Database, Exposure, has_no_args};
 use crate::model::{
     self, ArgumentArity, ConstructorArgumentKind, GetterMapping, InterfaceKind, OperationResult,
     PropertyGetter, PropertyHooks, PrototypeParent, ReturnType,
@@ -580,13 +580,15 @@ fn lower_members(
     let inherited = database.hook_members(declaration.name)?;
     for member in declaration.members.iter().chain(inherited.iter()) {
         let resolved = member;
-        let exposure = member.exposure(declaration);
+        let exposure = member.exposure();
         match &member.declaration {
             InterfaceMember::Const(member) => {
                 resolved.validate_scopes().map_err(|error| {
                     crate::Error(format!("{}: {error}", member_name(&resolved.declaration)))
                 })?;
-                interface.constants.push(model::Constant::parse(member)?);
+                interface
+                    .constants
+                    .push(model::Constant::parse(member, exposure)?);
             }
             InterfaceMember::Constructor(member)
                 if implementation.methods.contains_key("constructor") =>
@@ -602,12 +604,11 @@ fn lower_members(
                 )?;
             }
             InterfaceMember::Attribute(member) => {
-                let Some((mut attribute, signature)) =
-                    lower_attribute(database, member, &implementation.methods)?
+                let Some((attribute, signature)) =
+                    lower_attribute(database, member, exposure, &implementation.methods)?
                 else {
                     continue;
                 };
-                attribute.exposure = exposure;
                 resolved.validate_scopes().map_err(|error| {
                     crate::Error(format!("{}: {error}", member_name(&resolved.declaration)))
                 })?;
@@ -650,6 +651,7 @@ fn lower_members(
                 let Some((operation, signature, property)) = lower_operation(
                     database,
                     member,
+                    exposure,
                     &implementation.methods,
                     &mut interface.unions,
                 )?
@@ -664,8 +666,6 @@ fn lower_members(
                     getters.push(property);
                 }
                 methods.push(signature);
-                let mut operation = operation;
-                operation.exposure = exposure;
                 interface.operations.push(operation);
             }
             InterfaceMember::Constructor(_)
@@ -1206,6 +1206,7 @@ fn lower_indexed_setter(
 fn lower_operation(
     database: &Database<'_>,
     member: &weedle::interface::OperationInterfaceMember<'_>,
+    exposure: Exposure,
     implemented: &BTreeMap<String, Method>,
     unions: &mut Vec<model::Union>,
 ) -> Result<Option<(model::Operation, TokenStream, Option<PropertyGetter>)>, Error> {
@@ -1281,7 +1282,7 @@ fn lower_operation(
         fn #rust(&self, ctx: Ctx<'js>, #this_parameter #(#parameters),*) -> Result<#returns>;
     };
     let operation = model::Operation {
-        exposure: crate::database::Exposure::default(),
+        exposure,
         name: name.into(),
         rust,
         result,
@@ -1631,6 +1632,7 @@ fn reject_legacy_non_string_reflect(
 fn lower_attribute(
     database: &Database<'_>,
     member: &weedle::interface::AttributeInterfaceMember<'_>,
+    exposure: Exposure,
     implemented: &BTreeMap<String, Method>,
 ) -> Result<Option<(model::Attribute, TokenStream)>, Error> {
     // Reflected attributes install without implementation methods, so
@@ -1640,7 +1642,7 @@ fn lower_attribute(
     // implemented, so hand-written getters encode the spec algorithm. Other
     // members keep skip-if-unimplemented semantics.
     if let Some(content) = reflect_content(member.attributes.as_ref(), member.identifier.0)
-        && let Some(lowered) = lower_reflect_attribute(member, &content, implemented)?
+        && let Some(lowered) = lower_reflect_attribute(member, exposure, &content, implemented)?
     {
         return Ok(Some(lowered));
     }
@@ -1663,13 +1665,13 @@ fn lower_attribute(
     // `ReflectSetter` reflects on set while the getter stays custom: the
     // implementation provides the getter, the generator owns the setter.
     if let Some(content) = reflect_setter_content(member.attributes.as_ref(), member.identifier.0) {
-        return lower_reflect_setter_attribute(database, member, &content, implemented);
+        return lower_reflect_setter_attribute(database, member, exposure, &content, implemented);
     }
     // `ReflectURL` resolves the content attribute against the document base
     // on get and reflects plainly on set, fully generated. Non-`USVString`
     // shapes (like `object.codeBase`) fall through for hand implementation.
     if let Some(content) = reflect_url_content(member.attributes.as_ref(), member.identifier.0)
-        && let Some(lowered) = lower_reflect_url_attribute(member, &content, implemented)?
+        && let Some(lowered) = lower_reflect_url_attribute(member, exposure, &content, implemented)?
     {
         return Ok(Some(lowered));
     }
@@ -1740,7 +1742,7 @@ fn lower_attribute(
     let mut signature = quote! { fn #getter(&self, ctx: &Ctx<'js>) -> Result<#result>; };
     let setter = attribute_setter(member, &type_, writable, &setter_name, &mut signature)?;
     let attribute = model::Attribute {
-        exposure: crate::database::Exposure::default(),
+        exposure,
         name: member.identifier.0.into(),
         rust: getter,
         return_type: type_,
@@ -1907,6 +1909,7 @@ fn reflect_setter_content(
 fn lower_reflect_setter_attribute(
     database: &Database<'_>,
     member: &weedle::interface::AttributeInterfaceMember<'_>,
+    exposure: Exposure,
     content: &str,
     implemented: &BTreeMap<String, Method>,
 ) -> Result<Option<(model::Attribute, TokenStream)>, Error> {
@@ -1995,7 +1998,7 @@ fn lower_reflect_setter_attribute(
     }
     let signature = reflect_setter_signature(member.identifier.0, &getter, &type_)?;
     let attribute = model::Attribute {
-        exposure: crate::database::Exposure::default(),
+        exposure,
         name: member.identifier.0.into(),
         rust: getter,
         return_type: type_,
@@ -2092,6 +2095,7 @@ fn reflect_setter_signature(
 /// so hand-written getters encode the spec algorithm.
 fn lower_reflect_attribute(
     member: &weedle::interface::AttributeInterfaceMember<'_>,
+    exposure: Exposure,
     content: &str,
     implemented: &BTreeMap<String, Method>,
 ) -> Result<Option<(model::Attribute, TokenStream)>, Error> {
@@ -2186,7 +2190,7 @@ fn lower_reflect_attribute(
         None
     };
     let attribute = model::Attribute {
-        exposure: crate::database::Exposure::default(),
+        exposure,
         name: member.identifier.0.into(),
         rust: getter,
         return_type: type_,
@@ -2206,6 +2210,7 @@ fn lower_reflect_attribute(
 /// shapes fall through for hand implementation.
 fn lower_reflect_url_attribute(
     member: &weedle::interface::AttributeInterfaceMember<'_>,
+    exposure: Exposure,
     content: &str,
     implemented: &BTreeMap<String, Method>,
 ) -> Result<Option<(model::Attribute, TokenStream)>, Error> {
@@ -2254,7 +2259,7 @@ fn lower_reflect_url_attribute(
         None
     };
     let attribute = model::Attribute {
-        exposure: crate::database::Exposure::default(),
+        exposure,
         name: member.identifier.0.into(),
         rust: getter,
         return_type: ReturnType::UsvString,

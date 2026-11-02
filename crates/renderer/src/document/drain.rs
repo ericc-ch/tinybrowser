@@ -394,6 +394,7 @@ impl Document {
         };
         dial.req.referrer_policy = options
             .referrer_policy
+            .map(crate::protocol::referrer_policy)
             .or(self.world.borrow().policy.referrer_policy)
             .unwrap_or_default();
         dial.req.csp = Some(Box::new(
