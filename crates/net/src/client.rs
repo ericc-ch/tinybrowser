@@ -414,7 +414,7 @@ impl Agent {
         let mut hop = Hop {
             method: request.method,
             headers: request.headers,
-            body: request.body,
+            body: request.body.map(Bytes::from),
             // Once any hop is cross-origin under `cors` (or `no-cors`), every
             // later hop keeps that tainting
             // (<https://fetch.spec.whatwg.org/#main-fetch>).
@@ -434,7 +434,7 @@ impl Agent {
             hop.headers
                 .append(header::ACCEPT_LANGUAGE, HeaderValue::from_static("en-US"));
         }
-        let empty_body = hop.body.as_ref().is_none_or(Vec::is_empty);
+        let empty_body = hop.body.as_ref().is_none_or(Bytes::is_empty);
         if empty_body
             && (hop.method == Method::POST
                 || hop.method == Method::PUT
@@ -622,13 +622,7 @@ impl Agent {
             crate::cors::credentials_admitted(dial.cors.credentials, cross_origin);
         let (status, response_headers, reader, http2) = self
             .engine
-            .send(
-                &hop.method,
-                &wire,
-                &hop_headers,
-                hop.body.as_deref(),
-                budget,
-            )
+            .send(&hop.method, &wire, &hop_headers, hop.body.clone(), budget)
             .await?;
         let content_encoding: Vec<String> =
             crate::get_decode_split(&response_headers, "content-encoding")
@@ -949,7 +943,7 @@ impl Dial<'_> {
 struct Hop {
     method: Method,
     headers: HeaderMap,
-    body: Option<Vec<u8>>,
+    body: Option<Bytes>,
     response_type: crate::cors::ResponseType,
     /// The previous hop's URL, for the redirect-taint computation
     /// (<https://fetch.spec.whatwg.org/#concept-request-tainted-origin>).

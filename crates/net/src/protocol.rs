@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::fmt;
 
 use hyper::header::{HeaderName, HeaderValue};
@@ -143,27 +142,6 @@ pub fn get_decode_split_decoded<'a>(
     combined_header_in(headers, name).map(|value| split_header_value(&value))
 }
 
-pub(crate) fn is_token_char(c: char) -> bool {
-    c.is_ascii_alphanumeric()
-        || matches!(
-            c,
-            '!' | '#'
-                | '$'
-                | '%'
-                | '&'
-                | '\''
-                | '*'
-                | '+'
-                | '-'
-                | '.'
-                | '^'
-                | '_'
-                | '`'
-                | '|'
-                | '~'
-        )
-}
-
 /// Why a header name or value was rejected.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum HeaderError {
@@ -304,24 +282,27 @@ pub struct InvalidMethod(Box<str>);
 
 /// HTTP request method.
 ///
-/// `GET`, `HEAD`, `POST`, `PUT`, `DELETE`, and `OPTIONS` are stored in
-/// canonical uppercase. `PATCH` stays uppercase only when the input was already
-/// `PATCH`. Any other valid token is kept as typed.
+/// `http::Method` owns the token grammar and the RFC 9110 predicates
+/// (<https://www.rfc-editor.org/rfc/rfc9110#section-9>). This type adds Fetch's
+/// two rules on top: [`Method::parse`] normalizes the six standard methods to
+/// uppercase and keeps any other method as typed
+/// (<https://fetch.spec.whatwg.org/#methods>), and [`Method::is_forbidden`]
+/// rejects the methods page script may not send.
 ///
 /// The wire spelling is the text [`Method::parse`] accepts, so a decoded
 /// method is always a parsed method and neither side re-checks the grammar.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(try_from = "String", into = "String")]
-pub struct Method(Cow<'static, str>);
+pub struct Method(hyper::Method);
 
 impl Method {
-    pub const GET: Self = Self(Cow::Borrowed("GET"));
-    pub const HEAD: Self = Self(Cow::Borrowed("HEAD"));
-    pub const POST: Self = Self(Cow::Borrowed("POST"));
-    pub const PUT: Self = Self(Cow::Borrowed("PUT"));
-    pub const DELETE: Self = Self(Cow::Borrowed("DELETE"));
-    pub const OPTIONS: Self = Self(Cow::Borrowed("OPTIONS"));
-    pub const PATCH: Self = Self(Cow::Borrowed("PATCH"));
+    pub const GET: Self = Self(hyper::Method::GET);
+    pub const HEAD: Self = Self(hyper::Method::HEAD);
+    pub const POST: Self = Self(hyper::Method::POST);
+    pub const PUT: Self = Self(hyper::Method::PUT);
+    pub const DELETE: Self = Self(hyper::Method::DELETE);
+    pub const OPTIONS: Self = Self(hyper::Method::OPTIONS);
+    pub const PATCH: Self = Self(hyper::Method::PATCH);
 
     /// Parses an HTTP method token per [Fetch methods](https://fetch.spec.whatwg.org/#methods).
     ///
@@ -329,26 +310,26 @@ impl Method {
     ///
     /// [`InvalidMethod`] when `token` is empty or not an HTTP token.
     pub fn parse(token: &str) -> Result<Self, InvalidMethod> {
-        if token.is_empty() || !token.chars().all(is_token_char) {
-            return Err(InvalidMethod(token.into()));
-        }
-        let uppercased = token.to_ascii_uppercase();
-        let stored = match uppercased.as_str() {
-            "GET" => Cow::Borrowed("GET"),
-            "HEAD" => Cow::Borrowed("HEAD"),
-            "POST" => Cow::Borrowed("POST"),
-            "PUT" => Cow::Borrowed("PUT"),
-            "DELETE" => Cow::Borrowed("DELETE"),
-            "OPTIONS" => Cow::Borrowed("OPTIONS"),
-            "PATCH" if uppercased == token => Cow::Borrowed("PATCH"),
-            _ => Cow::Owned(token.to_owned()),
+        let standard = match token.to_ascii_uppercase().as_str() {
+            "GET" => Some(Self::GET),
+            "HEAD" => Some(Self::HEAD),
+            "POST" => Some(Self::POST),
+            "PUT" => Some(Self::PUT),
+            "DELETE" => Some(Self::DELETE),
+            "OPTIONS" => Some(Self::OPTIONS),
+            _ => None,
         };
-        Ok(Self(stored))
+        if let Some(method) = standard {
+            return Ok(method);
+        }
+        hyper::Method::from_bytes(token.as_bytes())
+            .map(Self)
+            .map_err(|_| InvalidMethod(token.into()))
     }
 
     /// Whether this method is safe per
     /// [RFC 9110](https://www.rfc-editor.org/rfc/rfc9110#section-9.2.1):
-    /// `GET`, `HEAD`, `OPTIONS`, or `TRACE`, matched case-sensitively.
+    /// `GET`, `HEAD`, `OPTIONS`, or `TRACE`.
     ///
     /// ```
     /// use net::Method;
@@ -359,13 +340,12 @@ impl Method {
     /// ```
     #[must_use]
     pub fn is_safe(&self) -> bool {
-        matches!(self.0.as_ref(), "GET" | "HEAD" | "OPTIONS" | "TRACE")
+        self.0.is_safe()
     }
 
     /// Whether this method is idempotent per
     /// [RFC 9110](https://www.rfc-editor.org/rfc/rfc9110#section-9.2.2):
-    /// `GET`, `HEAD`, `OPTIONS`, `TRACE`, `PUT`, and `DELETE`, matched
-    /// case-sensitively like [`Method::is_safe`].
+    /// `GET`, `HEAD`, `OPTIONS`, `TRACE`, `PUT`, and `DELETE`.
     ///
     /// ```
     /// use net::Method;
@@ -375,7 +355,7 @@ impl Method {
     /// ```
     #[must_use]
     pub fn is_idempotent(&self) -> bool {
-        self.is_safe() || matches!(self.0.as_ref(), "PUT" | "DELETE")
+        self.0.is_idempotent()
     }
 
     /// Whether this method is forbidden to page scripts
@@ -396,19 +376,25 @@ impl Method {
     pub fn is_forbidden(&self) -> bool {
         ["CONNECT", "TRACE", "TRACK"]
             .iter()
-            .any(|forbidden| self.0.eq_ignore_ascii_case(forbidden))
+            .any(|forbidden| self.0.as_str().eq_ignore_ascii_case(forbidden))
     }
 
     /// Wire spelling of this method.
     #[must_use]
     pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+
+    /// The same method as the HTTP crate's type, for the carrier's builder.
+    #[must_use]
+    pub(crate) fn as_http(&self) -> &hyper::Method {
         &self.0
     }
 }
 
 impl fmt::Display for Method {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
+        self.0.fmt(f)
     }
 }
 
@@ -422,7 +408,7 @@ impl TryFrom<String> for Method {
 
 impl From<Method> for String {
     fn from(method: Method) -> Self {
-        method.0.into_owned()
+        method.0.as_str().to_owned()
     }
 }
 

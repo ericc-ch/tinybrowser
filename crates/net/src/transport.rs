@@ -342,21 +342,18 @@ impl HttpEngine {
         method: &Method,
         wire_url: &Url,
         headers: &HeaderMap,
-        body: Option<&[u8]>,
+        body: Option<Bytes>,
         budget: HopBudget,
     ) -> Result<(u16, HeaderMap, Incoming, bool), NetError> {
         if budget.is_expired() {
             return Err(timed_out(budget.timeout_kind(TimeoutKind::Global)));
         }
         let request_body = match body {
-            Some(bytes) => Full::new(Bytes::copy_from_slice(bytes)).boxed(),
+            Some(bytes) => Full::new(bytes).boxed(),
             None => Empty::<Bytes>::new().boxed(),
         };
         let mut request = hyper::Request::builder()
-            .method(
-                hyper::Method::from_bytes(method.as_str().as_bytes())
-                    .map_err(|_| NetError::RejectedRequest)?,
-            )
+            .method(method.as_http().clone())
             .uri(
                 wire_url
                     .as_str()
