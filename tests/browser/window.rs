@@ -6,7 +6,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::fixture::{Fixture, TestServer, evaluate, ok, open_page, serve_on, server};
+use crate::fixture::{Fixture, TestServer, evaluate, ok, open_page, server};
 
 /// Serves one page that opens a browser-hosted popup, and returns the popup
 /// server plus the page's serialized origin.
@@ -19,7 +19,7 @@ fn open_popup(
     head: &str,
     features: &str,
 ) -> (TestServer, String, Fixture, cdp::Client, String) {
-    let popup = TestServer::start(vec![("/", "text/html", b"<!doctype html>peer")], None);
+    let popup = TestServer::start(vec![("/", ok("text/html", b"<!doctype html>peer"))], None);
     let target = format!("http://localhost:{}/", popup.address().port());
     let (listener, address) = server();
     let page = format!(
@@ -27,7 +27,7 @@ fn open_popup(
 <script>window.__popup = window.open({target:?}, "peer", {features:?});</script>
 "#
     );
-    serve_on(listener, vec![("/start", ok("text/html", page.as_bytes()))]);
+    TestServer::serve_on(listener, vec![("/start", ok("text/html", page.as_bytes()))]);
     let page_origin = format!("http://{page_host}:{}", address.port());
     let (fixture, client, session) =
         open_page("tinybrowser-window-open", &format!("{page_origin}/start"));
@@ -107,8 +107,8 @@ fn a_same_site_popup_is_same_site_and_not_same_origin() {
 fn a_named_popup_is_reused_and_navigated() {
     let popup = TestServer::start(
         vec![
-            ("/first", "text/html", b"<!doctype html>first"),
-            ("/second", "text/html", b"<!doctype html>second"),
+            ("/first", ok("text/html", b"<!doctype html>first")),
+            ("/second", ok("text/html", b"<!doctype html>second")),
         ],
         None,
     );
@@ -121,7 +121,7 @@ fn a_named_popup_is_reused_and_navigated() {
 window.__first = window.open('http://localhost:{port}/first', "shared");
 </script>"#
     );
-    serve_on(listener, vec![("/start", ok("text/html", page.as_bytes()))]);
+    TestServer::serve_on(listener, vec![("/start", ok("text/html", page.as_bytes()))]);
     let (_fixture, mut client, session) = open_page(
         "tinybrowser-window-open",
         &format!("http://127.0.0.1:{}/start", address.port()),
@@ -163,7 +163,7 @@ fn opening_the_current_context_with_no_url_keeps_its_document() {
         window.__self = window.open('', '_self');\
         window.__top = window.open('', '_top');\
         </script>";
-    serve_on(listener, vec![("/start", ok("text/html", page.as_bytes()))]);
+    TestServer::serve_on(listener, vec![("/start", ok("text/html", page.as_bytes()))]);
     let (_fixture, mut client, session) = open_page(
         "tinybrowser-window-open",
         &format!("http://127.0.0.1:{}/start", address.port()),
@@ -188,10 +188,10 @@ fn opening_the_current_context_with_no_url_keeps_its_document() {
 fn a_sandbox_without_allow_popups_cannot_open_a_context_by_spelling() {
     let popup = TestServer::start(
         vec![
-            ("/allowed", "text/html", b"<!doctype html>allowed"),
-            ("/blank", "text/html", b"<!doctype html>blank"),
-            ("/upper", "text/html", b"<!doctype html>upper"),
-            ("/named", "text/html", b"<!doctype html>named"),
+            ("/allowed", ok("text/html", b"<!doctype html>allowed")),
+            ("/blank", ok("text/html", b"<!doctype html>blank")),
+            ("/upper", ok("text/html", b"<!doctype html>upper")),
+            ("/named", ok("text/html", b"<!doctype html>named")),
         ],
         None,
     );
@@ -229,7 +229,7 @@ fn a_sandbox_without_allow_popups_cannot_open_a_context_by_spelling() {
         ),
     );
     let (listener, address) = server();
-    serve_on(listener, vec![("/start", ok("text/html", page.as_bytes()))]);
+    TestServer::serve_on(listener, vec![("/start", ok("text/html", page.as_bytes()))]);
     let (_fixture, mut client, session) = open_page(
         "tinybrowser-window-open",
         &format!("http://127.0.0.1:{}/start", address.port()),
@@ -284,7 +284,7 @@ window.__same_site = window.open(URL.createObjectURL(blob), '_blank');
 const blob = new Blob(['<!doctype html>peer'], {type: 'text/html'});
 parent.postMessage(String(window.open(URL.createObjectURL(blob), '_blank') === null), '*');
 </script>";
-    serve_on(
+    TestServer::serve_on(
         listener,
         vec![
             ("/start", ok("text/html", page.as_bytes())),

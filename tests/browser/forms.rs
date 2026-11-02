@@ -4,7 +4,7 @@
 
 use serde_json::json;
 
-use crate::fixture::{evaluate, ok, open_page, serve_on, server};
+use crate::fixture::{TestServer, evaluate, ok, open_page, server};
 
 /// A blank page; every control is built by the script under test.
 const PAGE: &[u8] = b"<!doctype html><meta charset=utf-8><body></body>";
@@ -103,7 +103,7 @@ const TWO_CHECKED_RADIOS: &str = "(() => {
 #[test]
 fn control_state_follows_markup_insertion_and_activation() {
     let (listener, page) = server();
-    serve_on(listener, vec![("/", ok("text/html", PAGE))]);
+    TestServer::serve_on(listener, vec![("/", ok("text/html", PAGE))]);
     let (_fixture, mut client, session) =
         open_page("tinybrowser-forms", &format!("http://{page}/"));
 

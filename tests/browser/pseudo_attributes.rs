@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use serde_json::json;
 
-use crate::fixture::{TestServer, evaluate, open_page};
+use crate::fixture::{TestServer, evaluate, ok, open_page};
 
 /// The first sheet paints the paragraph one color, the second another.
 const SHEET_A: &[u8] = b"p { color: rgb(1, 2, 3); }";
@@ -32,9 +32,9 @@ async function waitColor(expected) {
 fn server() -> TestServer {
     TestServer::start(
         vec![
-            ("/", "application/xml", DOCUMENT),
-            ("/a.css", "text/css", SHEET_A),
-            ("/b.css", "text/css", SHEET_B),
+            ("/", ok("application/xml", DOCUMENT)),
+            ("/a.css", ok("text/css", SHEET_A)),
+            ("/b.css", ok("text/css", SHEET_B)),
         ],
         Some("/b.css"),
     )

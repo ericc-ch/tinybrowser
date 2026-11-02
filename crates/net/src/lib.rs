@@ -26,3 +26,16 @@ pub use protocol::{
 pub use referrer::{Referrer, ReferrerClient, ReferrerPolicy, determine_referrer};
 pub use resolve::{InvalidResolveRule, ResolveRule};
 pub use transport::{InvalidCa, InvalidProxy, Proxy, TrustedCa};
+
+/// The URL a browsing context starts on when it has no creator to inherit
+/// from.
+///
+/// Parsed once: every document path, browser tab, and stylesheet parser that
+/// needs the placeholder shares this value instead of re-spelling the URL.
+#[must_use]
+pub fn about_blank() -> url::Url {
+    static ABOUT_BLANK: std::sync::LazyLock<url::Url> = std::sync::LazyLock::new(|| {
+        url::Url::parse("about:blank").expect("about:blank is a valid URL")
+    });
+    ABOUT_BLANK.clone()
+}

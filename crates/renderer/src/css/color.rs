@@ -23,7 +23,6 @@ use style::stylesheets::{CssRuleType, Origin, UrlExtraData};
 use style::values::Parser;
 use style::values::specified::Color as SpecifiedColor;
 use style_traits::{ParsingMode, ToCss};
-use url::Url;
 
 /// A parsed color: the computed absolute value, the straight sRGB bytes for
 /// painting, and the exact CSS serialization when the syntax has no
@@ -48,7 +47,7 @@ fn parse_absolute(
     device: Option<&Device>,
     current: &AbsoluteColor,
 ) -> Option<AbsoluteColor> {
-    let url_data = UrlExtraData(ServoArc::new(Url::parse("about:blank").ok()?));
+    let url_data = UrlExtraData(ServoArc::new(net::about_blank()));
     let context = ParserContext::new(
         Origin::Author,
         &url_data,

@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use serde_json::json;
 
-use crate::fixture::{PIXEL, evaluate, ok, open_page, redirect, serve_on, serve_on_after, server};
+use crate::fixture::{PIXEL, TestServer, evaluate, ok, open_page, redirect, server};
 
 /// Draws each image onto a fresh canvas and reads the pixels back. A tainted
 /// canvas throws `SecurityError` from `getImageData`; a clean one returns.
@@ -40,7 +40,7 @@ const PROBE: &str = r"(async () => {
 fn image_origin_follows_the_response_taint() {
     let (cross_listener, cross) = server();
     let (page_listener, page) = server();
-    serve_on(
+    TestServer::serve_on(
         cross_listener,
         vec![
             ("/pixel.png", ok("image/png", PIXEL)),
@@ -56,7 +56,7 @@ fn image_origin_follows_the_response_taint() {
          <img id=roundtrip src=\"http://{page}/bounce.png\">\
          <img id=same src=\"http://{page}/pixel.png\">"
     );
-    serve_on(
+    TestServer::serve_on(
         page_listener,
         vec![
             ("/", ok("text/html", body.as_bytes())),
@@ -85,7 +85,7 @@ fn src_change_draws_nothing_until_the_new_request_settles() {
     let (slow_listener, slow) = server();
     let (page_listener, page) = server();
     let pixel = PIXEL.to_vec();
-    serve_on_after(
+    TestServer::serve_on_after(
         slow_listener,
         vec![("/slow.png", ok("image/png", &pixel))],
         Duration::from_millis(300),
@@ -94,7 +94,7 @@ fn src_change_draws_nothing_until_the_new_request_settles() {
         "<!doctype html>\
          <img id=swap data-slow=\"http://{slow}/slow.png\" src=\"http://{page}/pixel.png\">"
     );
-    serve_on(
+    TestServer::serve_on(
         page_listener,
         vec![
             ("/", ok("text/html", body.as_bytes())),
@@ -162,7 +162,7 @@ fn src_change_draws_nothing_until_the_new_request_settles() {
 #[test]
 fn blob_encoders_name_and_encode_the_settled_type() {
     let (page_listener, page) = server();
-    serve_on(
+    TestServer::serve_on(
         page_listener,
         vec![(
             "/",

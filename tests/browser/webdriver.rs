@@ -4,7 +4,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::fixture::Fixture;
+use crate::fixture::{Fixture, TestServer, ok};
 use base64::Engine as _;
 use serde_json::{Value, json};
 
@@ -77,46 +77,21 @@ const TLS_SERVER_CERT_PEM: &str = "\
 const TLS_SERVER_KEY_PEM: &str = "\
 -----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgiOq3Tq7nKzsvkH8R\nCv2ScQ1xyfEou4Fvhl0JLJDob3ihRANCAARaU9LlsB9YYhjXs5HSIoylgAjx9GY8\nhaKduRJhUaGe0xXXBx62Rf7XRCdAfnzL4svr8w4EgUe5iEbWNJTWNBdK\n-----END PRIVATE KEY-----\n";
 
-/// One HTTPS loopback server that answers `responses` navigations with a page
-/// whose title says it was reached over TLS.
-fn https_server(responses: usize) -> (String, std::thread::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let addr = listener.local_addr().expect("addr");
+/// One HTTPS loopback server whose page title says it was reached over TLS.
+fn https_server() -> (String, TestServer) {
     let identity = native_tls::Identity::from_pkcs8(
         TLS_SERVER_CERT_PEM.as_bytes(),
         TLS_SERVER_KEY_PEM.as_bytes(),
     )
     .expect("the test identity parses");
-    let acceptor = native_tls::TlsAcceptor::new(identity).expect("tls acceptor");
-    let handle = thread::spawn(move || {
-        let mut served = 0;
-        while served < responses {
-            let (stream, _) = listener.accept().expect("accept");
-            stream
-                .set_read_timeout(Some(Duration::from_secs(10)))
-                .expect("read timeout is settable");
-            stream
-                .set_write_timeout(Some(Duration::from_secs(10)))
-                .expect("write timeout is settable");
-            // A client that does not trust the certificate fails its
-            // handshake; the server stays up for the dial with `--tls-ca`.
-            let Ok(mut stream) = acceptor.accept(stream) else {
-                continue;
-            };
-            let mut buffer = [0u8; 4096];
-            let read = stream.read(&mut buffer).expect("request readable");
-            assert!(read > 0, "peer closed before sending a request");
-            let body = b"<!doctype html><title>trusted</title>";
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            );
-            stream.write_all(response.as_bytes()).expect("head written");
-            stream.write_all(body).expect("body written");
-            served += 1;
-        }
-    });
-    (format!("https://{addr}/"), handle)
+    let server = TestServer::start_tls(
+        vec![(
+            "/",
+            ok("text/html", b"<!doctype html><title>trusted</title>"),
+        )],
+        identity,
+    );
+    (format!("https://{}/", server.address()), server)
 }
 
 /// Creates a session and navigates it, returning the `/url` reply.
@@ -139,7 +114,7 @@ fn navigate_new_session(addr: &str, url: &str) -> Value {
 /// the way to `AgentOptions` passes every other test in the suite.
 #[test]
 fn a_tls_ca_from_the_command_line_makes_an_https_navigation_load() {
-    let (url, server) = https_server(1);
+    let (url, _server) = https_server();
 
     let untrusted = Fixture::new("tinybrowser-webdriver-tls-ca-untrusted");
     let (addr, _fixture) = start_in(untrusted, Vec::new());
@@ -155,7 +130,6 @@ fn a_tls_ca_from_the_command_line_makes_an_https_navigation_load() {
     let (addr, _fixture) = start_in(trusted, vec![format!("--tls-ca={}", ca.display())]);
     let loaded = navigate_new_session(&addr, &url);
     assert_eq!(loaded["value"], Value::Null, "{loaded}");
-    server.join().expect("server");
 }
 
 /// A readable `--tls-ca` is part of the network configuration, so the server
@@ -343,19 +317,17 @@ fn execute_sync_waits_for_returned_promise_or_script_timeout() {
 
 #[test]
 fn navigate_returns_after_load_not_after_timers() {
-    let server_listener = TcpListener::bind("127.0.0.1:0").expect("server bind");
-    let server_addr = server_listener.local_addr().expect("server addr");
-    let server = thread::spawn(move || {
-        let (mut navigation, _) = server_listener.accept().expect("navigation");
-        crate::fixture::read_request_path(&mut navigation).expect("request head");
-        let body = b"<!doctype html><script>window.early = 1; setTimeout(function() { window.late = 1; }, 30000);</script>";
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            body.len()
-        );
-        navigation.write_all(response.as_bytes()).expect("head");
-        navigation.write_all(body).expect("body");
-    });
+    let server = TestServer::start(
+        vec![(
+            "/",
+            ok(
+                "text/html",
+                b"<!doctype html><script>window.early = 1; setTimeout(function() { window.late = 1; }, 30000);</script>",
+            ),
+        )],
+        None,
+    );
+    let server_addr = server.address();
 
     let (addr, _fixture) = start(Vec::new());
 
@@ -393,24 +365,18 @@ fn navigate_returns_after_load_not_after_timers() {
         Some(r#"{"script":"return typeof window.late","args":[]}"#),
     );
     assert_eq!(late["value"], json!("undefined"));
-    server.join().expect("server");
 }
 
 #[test]
 fn new_window_uses_builder_resolve_map() {
-    let server_listener = TcpListener::bind("127.0.0.1:0").expect("server bind");
-    let server_addr = server_listener.local_addr().expect("server addr");
-    let server = thread::spawn(move || {
-        let (mut navigation, _) = server_listener.accept().expect("navigation");
-        crate::fixture::read_request_path(&mut navigation).expect("request head");
-        let body = b"<!doctype html><title>mapped</title>";
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            body.len()
-        );
-        navigation.write_all(response.as_bytes()).expect("head");
-        navigation.write_all(body).expect("body");
-    });
+    let server = TestServer::start(
+        vec![(
+            "/",
+            ok("text/html", b"<!doctype html><title>mapped</title>"),
+        )],
+        None,
+    );
+    let server_addr = server.address();
 
     let (addr, _fixture) = start(vec!["--resolve=*.test=127.0.0.1".to_owned()]);
 
@@ -453,7 +419,6 @@ fn new_window_uses_builder_resolve_map() {
         current["value"].as_str().expect("url"),
         format!("http://web-platform.test:{}/", server_addr.port())
     );
-    server.join().expect("server");
 }
 
 #[test]
@@ -498,23 +463,11 @@ fn one_session_delete_closes_tabs_close_last_window_invalidates() {
 const ELEMENT_KEY: &str = "element-6066-11e4-a52e-4f735466cecf";
 
 /// Serves one page over HTTP for any request until the test process exits.
-fn spawn_page(html: &'static str) -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind page server");
-    let port = listener.local_addr().expect("page addr").port();
-    thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(mut stream) = stream else { break };
-            let mut buf = [0u8; 1024];
-            let _received = stream.read(&mut buf);
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                html.len(),
-                html
-            );
-            let _written = stream.write_all(response.as_bytes());
-        }
-    });
-    port
+fn spawn_page(html: &'static str) -> TestServer {
+    TestServer::start(
+        vec![("/", ok("text/html; charset=utf-8", html.as_bytes()))],
+        None,
+    )
 }
 
 fn create_session(addr: &str) -> String {
@@ -546,7 +499,8 @@ fn find(addr: &str, id: &str, selector: &str) -> String {
 
 #[test]
 fn element_roundtrip() {
-    let page_port = spawn_page("<!doctype html><button id=b>B</button><input id=i>");
+    let page = spawn_page("<!doctype html><button id=b>B</button><input id=i>");
+    let page_port = page.address().port();
     let (addr, _fixture) = start(Vec::new());
     let id = create_session(&addr);
     navigate(&addr, &id, &format!("http://127.0.0.1:{page_port}/"));
@@ -652,7 +606,8 @@ fn element_roundtrip() {
 
 #[test]
 fn cookie_roundtrip() {
-    let page_port = spawn_page("<!doctype html><title>cookies</title>");
+    let page = spawn_page("<!doctype html><title>cookies</title>");
+    let page_port = page.address().port();
     let (addr, _fixture) = start(Vec::new());
     let id = create_session(&addr);
     navigate(&addr, &id, &format!("http://127.0.0.1:{page_port}/"));

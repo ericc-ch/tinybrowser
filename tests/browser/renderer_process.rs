@@ -1,10 +1,8 @@
 //! Renderer-process lifecycle over CDP: one daemon, one renderer child per site.
 
-use std::io::{Read, Write};
-use std::net::TcpListener;
 use std::time::{Duration, Instant};
 
-use crate::fixture::Fixture;
+use crate::fixture::{Fixture, TestServer, ok};
 use serde_json::{Value, json};
 
 fn attach(client: &mut cdp::Client, target: &str) -> String {
@@ -204,21 +202,11 @@ fn close_interrupts_a_running_script_in_the_renderer_process() {
 
 #[test]
 fn aborted_tab_releases_its_assignment() {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let address = listener.local_addr().expect("address");
-    let server = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept");
-        let mut request = [0_u8; 1024];
-        let _ = stream.read(&mut request).expect("read request");
-        let body = b"<!doctype html><title>abort</title>";
-        write!(
-            stream,
-            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            body.len()
-        )
-        .expect("write head");
-        stream.write_all(body).expect("write body");
-    });
+    let server = TestServer::start(
+        vec![("/", ok("text/html", b"<!doctype html><title>abort</title>"))],
+        None,
+    );
+    let address = server.address();
 
     let mut fixture = Fixture::new("tinybrowser-renderer-abort");
     fixture.spawn_daemon_with_env("TINYBROWSER_LOG", "debug");
@@ -279,28 +267,18 @@ fn aborted_tab_releases_its_assignment() {
         );
         std::thread::sleep(Duration::from_millis(25));
     }
-    server.join().expect("server");
 }
 
 #[test]
 fn a_wedged_renderer_is_interrupted_and_the_tab_recovers() {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let address = listener.local_addr().expect("address");
-    let server = std::thread::spawn(move || {
-        for _ in 0..2 {
-            let (mut stream, _) = listener.accept().expect("accept");
-            let mut request = [0_u8; 1024];
-            let _ = stream.read(&mut request).expect("read request");
-            let body = b"<!doctype html><title>timeout</title>";
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            )
-            .expect("write head");
-            stream.write_all(body).expect("write body");
-        }
-    });
+    let server = TestServer::start(
+        vec![(
+            "/",
+            ok("text/html", b"<!doctype html><title>timeout</title>"),
+        )],
+        None,
+    );
+    let address = server.address();
 
     let mut fixture = Fixture::new("tinybrowser-renderer-timeout");
     fixture.spawn_daemon_with_env("TINYBROWSER_RENDERER_REQUEST_TIMEOUT_MS", "500");
@@ -340,29 +318,21 @@ fn a_wedged_renderer_is_interrupted_and_the_tab_recovers() {
         .expect("renavigate");
     crate::fixture::wait_for_load(&mut client, &session, Duration::from_secs(10));
     assert_eq!(eval(&mut client, &target, "2+2").unwrap(), "4");
-    server.join().expect("server");
 }
 
 #[test]
 fn post_message_to_a_busy_tab_does_not_block_the_sender() {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let address = listener.local_addr().expect("address");
-    let server = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept");
-        let mut request = [0_u8; 1024];
-        let _ = stream.read(&mut request).expect("read request");
-        let body = b"<!doctype html><title>sender</title>";
-        write!(
-            stream,
-            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            body.len()
-        )
-        .expect("write head");
-        stream.write_all(body).expect("write body");
-    });
+    let server = TestServer::start(
+        vec![(
+            "/",
+            ok("text/html", b"<!doctype html><title>sender</title>"),
+        )],
+        None,
+    );
+    let address = server.address();
 
     // The popup must cross an origin boundary to stay a browser tab.
-    let (peer_port, peer_server) = serve_page("peer");
+    let (peer_port, _peer_server) = serve_page("peer");
     let mut fixture = Fixture::new("tinybrowser-renderer-messaging");
     fixture.spawn_daemon_with_env("TINYBROWSER_LOG", "debug");
     let _ = fixture.wait_json();
@@ -459,30 +429,21 @@ fn post_message_to_a_busy_tab_does_not_block_the_sender() {
     blocking_thread.join().expect("blocking thread");
     let _ = probe_rx.recv_timeout(Duration::from_secs(5));
     probing_thread.join().expect("probing thread");
-    server.join().expect("server");
-    peer_server.join().expect("peer server");
 }
 
 #[test]
 fn window_messages_are_limited_to_related_tabs() {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let address = listener.local_addr().expect("address");
-    let server = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept");
-        let mut request = [0_u8; 1024];
-        let _ = stream.read(&mut request).expect("read request");
-        let body = b"<!doctype html><title>related</title>";
-        write!(
-            stream,
-            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            body.len()
-        )
-        .expect("write head");
-        stream.write_all(body).expect("write body");
-    });
+    let server = TestServer::start(
+        vec![(
+            "/",
+            ok("text/html", b"<!doctype html><title>related</title>"),
+        )],
+        None,
+    );
+    let address = server.address();
 
     // The popup must cross an origin boundary to stay a browser tab.
-    let (peer_port, peer_server) = serve_page("peer");
+    let (peer_port, _peer_server) = serve_page("peer");
     let mut fixture = Fixture::new("tinybrowser-renderer-related");
     fixture.spawn_daemon_with_env("TINYBROWSER_LOG", "debug");
     let _ = fixture.wait_json();
@@ -544,27 +505,18 @@ fn window_messages_are_limited_to_related_tabs() {
         );
         std::thread::sleep(Duration::from_millis(25));
     }
-    server.join().expect("server");
-    peer_server.join().expect("peer server");
 }
 
 #[test]
 fn legal_storage_values_do_not_kill_the_renderer() {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let address = listener.local_addr().expect("address");
-    let server = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept");
-        let mut request = [0_u8; 1024];
-        let _ = stream.read(&mut request).expect("read request");
-        let body = b"<!doctype html><title>storage</title>";
-        write!(
-            stream,
-            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            body.len()
-        )
-        .expect("write head");
-        stream.write_all(body).expect("write body");
-    });
+    let server = TestServer::start(
+        vec![(
+            "/",
+            ok("text/html", b"<!doctype html><title>storage</title>"),
+        )],
+        None,
+    );
+    let address = server.address();
 
     let mut fixture = Fixture::new("tinybrowser-renderer-storage");
     fixture.spawn_daemon();
@@ -597,51 +549,15 @@ fn legal_storage_values_do_not_kill_the_renderer() {
         "2500000"
     );
     assert_eq!(eval(&mut client, &target, "2+2").unwrap(), "4");
-    server.join().expect("server");
 }
 
 /// Serves one HTML page on a fresh loopback port, for a popup that must cross
 /// an origin boundary.
-///
-/// The renderer is expected to fetch this page; a missing connection fails the
-/// test instead of blocking the harness forever.
-fn serve_page(title: &'static str) -> (u16, std::thread::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let port = listener.local_addr().expect("address").port();
-    let handle = std::thread::spawn(move || {
-        listener
-            .set_nonblocking(true)
-            .expect("nonblocking listener");
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let (mut stream, _) = loop {
-            match listener.accept() {
-                Ok(connection) => break connection,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    assert!(
-                        Instant::now() < deadline,
-                        "the popup never fetched its cross-origin page"
-                    );
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Err(error) => panic!("accept: {error}"),
-            }
-        };
-        stream.set_nonblocking(false).expect("blocking connection");
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .expect("read timeout");
-        let mut request = [0_u8; 1024];
-        let _ = stream.read(&mut request).expect("read request");
-        let body = format!("<!doctype html><title>{title}</title>");
-        write!(
-            stream,
-            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            body.len()
-        )
-        .expect("write head");
-        stream.write_all(body.as_bytes()).expect("write body");
-    });
-    (port, handle)
+fn serve_page(title: &'static str) -> (u16, TestServer) {
+    let body = format!("<!doctype html><title>{title}</title>");
+    let server = TestServer::start(vec![("/", ok("text/html", body.as_bytes()))], None);
+    let port = server.address().port();
+    (port, server)
 }
 
 #[test]
@@ -751,23 +667,14 @@ fn log_level_reaches_the_daemon_file() {
 
 #[test]
 fn same_site_assignments_share_only_after_the_process_budget() {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let address = listener.local_addr().expect("address");
-    let server = std::thread::spawn(move || {
-        for _ in 0..2 {
-            let (mut stream, _) = listener.accept().expect("accept");
-            let mut request = [0_u8; 1024];
-            let _ = stream.read(&mut request).expect("read request");
-            let body = b"<!doctype html><title>shared-site</title>";
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            )
-            .expect("write head");
-            stream.write_all(body).expect("write body");
-        }
-    });
+    let server = TestServer::start(
+        vec![(
+            "/",
+            ok("text/html", b"<!doctype html><title>shared-site</title>"),
+        )],
+        None,
+    );
+    let address = server.address();
 
     let mut fixture = Fixture::new("tinybrowser-renderer-budget");
     fixture.spawn_daemon_with_env("TINYBROWSER_RENDERER_PROCESS_LIMIT", "1");
@@ -817,5 +724,4 @@ fn same_site_assignments_share_only_after_the_process_budget() {
     close(&mut client, &first);
     assert_eq!(eval(&mut client, &second, "2+2").unwrap(), "4");
     assert_eq!(renderer_children(daemon).len(), 1);
-    server.join().expect("server");
 }

@@ -2,7 +2,7 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
-use crate::fixture::{Fixture, TestServer, evaluate, load_page};
+use crate::fixture::{Fixture, TestServer, evaluate, load_page, ok};
 use serde_json::json;
 
 fn start() -> (Fixture, cdp::Client) {
@@ -241,7 +241,11 @@ fn get_properties_reports_descriptors_and_releases_groups() {
 
 #[test]
 fn clear_browser_cookies_deletes_page_cookies_from_both_target_kinds() {
-    let server_addr = crate::fixture::serve(b"<!doctype html><p>hi</p>", "text/html");
+    let server = TestServer::start(
+        vec![("/", ok("text/html", b"<!doctype html><p>hi</p>"))],
+        None,
+    );
+    let server_addr = server.address();
 
     let (_fixture, mut client) = start();
     let session = crate::fixture::load_page(
@@ -280,7 +284,11 @@ fn clear_browser_cookies_deletes_page_cookies_from_both_target_kinds() {
 
 #[test]
 fn page_navigate_loads_http_document() {
-    let server_addr = crate::fixture::serve(b"<!doctype html><p id=ok>hi</p>", "text/html");
+    let server = TestServer::start(
+        vec![("/", ok("text/html", b"<!doctype html><p id=ok>hi</p>"))],
+        None,
+    );
+    let server_addr = server.address();
 
     let (_fixture, mut client) = start();
     let session = crate::fixture::load_page(
@@ -307,8 +315,8 @@ fn page_navigate_loads_http_document() {
 fn page_navigate_from_a_fresh_tab_is_same_site_for_cookies() {
     let server = TestServer::start(
         vec![
-            ("/", "text/html", b"<!doctype html><p>first</p>"),
-            ("/again", "text/html", b"<!doctype html><p>again</p>"),
+            ("/", ok("text/html", b"<!doctype html><p>first</p>")),
+            ("/again", ok("text/html", b"<!doctype html><p>again</p>")),
         ],
         None,
     );
@@ -451,10 +459,17 @@ fn json_discovery_page_socket_close_target_and_browser_close() {
 #[test]
 fn dom_outer_html_serializes_elements_and_documents() {
     let (_fixture, mut client) = start();
-    let server_addr = crate::fixture::serve(
-        b"<!doctype html><html><body><p id=\"x\" class=\"a\">hi</p></body></html>",
-        "text/html",
+    let server = TestServer::start(
+        vec![(
+            "/",
+            ok(
+                "text/html",
+                b"<!doctype html><html><body><p id=\"x\" class=\"a\">hi</p></body></html>",
+            ),
+        )],
+        None,
     );
+    let server_addr = server.address();
     let session = crate::fixture::load_page(
         &mut client,
         &format!("http://{server_addr}/"),
@@ -510,10 +525,17 @@ fn dom_outer_html_serializes_elements_and_documents() {
 #[test]
 fn dom_attributes_require_an_element_and_an_identifier() {
     let (_fixture, mut client) = start();
-    let server_addr = crate::fixture::serve(
-        b"<!doctype html><html><body><p id=\"x\" class=\"a\">hi</p></body></html>",
-        "text/html",
+    let server = TestServer::start(
+        vec![(
+            "/",
+            ok(
+                "text/html",
+                b"<!doctype html><html><body><p id=\"x\" class=\"a\">hi</p></body></html>",
+            ),
+        )],
+        None,
     );
+    let server_addr = server.address();
     let session = crate::fixture::load_page(
         &mut client,
         &format!("http://{server_addr}/"),

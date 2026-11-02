@@ -1186,7 +1186,7 @@ fn document_url(origin: &url::Origin) -> Url {
         url::Origin::Tuple(..) => {
             Url::parse(&origin.ascii_serialization()).expect("a tuple origin serializes as a URL")
         }
-        url::Origin::Opaque(_) => Url::parse("about:blank").expect("about:blank is a valid URL"),
+        url::Origin::Opaque(_) => net::about_blank(),
     }
 }
 
@@ -1512,9 +1512,7 @@ pub(crate) fn dial_failure(error: &net::NetError) -> DialFailure {
 /// claim its origin. The `url` crate mints an opaque origin for a non-special
 /// URL, and every mint is distinct, which is exactly "no principal".
 fn opaque_origin() -> url::Origin {
-    Url::parse("about:blank")
-        .expect("about:blank is a valid URL")
-        .origin()
+    net::about_blank().origin()
 }
 
 /// The browser's default headers for one top-level (or popup) document

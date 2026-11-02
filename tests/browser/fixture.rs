@@ -2,46 +2,24 @@
 
 use std::fmt::Write as _;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::json;
 
-/// Reads one HTTP/1.1 request head and returns its request target, discarding
-/// the rest. Test servers call this before replying: closing a socket with
-/// unread data sends RST, which can abort the response delivery. `None` means
-/// the connection failed or the request line was malformed; the server loop
-/// moves on to the next connection.
-pub(crate) fn read_request_path(stream: &mut TcpStream) -> Option<String> {
-    // Only the request line matters, so decode up to its line break and leave
-    // the (possibly non-UTF-8) header bytes alone.
-    let head = read_request_head_bytes(stream)?;
-    let line = match head.windows(2).position(|window| window == b"\r\n") {
-        Some(end) => &head[..end],
-        None => &head[..],
-    };
-    let line = String::from_utf8_lossy(line);
-    line.split_whitespace().nth(1).map(str::to_owned)
-}
-
 /// Reads one request head, including its blank line, and returns it as text so
 /// a test can inspect the headers the client sent.
-pub(crate) fn read_request_head(stream: &mut TcpStream) -> Option<String> {
+pub(crate) fn read_request_head(stream: &mut impl Read) -> Option<String> {
     let head = read_request_head_bytes(stream)?;
     Some(String::from_utf8_lossy(&head).into_owned())
 }
 
-fn read_request_head_bytes(stream: &mut TcpStream) -> Option<Vec<u8>> {
-    // Short polls instead of one long blocking read: under load the request
-    // can lag the accept, and a single long read hides which side stalled.
-    stream
-        .set_read_timeout(Some(Duration::from_millis(100)))
-        .ok()?;
+fn read_request_head_bytes(stream: &mut impl Read) -> Option<Vec<u8>> {
     let mut head = Vec::new();
     let mut chunk = [0_u8; 512];
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -77,55 +55,73 @@ pub(crate) fn server() -> (TcpListener, std::net::SocketAddr) {
     (listener, address)
 }
 
-/// Serves one response per request path for every connection the listener
-/// gets, reading each request head first. An unknown path gets an empty 404.
-/// The thread runs until the test process exits.
-pub(crate) fn serve_on(listener: TcpListener, routes: Vec<(&'static str, Vec<u8>)>) {
-    serve_on_after(listener, routes, Duration::ZERO);
+/// One canned HTTP response a [`TestServer`] sends.
+#[derive(Clone)]
+pub(crate) struct Response {
+    status: u16,
+    reason: &'static str,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
 }
 
-/// [`serve_on`] with a delay before each response, so a test can observe a
-/// request that is still in flight.
-pub(crate) fn serve_on_after(
-    listener: TcpListener,
-    routes: Vec<(&'static str, Vec<u8>)>,
-    delay: Duration,
-) {
-    thread::spawn(move || {
-        for mut stream in listener.incoming().flatten() {
-            let Some(path) = read_request_path(&mut stream) else {
-                continue;
-            };
-            let response = routes.iter().find(|(route, _)| *route == path).map_or_else(
-                || {
-                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                        .to_vec()
-                },
-                |(_, response)| response.clone(),
-            );
-            thread::sleep(delay);
-            let _ = stream.write_all(&response);
+impl Response {
+    fn not_found() -> Self {
+        Self {
+            status: 404,
+            reason: "Not Found",
+            headers: Vec::new(),
+            body: Vec::new(),
         }
-    });
+    }
+
+    /// The bytes of this response, echoing the request's `Origin` when `cors`
+    /// is set so a credentialed CORS request passes the CORS check.
+    fn render(&self, head: &str, cors: bool) -> Vec<u8> {
+        let mut response = format!(
+            "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nConnection: close\r\n",
+            self.status,
+            self.reason,
+            self.body.len()
+        );
+        for (name, value) in &self.headers {
+            let _ = write!(response, "{name}: {value}\r\n");
+        }
+        if cors {
+            match request_header(head, "origin") {
+                Some(origin) => {
+                    let _ = write!(
+                        response,
+                        "Access-Control-Allow-Origin: {origin}\r\nAccess-Control-Allow-Credentials: true\r\nVary: Origin\r\n"
+                    );
+                }
+                None => response.push_str("Access-Control-Allow-Origin: *\r\n"),
+            }
+        }
+        response.push_str("\r\n");
+        let mut response = response.into_bytes();
+        response.extend_from_slice(&self.body);
+        response
+    }
 }
 
 /// A `200` response with `body` and `content_type`.
-pub(crate) fn ok(content_type: &str, body: &[u8]) -> Vec<u8> {
-    let mut response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    )
-    .into_bytes();
-    response.extend_from_slice(body);
-    response
+pub(crate) fn ok(content_type: &str, body: &[u8]) -> Response {
+    Response {
+        status: 200,
+        reason: "OK",
+        headers: vec![("Content-Type".to_owned(), content_type.to_owned())],
+        body: body.to_vec(),
+    }
 }
 
 /// A `302` response to `location`.
-pub(crate) fn redirect(location: &str) -> Vec<u8> {
-    format!(
-        "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-    )
-    .into_bytes()
+pub(crate) fn redirect(location: &str) -> Response {
+    Response {
+        status: 302,
+        reason: "Found",
+        headers: vec![("Location".to_owned(), location.to_owned())],
+        body: Vec::new(),
+    }
 }
 
 /// One 1x1 red PNG.
@@ -156,28 +152,63 @@ pub(crate) struct TestServer {
 }
 
 impl TestServer {
-    pub(crate) fn start(
-        routes: Vec<(&'static str, &'static str, &'static [u8])>,
-        hold: Option<&'static str>,
-    ) -> Self {
-        Self::with_cors(routes, hold, true)
+    pub(crate) fn start(routes: Vec<(&'static str, Response)>, hold: Option<&'static str>) -> Self {
+        Self::with_options(routes, hold, true, Duration::ZERO)
     }
 
     /// A server that sends no CORS headers, so a `cors`-mode request to it
     /// fails the CORS check
     /// (<https://fetch.spec.whatwg.org/#cors-check>).
-    pub(crate) fn start_without_cors(
-        routes: Vec<(&'static str, &'static str, &'static [u8])>,
-    ) -> Self {
-        Self::with_cors(routes, None, false)
+    pub(crate) fn start_without_cors(routes: Vec<(&'static str, Response)>) -> Self {
+        Self::with_options(routes, None, false, Duration::ZERO)
     }
 
-    fn with_cors(
-        routes: Vec<(&'static str, &'static str, &'static [u8])>,
+    /// Serves `routes` on an already-bound `listener`, so a test can name the
+    /// server's origin in the routes it serves.
+    pub(crate) fn serve_on(listener: TcpListener, routes: Vec<(&'static str, Response)>) -> Self {
+        Self::serve(listener, routes, None, true, Duration::ZERO, None)
+    }
+
+    /// [`Self::serve_on`] with a delay before every response, so a test can
+    /// observe a request that is still in flight while its own code blocks.
+    pub(crate) fn serve_on_after(
+        listener: TcpListener,
+        routes: Vec<(&'static str, Response)>,
+        delay: Duration,
+    ) -> Self {
+        Self::serve(listener, routes, None, true, delay, None)
+    }
+
+    fn with_options(
+        routes: Vec<(&'static str, Response)>,
         hold: Option<&'static str>,
         cors: bool,
+        delay: Duration,
     ) -> Self {
-        let (listener, address) = server();
+        let (listener, _) = server();
+        Self::serve(listener, routes, hold, cors, delay, None)
+    }
+
+    /// Serves `routes` over TLS with `identity`, so a test can exercise a
+    /// navigation whose certificate the browser may or may not trust.
+    pub(crate) fn start_tls(
+        routes: Vec<(&'static str, Response)>,
+        identity: native_tls::Identity,
+    ) -> Self {
+        let (listener, _) = server();
+        let acceptor = native_tls::TlsAcceptor::new(identity).expect("tls acceptor");
+        Self::serve(listener, routes, None, true, Duration::ZERO, Some(acceptor))
+    }
+
+    fn serve(
+        listener: TcpListener,
+        routes: Vec<(&'static str, Response)>,
+        hold: Option<&'static str>,
+        cors: bool,
+        delay: Duration,
+        tls: Option<native_tls::TlsAcceptor>,
+    ) -> Self {
+        let address = listener.local_addr().expect("server addr");
         let (sender, receiver) = mpsc::channel();
         let released: Arc<(Mutex<bool>, Condvar)> = Arc::default();
         let flag = Arc::clone(&released);
@@ -186,30 +217,31 @@ impl TestServer {
                 let sender = sender.clone();
                 let flag = Arc::clone(&flag);
                 let routes = routes.clone();
+                let tls = tls.clone();
                 thread::spawn(move || {
-                    let Some(head) = read_request_head(&mut stream) else {
+                    if let Some(acceptor) = tls {
+                        // The handshake needs a generous deadline; the poll
+                        // loop that follows shortens it once the stream is
+                        // wrapped.
+                        let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+                        let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
+                        // A client that does not trust the certificate fails
+                        // its handshake; the accept loop stays up for the next
+                        // dial.
+                        let Ok(mut stream) = acceptor.accept(stream) else {
+                            return;
+                        };
+                        let _ = stream
+                            .get_ref()
+                            .set_read_timeout(Some(Duration::from_millis(100)));
+                        answer(&mut stream, &routes, hold, cors, delay, &sender, &flag);
                         return;
-                    };
-                    let path = request_path(&head);
-                    let _ = sender.send(RecordedRequest {
-                        path: path.clone(),
-                        head: head.clone(),
-                    });
-                    if hold == Some(path.as_str()) {
-                        let (lock, condvar) = &*flag;
-                        let mut released = lock.lock().expect("release flag");
-                        while !*released {
-                            released = condvar.wait(released).expect("release wait");
-                        }
                     }
-                    let (content_type, body) = routes
-                        .iter()
-                        .find(|(route, _, _)| *route == path)
-                        .map_or(("text/plain", &[][..]), |(_, kind, body)| (*kind, *body));
-                    let response = response_for(&head, content_type, body, cors);
-                    // The client may hang up right after its head; a failed
-                    // write then needs no retry.
-                    let _ = stream.write_all(&response);
+                    // Short polls instead of one long blocking read: under load
+                    // the request can lag the accept, and a single long read
+                    // hides which side stalled.
+                    let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
+                    answer(&mut stream, &routes, hold, cors, delay, &sender, &flag);
                 });
             }
         });
@@ -227,30 +259,16 @@ impl TestServer {
 
     /// Waits for a request whose target is `path` and returns its head.
     pub(crate) fn wait(&self, path: &str) -> String {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            if let Some(found) = self
-                .history
+        poll_until(&format!("a request for {path}"), || {
+            self.drain();
+            self.history
                 .lock()
                 .expect("request history")
                 .iter()
                 .rev()
                 .find(|request| request.path == path)
-            {
-                return found.head.clone();
-            }
-            match self
-                .receiver
-                .lock()
-                .expect("request channel")
-                .recv_timeout(Duration::from_millis(100))
-            {
-                Ok(recorded) => self.history.lock().expect("request history").push(recorded),
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => panic!("request recorder stopped"),
-            }
-            assert!(Instant::now() < deadline, "no request for {path}");
-        }
+                .map(|request| request.head.clone())
+        })
     }
 
     /// Whether any request for `path` has been accepted.
@@ -297,6 +315,49 @@ impl TestServer {
     }
 }
 
+/// Answers one accepted connection: reads its head, records it, applies the
+/// hold, delay, and route, and writes the response. Generic over the stream so
+/// the plain and TLS servers share every rule.
+fn answer(
+    stream: &mut (impl Read + Write),
+    routes: &[(&'static str, Response)],
+    hold: Option<&str>,
+    cors: bool,
+    delay: Duration,
+    sender: &mpsc::Sender<RecordedRequest>,
+    flag: &(Mutex<bool>, Condvar),
+) {
+    let Some(head) = read_request_head(stream) else {
+        return;
+    };
+    // A malformed request line is not this server's request to answer, so the
+    // connection is closed without a record.
+    let Some(path) = request_target(&head) else {
+        return;
+    };
+    let _ = sender.send(RecordedRequest {
+        path: path.to_owned(),
+        head: head.clone(),
+    });
+    if hold == Some(path) {
+        let (lock, condvar) = flag;
+        let mut released = lock.lock().expect("release flag");
+        while !*released {
+            released = condvar.wait(released).expect("release wait");
+        }
+    }
+    if !delay.is_zero() {
+        thread::sleep(delay);
+    }
+    let response = routes
+        .iter()
+        .find(|(route, _)| *route == path)
+        .map_or_else(Response::not_found, |(_, response)| response.clone());
+    // The client may hang up right after its head; a failed write then needs no
+    // retry.
+    let _ = stream.write_all(&response.render(&head, cors));
+}
+
 /// Polls `probe` until it answers, failing the test after ten seconds.
 pub(crate) fn poll_until<T>(what: &str, mut probe: impl FnMut() -> Option<T>) -> T {
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -309,37 +370,17 @@ pub(crate) fn poll_until<T>(what: &str, mut probe: impl FnMut() -> Option<T>) ->
     }
 }
 
-/// The request target of a recorded head.
-fn request_path(head: &str) -> String {
-    head.split_whitespace().nth(1).unwrap_or("/").to_owned()
-}
-
-/// One response, echoing the request's `Origin` when it sent one so a
-/// credentialed CORS request passes the CORS check.
-fn response_for(head: &str, content_type: &str, body: &[u8], cors: bool) -> Vec<u8> {
-    let mut response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n",
-        body.len()
-    );
-    if !cors {
-        response.push_str("\r\n");
-        let mut response = response.into_bytes();
-        response.extend_from_slice(body);
-        return response;
-    }
-    match request_header(head, "origin") {
-        Some(origin) => {
-            let _ = write!(
-                response,
-                "Access-Control-Allow-Origin: {origin}\r\nAccess-Control-Allow-Credentials: true\r\nVary: Origin\r\n"
-            );
-        }
-        None => response.push_str("Access-Control-Allow-Origin: *\r\n"),
-    }
-    response.push_str("\r\n");
-    let mut response = response.into_bytes();
-    response.extend_from_slice(body);
-    response
+/// The request target of a request head, or `None` when the request line is
+/// malformed. One parser decides both what a server records and what route it
+/// answers: a line with no method, target, or HTTP version is dropped rather
+/// than guessed at as `/`.
+fn request_target(head: &str) -> Option<&str> {
+    let line = head.lines().next()?;
+    let mut parts = line.split_whitespace();
+    let method = parts.next()?;
+    let target = parts.next()?;
+    let version = parts.next()?;
+    (!method.is_empty() && version.starts_with("HTTP/")).then_some(target)
 }
 
 /// One request header's value, case-insensitively.
@@ -348,13 +389,6 @@ fn request_header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
         let (header, value) = line.split_once(':')?;
         header.eq_ignore_ascii_case(name).then(|| value.trim())
     })
-}
-
-/// Serves one body at `/` on an ephemeral port for every connection it gets./// Serves one body at `/` on an ephemeral port for every connection it gets.
-pub(crate) fn serve(body: &'static [u8], content_type: &'static str) -> std::net::SocketAddr {
-    let (listener, address) = server();
-    serve_on(listener, vec![("/", ok(content_type, body))]);
-    address
 }
 
 /// Creates a target, attaches to it, and waits for `Page.loadEventFired`

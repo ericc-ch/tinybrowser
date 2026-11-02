@@ -1506,7 +1506,7 @@ impl Engine {
         if let Some((base, referrer_url, origin, policy)) = inherited {
             document.load_frame_srcdoc(&base, &referrer_url, origin, &policy, markup);
         } else {
-            let blank = Url::parse("about:blank").expect("about:blank parses");
+            let blank = about_blank();
             document.load_frame_srcdoc(
                 &blank,
                 &blank,

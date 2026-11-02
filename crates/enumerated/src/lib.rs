@@ -48,8 +48,8 @@ pub const fn keywords_equal(left: &str, right: &str) -> bool {
 
 /// Declares one keyword set.
 ///
-/// The invocation supplies only the extra derives; `Clone`, `Copy`, `Debug`,
-/// `Eq`, and `PartialEq` are part of the declaration.
+/// The invocation's attributes go on the enum; `Clone`, `Copy`, `Debug`, `Eq`,
+/// and `PartialEq` are always derived.
 #[macro_export]
 macro_rules! enumerated {
     (

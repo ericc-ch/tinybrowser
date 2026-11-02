@@ -491,11 +491,7 @@ struct BlitzRequest {
     destination: Option<crate::csp::Destination>,
 }
 
-/// The URL a browsing context starts on when it has no creator to inherit
-/// from.
-pub(crate) fn about_blank() -> Url {
-    Url::parse("about:blank").expect("about:blank is a valid URL")
-}
+pub(crate) use net::about_blank;
 
 /// One document: tree, task list, `QuickJS` realm, and browser services.
 #[expect(
@@ -809,7 +805,7 @@ impl Document {
         runtime: &FrameRuntime,
         init_scripts: &Rc<RefCell<Vec<(u64, String)>>>,
     ) -> Self {
-        let document_url = Url::parse("about:blank").expect("about:blank is a valid URL");
+        let document_url = about_blank();
         runtime.shared.borrow_mut().begin_document(frame);
         let world = Rc::new(RefCell::new(World::new(
             document_url.clone(),
@@ -3993,9 +3989,7 @@ impl Document {
             self.queue_csp_reports(&violations);
         }
         if blocked {
-            let opaque = Url::parse("about:blank")
-                .map_or_else(|_| child_url.origin(), |blank| blank.origin());
-            self.load_about_blank(Some(&about_blank()), Some(opaque));
+            self.load_about_blank(Some(&about_blank()), Some(url::Origin::new_opaque()));
         }
         blocked
     }

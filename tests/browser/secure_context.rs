@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use crate::fixture::{TestServer, evaluate, ok, open_page, serve_on, server};
+use crate::fixture::{TestServer, evaluate, ok, open_page, server};
 
 /// Percent-encodes `markup` into a `data:` URL.
 fn data_url(markup: &str) -> String {
@@ -85,7 +85,7 @@ fn a_data_document_is_never_secure_and_its_child_inherits_it() {
 fn a_child_inherits_its_creators_secure_context() {
     let (listener, page) = server();
     let body = format!("<!doctype html><body>{SRCDOC_PAGE}");
-    serve_on(listener, vec![("/", ok("text/html", body.as_bytes()))]);
+    TestServer::serve_on(listener, vec![("/", ok("text/html", body.as_bytes()))]);
     let (_fixture, mut client, session) = open_page(
         "tinybrowser-secure-context-child",
         &format!("http://{page}/"),
@@ -168,7 +168,7 @@ window.__blankBit = () => {
 };
 </script>"#;
     let (listener, address) = server();
-    serve_on(listener, vec![("/", ok("text/html", page.as_bytes()))]);
+    TestServer::serve_on(listener, vec![("/", ok("text/html", page.as_bytes()))]);
     let (_fixture, mut client, session) = open_page(
         "tinybrowser-secure-context-popup-secure",
         &format!("http://127.0.0.1:{}/", address.port()),

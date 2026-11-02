@@ -94,11 +94,27 @@ impl Member<'_> {
 }
 
 pub(crate) fn has_no_args(list: Option<&ExtendedAttributeList<'_>>, name: &str) -> bool {
-    list.is_some_and(|list| weedle::attribute::has_no_args(list, name))
+    list.is_some_and(|list| {
+        list.body.list.iter().any(|attribute| match attribute {
+            ExtendedAttribute::NoArgs(item) => item.0.0 == name,
+            _ => false,
+        })
+    })
 }
 
 pub(crate) fn exposed_in(list: Option<&ExtendedAttributeList<'_>>, target: &str) -> bool {
-    list.is_some_and(|list| weedle::attribute::exposed_in(list, target))
+    list.is_some_and(|list| {
+        list.body.list.iter().any(|attribute| match attribute {
+            ExtendedAttribute::WildCard(item) if item.identifier.0 == "Exposed" => true,
+            ExtendedAttribute::Ident(item) if item.lhs_identifier.0 == "Exposed" => {
+                item.rhs.0 == target
+            }
+            ExtendedAttribute::IdentList(item) if item.identifier.0 == "Exposed" => {
+                item.list.body.list.iter().any(|item| item.0 == target)
+            }
+            _ => false,
+        })
+    })
 }
 
 impl<'idl> Database<'idl> {

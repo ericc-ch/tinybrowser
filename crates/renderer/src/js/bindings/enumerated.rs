@@ -6,7 +6,7 @@
 //! or the invalid-value default when it is not a keyword
 //! (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#limited-to-only-known-values>).
 //!
-//! The declaration form is `net::enumerated`, the same one `net` uses for
+//! The declaration form is `enumerated::enumerated!`, shared with `net`'s
 //! `ReferrerPolicy` and `CrossOrigin`.
 
 pub(crate) use enumerated::Enumerated;

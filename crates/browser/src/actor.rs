@@ -715,13 +715,11 @@ impl Tab {
             pending_mount: Some(blank_mount()),
             site: None,
             events_rx: None,
-            document_url: Url::parse("about:blank").expect("about:blank is a valid URL"),
+            document_url: net::about_blank(),
             viewport: renderer::DEFAULT_VIEWPORT,
             init_scripts: Vec::new(),
             next_init_script: 1,
-            history: SessionHistory::new(
-                Url::parse("about:blank").expect("about:blank is a valid URL"),
-            ),
+            history: SessionHistory::new(net::about_blank()),
             traversal: None,
             document_loaded: false,
             navigation_failed: false,
@@ -1273,7 +1271,7 @@ impl Tab {
 fn blank_mount() -> Mount {
     Mount {
         head: ResponseHead::local(
-            Url::parse("about:blank").expect("about:blank is a valid URL"),
+            net::about_blank(),
             Some("text/html; charset=utf-8".to_owned()),
             None,
         ),

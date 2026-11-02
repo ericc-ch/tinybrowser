@@ -5,7 +5,7 @@
 
 use serde_json::json;
 
-use crate::fixture::{PIXEL, TestServer, evaluate, ok, open_page, poll_until, serve_on, server};
+use crate::fixture::{PIXEL, TestServer, evaluate, ok, open_page, poll_until, server};
 
 /// Counts each image's first `load` or `error` and records the settled widths.
 /// Runs after the images are in the tree.
@@ -62,8 +62,8 @@ fn wait_settled(client: &mut cdp::Client, session: &str, images: u64) {
 fn a_padded_crossorigin_image_is_a_cors_request_without_credentials() {
     let foreign = TestServer::start(
         vec![
-            ("/padded.png", "image/png", PIXEL),
-            ("/credentials.png", "image/png", PIXEL),
+            ("/padded.png", ok("image/png", PIXEL)),
+            ("/credentials.png", ok("image/png", PIXEL)),
         ],
         None,
     );
@@ -77,7 +77,7 @@ fn a_padded_crossorigin_image_is_a_cors_request_without_credentials() {
         foreign.address()
     );
     let (listener, origin) = server();
-    serve_on(listener, vec![("/", ok("text/html", page.as_bytes()))]);
+    TestServer::serve_on(listener, vec![("/", ok("text/html", page.as_bytes()))]);
     let (_fixture, mut client, session) =
         open_page("tinybrowser-crossorigin", &format!("http://{origin}/"));
     wait_settled(&mut client, &session, 2);
@@ -116,7 +116,7 @@ fn a_padded_crossorigin_image_is_a_cors_request_without_credentials() {
 #[test]
 fn a_link_stylesheet_crossorigin_is_a_cors_request() {
     let foreign = TestServer::start(
-        vec![("/style.css", "text/css", b"p { color: rgb(1, 2, 3); }")],
+        vec![("/style.css", ok("text/css", b"p { color: rgb(1, 2, 3); }"))],
         None,
     );
     let page = format!(
@@ -128,7 +128,7 @@ fn a_link_stylesheet_crossorigin_is_a_cors_request() {
         foreign.address()
     );
     let (listener, origin) = server();
-    serve_on(listener, vec![("/", ok("text/html", page.as_bytes()))]);
+    TestServer::serve_on(listener, vec![("/", ok("text/html", page.as_bytes()))]);
     let (_fixture, mut client, session) =
         open_page("tinybrowser-crossorigin-link", &format!("http://{origin}/"));
 
@@ -157,8 +157,7 @@ fn a_link_stylesheet_crossorigin_is_a_cors_request() {
 fn a_link_stylesheet_crossorigin_without_cors_approval_does_not_apply() {
     let foreign = TestServer::start_without_cors(vec![(
         "/style.css",
-        "text/css",
-        b"p { color: rgb(1, 2, 3); }",
+        ok("text/css", b"p { color: rgb(1, 2, 3); }"),
     )]);
     let page = format!(
         r#"<!doctype html><body>
@@ -170,7 +169,7 @@ fn a_link_stylesheet_crossorigin_without_cors_approval_does_not_apply() {
         foreign.address()
     );
     let (listener, origin) = server();
-    serve_on(listener, vec![("/", ok("text/html", page.as_bytes()))]);
+    TestServer::serve_on(listener, vec![("/", ok("text/html", page.as_bytes()))]);
     let (_fixture, mut client, session) = open_page(
         "tinybrowser-crossorigin-link-refused",
         &format!("http://{origin}/"),
@@ -195,7 +194,7 @@ fn a_link_stylesheet_crossorigin_without_cors_approval_does_not_apply() {
 /// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#cors-settings-attributes>).
 #[test]
 fn two_images_on_one_url_keep_their_own_crossorigin() {
-    let foreign = TestServer::start(vec![("/shared.png", "image/png", PIXEL)], None);
+    let foreign = TestServer::start(vec![("/shared.png", ok("image/png", PIXEL))], None);
     let page = format!(
         r#"<!doctype html><body>
 <script>document.cookie = 'session=1; path=/'</script>
@@ -206,7 +205,7 @@ fn two_images_on_one_url_keep_their_own_crossorigin() {
         foreign.address()
     );
     let (listener, origin) = server();
-    serve_on(listener, vec![("/", ok("text/html", page.as_bytes()))]);
+    TestServer::serve_on(listener, vec![("/", ok("text/html", page.as_bytes()))]);
     let (_fixture, mut client, session) = open_page(
         "tinybrowser-crossorigin-shared",
         &format!("http://{origin}/"),
@@ -240,7 +239,7 @@ fn two_images_on_one_url_keep_their_own_crossorigin() {
 /// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#cors-settings-attributes>).
 #[test]
 fn one_cors_state_is_one_request() {
-    let foreign = TestServer::start(vec![("/canon.png", "image/png", PIXEL)], None);
+    let foreign = TestServer::start(vec![("/canon.png", ok("image/png", PIXEL))], None);
     let page = format!(
         r#"<!doctype html><body>
 <img src="http://{0}/canon.png" crossorigin="">
@@ -250,7 +249,7 @@ fn one_cors_state_is_one_request() {
         foreign.address()
     );
     let (listener, origin) = server();
-    serve_on(listener, vec![("/", ok("text/html", page.as_bytes()))]);
+    TestServer::serve_on(listener, vec![("/", ok("text/html", page.as_bytes()))]);
     let (_fixture, mut client, session) = open_page(
         "tinybrowser-crossorigin-canonical",
         &format!("http://{origin}/"),
@@ -270,7 +269,7 @@ fn one_cors_state_is_one_request() {
 /// first (<https://html.spec.whatwg.org/multipage/canvas.html#the-image-argument>).
 #[test]
 fn a_no_cors_image_on_a_cors_images_url_still_taints() {
-    let foreign = TestServer::start(vec![("/pixel.png", "image/png", PIXEL)], None);
+    let foreign = TestServer::start(vec![("/pixel.png", ok("image/png", PIXEL))], None);
     let page = format!(
         r#"<!doctype html><body>
 <img id="cors" src="http://{0}/pixel.png" crossorigin="anonymous">
@@ -280,7 +279,7 @@ fn a_no_cors_image_on_a_cors_images_url_still_taints() {
         foreign.address()
     );
     let (listener, origin) = server();
-    serve_on(listener, vec![("/", ok("text/html", page.as_bytes()))]);
+    TestServer::serve_on(listener, vec![("/", ok("text/html", page.as_bytes()))]);
     let (_fixture, mut client, session) = open_page(
         "tinybrowser-crossorigin-taint",
         &format!("http://{origin}/"),
@@ -300,7 +299,7 @@ fn a_no_cors_image_on_a_cors_images_url_still_taints() {
 /// (<https://html.spec.whatwg.org/multipage/canvas.html#the-image-argument>).
 #[test]
 fn a_cached_no_cors_image_does_not_inherit_a_cors_images_clean_state() {
-    let foreign = TestServer::start(vec![("/pixel.png", "image/png", PIXEL)], None);
+    let foreign = TestServer::start(vec![("/pixel.png", ok("image/png", PIXEL))], None);
     let page = format!(
         r#"<!doctype html><body>
 <img id="a" src="http://{0}/pixel.png">
@@ -318,7 +317,7 @@ window.__insertPlain = () => {{
         foreign.address()
     );
     let (listener, origin) = server();
-    serve_on(listener, vec![("/", ok("text/html", page.as_bytes()))]);
+    TestServer::serve_on(listener, vec![("/", ok("text/html", page.as_bytes()))]);
     let (_fixture, mut client, session) = open_page(
         "tinybrowser-crossorigin-taint-cache",
         &format!("http://{origin}/"),
@@ -346,7 +345,7 @@ window.__insertPlain = () => {{
 /// (<https://html.spec.whatwg.org/multipage/images.html#reacting-to-dom-mutations>).
 #[test]
 fn a_crossorigin_write_starts_a_new_request() {
-    let foreign = TestServer::start(vec![("/reload.png", "image/png", PIXEL)], None);
+    let foreign = TestServer::start(vec![("/reload.png", ok("image/png", PIXEL))], None);
     let page = format!(
         r#"<!doctype html><body>
 <script>document.cookie = 'session=1; path=/'</script>
@@ -355,7 +354,7 @@ fn a_crossorigin_write_starts_a_new_request() {
         foreign.address()
     );
     let (listener, origin) = server();
-    serve_on(listener, vec![("/", ok("text/html", page.as_bytes()))]);
+    TestServer::serve_on(listener, vec![("/", ok("text/html", page.as_bytes()))]);
     let (_fixture, mut client, session) = open_page(
         "tinybrowser-crossorigin-reload",
         &format!("http://{origin}/"),
@@ -395,7 +394,7 @@ fn a_crossorigin_write_starts_a_new_request() {
 /// (<https://html.spec.whatwg.org/multipage/images.html#reacting-to-dom-mutations>).
 #[test]
 fn a_same_state_crossorigin_write_keeps_the_request() {
-    let foreign = TestServer::start(vec![("/same.png", "image/png", PIXEL)], None);
+    let foreign = TestServer::start(vec![("/same.png", ok("image/png", PIXEL))], None);
     let page = format!(
         r#"<!doctype html><body>
 <img id="img" src="http://{0}/same.png" crossorigin="">
@@ -404,7 +403,7 @@ fn a_same_state_crossorigin_write_keeps_the_request() {
         foreign.address()
     );
     let (listener, origin) = server();
-    serve_on(listener, vec![("/", ok("text/html", page.as_bytes()))]);
+    TestServer::serve_on(listener, vec![("/", ok("text/html", page.as_bytes()))]);
     let (_fixture, mut client, session) =
         open_page("tinybrowser-crossorigin-same", &format!("http://{origin}/"));
     wait_settled(&mut client, &session, 1);
@@ -436,7 +435,7 @@ fn a_same_state_crossorigin_write_keeps_the_request() {
 /// (<https://html.spec.whatwg.org/multipage/images.html#update-the-image-data>).
 #[test]
 fn a_repeated_src_answered_from_cache_fires_load() {
-    let foreign = TestServer::start(vec![("/cached.png", "image/png", PIXEL)], None);
+    let foreign = TestServer::start(vec![("/cached.png", ok("image/png", PIXEL))], None);
     let page = format!(
         r#"<!doctype html><body>
 <img id="img" src="http://{0}/cached.png">
@@ -448,7 +447,7 @@ document.getElementById('img').addEventListener('load', () => window.__loads++);
         foreign.address()
     );
     let (listener, origin) = server();
-    serve_on(listener, vec![("/", ok("text/html", page.as_bytes()))]);
+    TestServer::serve_on(listener, vec![("/", ok("text/html", page.as_bytes()))]);
     let (_fixture, mut client, session) = open_page(
         "tinybrowser-crossorigin-cached",
         &format!("http://{origin}/"),
@@ -477,7 +476,7 @@ document.getElementById('img').addEventListener('load', () => window.__loads++);
 /// (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>).
 #[test]
 fn a_failed_cors_request_loads_after_crossorigin_is_removed() {
-    let foreign = TestServer::start_without_cors(vec![("/pixel.png", "image/png", PIXEL)]);
+    let foreign = TestServer::start_without_cors(vec![("/pixel.png", ok("image/png", PIXEL))]);
     let page = format!(
         r#"<!doctype html><body>
 <img id="img" src="http://{0}/pixel.png" crossorigin="anonymous">
@@ -491,7 +490,7 @@ image.addEventListener('load', () => window.__loaded++);
         foreign.address()
     );
     let (listener, origin) = server();
-    serve_on(listener, vec![("/", ok("text/html", page.as_bytes()))]);
+    TestServer::serve_on(listener, vec![("/", ok("text/html", page.as_bytes()))]);
     let (_fixture, mut client, session) = open_page(
         "tinybrowser-crossorigin-recover",
         &format!("http://{origin}/"),
@@ -537,7 +536,7 @@ image.addEventListener('load', () => window.__loaded++);
 #[test]
 fn a_link_crossorigin_write_refetches_the_sheet() {
     let foreign = TestServer::start(
-        vec![("/style.css", "text/css", b"p { color: rgb(1, 2, 3); }")],
+        vec![("/style.css", ok("text/css", b"p { color: rgb(1, 2, 3); }"))],
         None,
     );
     let page = format!(
@@ -549,7 +548,7 @@ fn a_link_crossorigin_write_refetches_the_sheet() {
         foreign.address()
     );
     let (listener, origin) = server();
-    serve_on(listener, vec![("/", ok("text/html", page.as_bytes()))]);
+    TestServer::serve_on(listener, vec![("/", ok("text/html", page.as_bytes()))]);
     let (_fixture, mut client, session) = open_page(
         "tinybrowser-crossorigin-link-reload",
         &format!("http://{origin}/"),
@@ -579,7 +578,7 @@ fn a_link_crossorigin_write_refetches_the_sheet() {
 /// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#referrer-policy-attribute>).
 #[test]
 fn a_referrerpolicy_write_does_not_change_an_earlier_request() {
-    let foreign = TestServer::start(vec![("/pixel.png", "image/png", PIXEL)], None);
+    let foreign = TestServer::start(vec![("/pixel.png", ok("image/png", PIXEL))], None);
     let page = format!(
         "<!doctype html><body>
 <script>
@@ -595,7 +594,7 @@ document.body.append(image);
         foreign.address()
     );
     let (listener, origin) = server();
-    serve_on(listener, vec![("/", ok("text/html", page.as_bytes()))]);
+    TestServer::serve_on(listener, vec![("/", ok("text/html", page.as_bytes()))]);
     let (_fixture, _client, _session) =
         open_page("tinybrowser-referrer-sampled", &format!("http://{origin}/"));
 

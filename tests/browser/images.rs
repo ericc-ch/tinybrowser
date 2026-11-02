@@ -3,7 +3,7 @@
 
 use serde_json::json;
 
-use crate::fixture::{PIXEL, TestServer, evaluate, ok, open_page, poll_until, serve_on, server};
+use crate::fixture::{PIXEL, TestServer, evaluate, ok, open_page, poll_until, server};
 
 /// An empty `src` is a broken image request: the element fires `error` and the
 /// document's `load` event does not wait for a request that can never settle
@@ -20,7 +20,7 @@ image.addEventListener('load', () => window.__events.push('load'));
 </script>
 "#;
     let (listener, origin) = server();
-    serve_on(listener, vec![("/", ok("text/html", page.as_bytes()))]);
+    TestServer::serve_on(listener, vec![("/", ok("text/html", page.as_bytes()))]);
     // A document whose load event never fires fails this call.
     let (_fixture, mut client, session) =
         open_page("tinybrowser-image-empty-src", &format!("http://{origin}/"));
@@ -43,7 +43,7 @@ image.addEventListener('load', () => window.__events.push('load'));
 /// (<https://html.spec.whatwg.org/multipage/images.html#reacting-to-dom-mutations>).
 #[test]
 fn moving_a_loaded_image_does_not_reload_it() {
-    let foreign = TestServer::start(vec![("/pixel.png", "image/png", PIXEL)], None);
+    let foreign = TestServer::start(vec![("/pixel.png", ok("image/png", PIXEL))], None);
     let page = format!(
         r#"<!doctype html><body>
 <div id="first"></div><div id="second"></div>
@@ -57,7 +57,7 @@ image.addEventListener('load', () => window.__loads++);
         foreign.address()
     );
     let (listener, origin) = server();
-    serve_on(listener, vec![("/", ok("text/html", page.as_bytes()))]);
+    TestServer::serve_on(listener, vec![("/", ok("text/html", page.as_bytes()))]);
     let (_fixture, mut client, session) =
         open_page("tinybrowser-image-move", &format!("http://{origin}/"));
     poll_until("the first load", || {
