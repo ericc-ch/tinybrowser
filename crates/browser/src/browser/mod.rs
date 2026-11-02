@@ -88,8 +88,8 @@ pub struct BrowserHandle {
 
 /// Parameters for a renderer-initiated `window.open`.
 pub(crate) struct OpenWindowOptions {
-    /// Requested URL, already filtered to a navigable scheme or empty.
-    pub(crate) url: String,
+    /// Requested URL, already filtered to `about:blank` or HTTP(S).
+    pub(crate) url: Url,
     /// Tab that called `window.open`, when it has one.
     pub(crate) source: Option<TabId>,
     /// What the call's `noopener` and `noreferrer` features asked for.

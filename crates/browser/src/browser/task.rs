@@ -258,9 +258,9 @@ impl BrowserTask {
             self.tabs.set_opener(id, source);
             self.context.copy_session(source, id);
         }
-        if !url.is_empty() && url != "about:blank" {
+        if url.as_str() != "about:blank" {
             tokio::spawn(async move {
-                let _result = handle.goto_from(&url, initiator).await;
+                let _result = handle.goto_from(url.as_str(), initiator).await;
             });
         }
         Ok(id)

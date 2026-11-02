@@ -661,10 +661,10 @@ impl StorageHost for WasmServices {
 impl BrowsingContextHost for WasmServices {
     fn window_open(
         &self,
-        _url: &str,
-        _name: &str,
+        _url: &Url,
         _opener: renderer::OpenerPolicy,
         _source: &renderer::NavigationSource,
+        _allow_popups: bool,
     ) -> Option<renderer::WindowId> {
         None
     }

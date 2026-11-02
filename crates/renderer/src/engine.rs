@@ -1610,7 +1610,7 @@ impl Engine {
                         .contains(*frame)
                         .then(|| (*frame, tree.container(*frame))),
                     NavigationTarget::Target(target) => tree
-                        .choose_navigable(target, queued_on)
+                        .choose_navigable(&crate::messaging::TargetName::parse(target), queued_on)
                         .map(|frame| (frame, tree.container(frame))),
                 }
             };

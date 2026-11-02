@@ -868,10 +868,10 @@ mod tests {
         };
         let call = crate::wire::ServiceCall::BrowsingContext(
             crate::wire::BrowsingContextCall::WindowOpen {
-                url: "https://b.test/".to_owned(),
-                name: String::new(),
+                url: url::Url::parse("https://b.test/").expect("url"),
                 opener: renderer::OpenerPolicy::Keep,
                 source: source.clone(),
+                allow_popups: true,
             },
         );
         let message: crate::wire::FromRenderer = crate::exchange::Frame::Call {

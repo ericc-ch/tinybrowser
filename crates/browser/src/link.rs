@@ -789,21 +789,26 @@ async fn route_window_call(
             url,
             opener,
             source,
-            ..
+            allow_popups,
         } => {
+            // The browser only ever answers with a new tab, so this is the
+            // creation branch and the sandbox bit applies here too. The
+            // renderer refused first; a call that arrives without the bit is a
+            // forged or confused renderer, not a page request
+            // (<https://html.spec.whatwg.org/multipage/browsers.html#sandboxed-auxiliary-navigation-browsing-context-flag>).
+            if !allow_popups {
+                return Err(RendererViolation);
+            }
             let renderer::NavigationSource {
                 origin: claim,
                 referrer,
                 referrer_policy,
             } = source;
-            let spec = if url.is_empty() || url == "about:blank" {
-                Some(String::new())
-            } else {
-                url::Url::parse(&url)
-                    .ok()
-                    .filter(|url| matches!(url.scheme(), "http" | "https"))
-                    .map(|url| url.to_string())
-            };
+            // A popup may navigate only to `about:blank` or an HTTP(S) URL.
+            // The renderer resolved the URL; the browser still checks the
+            // scheme, because a renderer is not the trust boundary.
+            let url = (url.as_str() == "about:blank" || matches!(url.scheme(), "http" | "https"))
+                .then_some(url);
             // The calling document's origin must belong to this renderer's
             // site lock; an opaque document may still open a window, but its
             // origin stays opaque. The referrer is the document's own URL, so
@@ -828,11 +833,11 @@ async fn route_window_call(
                 referrer_policy,
             };
             let source = Some(assignment.tab);
-            let tab = match spec {
-                Some(spec) => context
+            let tab = match url {
+                Some(url) => context
                     .browser
                     .open_window(crate::browser::OpenWindowOptions {
-                        url: spec,
+                        url,
                         source,
                         opener,
                         initiator,

@@ -1309,15 +1309,17 @@ pub trait BrowsingContextHost: Send + Sync + 'static {
     ///
     /// `source` is the calling document's origin, referrer source, and policy.
     /// `noreferrer` is not applied here: the browser folds it into the policy
-    /// it receives, because it owns the feature's meaning
+    /// it receives, because it owns the feature's meaning. `allow_popups` is
+    /// the calling document's sandbox bit; the browser enforces it too,
+    /// because it is the trust boundary
     /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#window-open-steps>,
     /// <https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
     fn window_open(
         &self,
-        url: &str,
-        name: &str,
+        url: &Url,
         opener: OpenerPolicy,
         source: &NavigationSource,
+        allow_popups: bool,
     ) -> Option<WindowId>;
 
     /// `window.close()` on a window this realm opened.

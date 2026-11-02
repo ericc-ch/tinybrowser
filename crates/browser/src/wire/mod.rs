@@ -14,6 +14,7 @@
 pub mod channel;
 
 use serde::{Deserialize, Serialize};
+use url::Url;
 
 use crate::exchange::{Frame, RequestId};
 use renderer::{
@@ -370,10 +371,8 @@ pub enum StorageCall {
 pub enum BrowsingContextCall {
     /// `window.open(url, target, features)`.
     WindowOpen {
-        /// Absolute URL to load, or empty for `about:blank`.
-        url: String,
-        /// Browsing context name.
-        name: String,
+        /// Absolute URL to load; `about:blank` when the call named none.
+        url: Url,
         /// What the `noopener` and `noreferrer` features asked for, already
         /// parsed by the renderer that read the feature string.
         opener: OpenerPolicy,
@@ -381,6 +380,11 @@ pub enum BrowsingContextCall {
         /// (<https://w3c.github.io/webappsec-fetch-metadata/#abstract-opdef-set-site>,
         /// <https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
         source: NavigationSource,
+        /// The calling document's sandbox bit for creating a context. The
+        /// renderer already refused the call without it; the browser checks it
+        /// again because it is the trust boundary
+        /// (<https://html.spec.whatwg.org/multipage/browsers.html#sandboxed-auxiliary-navigation-browsing-context-flag>).
+        allow_popups: bool,
     },
     /// `window.close()` on a window this renderer opened.
     WindowClose {

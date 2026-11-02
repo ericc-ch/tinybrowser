@@ -95,3 +95,47 @@ fn a_same_site_popup_is_same_site_and_not_same_origin() {
     );
     assert!(head.contains("sec-fetch-site: same-site"), "{head}");
 }
+
+/// A sandboxed document without `allow-popups` cannot create a context, no
+/// matter how the target is spelled. The old check tested for the literal
+/// `_blank`, so `_BLANK` and any unknown `_`-prefixed name walked past it and
+/// opened a cross-origin tab
+/// (<https://html.spec.whatwg.org/multipage/browsers.html#sandboxed-auxiliary-navigation-browsing-context-flag>).
+#[test]
+fn a_sandbox_without_allow_popups_cannot_open_a_context_by_spelling() {
+    let popup = TestServer::start(
+        vec![
+            ("/allowed", "text/html", b"<!doctype html>allowed"),
+            ("/blank", "text/html", b"<!doctype html>blank"),
+            ("/upper", "text/html", b"<!doctype html>upper"),
+            ("/named", "text/html", b"<!doctype html>named"),
+        ],
+        None,
+    );
+    let port = popup.address().port();
+    let frame = |sandbox: &str, name: &str, path: &str| {
+        format!(
+            "<iframe sandbox=\"{sandbox}\" srcdoc=\"<script>window.open('http://localhost:{port}/{path}', '{name}')</script>\"></iframe>"
+        )
+    };
+    let page = format!(
+        "<!doctype html>{}{}{}{}",
+        frame("allow-scripts allow-popups", "_blank", "allowed"),
+        frame("allow-scripts", "_blank", "blank"),
+        frame("allow-scripts", "_BLANK", "upper"),
+        frame("allow-scripts", "_new", "named"),
+    );
+    let (listener, address) = server();
+    serve_on(listener, vec![("/start", ok("text/html", page.as_bytes()))]);
+    let (_fixture, _client, _session) = open_page(
+        "tinybrowser-window-open",
+        &format!("http://127.0.0.1:{}/start", address.port()),
+    );
+
+    // The popup-capable frame proves the page really ran each script.
+    popup.wait("/allowed");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    for path in ["/blank", "/upper", "/named"] {
+        assert!(!popup.requested(path), "{path} opened without allow-popups");
+    }
+}

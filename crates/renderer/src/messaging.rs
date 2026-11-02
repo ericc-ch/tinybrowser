@@ -15,6 +15,66 @@ use std::rc::Rc;
 use crate::dom::tree::NodeId;
 use crate::protocol::FrameId;
 
+/// One browsing-context target name, parsed once from the string a page
+/// supplied
+/// (<https://html.spec.whatwg.org/multipage/document-sequences.html#valid-browsing-context-name-or-keyword>).
+///
+/// Keywords match ASCII case-insensitively and the empty string is `_self`, as
+/// the HTML rules for choosing a navigable require. Every other non-empty name
+/// selects a named context. Keeping the spelling out of the decision means a
+/// sandbox gate cannot be bypassed by `_BLANK`, and every reader agrees on
+/// which names create a context.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum TargetName {
+    /// The empty string or `_self`.
+    Current,
+    /// `_parent`.
+    Parent,
+    /// `_top`.
+    Top,
+    /// `_blank`.
+    Blank,
+    /// A named context.
+    Named(String),
+}
+
+impl TargetName {
+    /// Parses one target name.
+    #[must_use]
+    pub(crate) fn parse(raw: &str) -> Self {
+        if raw.is_empty() || raw.eq_ignore_ascii_case("_self") {
+            Self::Current
+        } else if raw.eq_ignore_ascii_case("_parent") {
+            Self::Parent
+        } else if raw.eq_ignore_ascii_case("_top") {
+            Self::Top
+        } else if raw.eq_ignore_ascii_case("_blank") {
+            Self::Blank
+        } else {
+            Self::Named(raw.to_owned())
+        }
+    }
+
+    /// Whether the target names a context rather than the current frame or an
+    /// ancestor. `_blank` always creates; a named one may already exist, which
+    /// only [`choose_navigable`] can answer.
+    ///
+    /// [`choose_navigable`]: FrameTree::choose_navigable
+    #[must_use]
+    pub(crate) fn names_context(&self) -> bool {
+        matches!(self, Self::Blank | Self::Named(_))
+    }
+
+    /// The name a newly created context carries, when the target names one.
+    #[must_use]
+    pub(crate) fn new_context_name(&self) -> Option<&str> {
+        match self {
+            Self::Named(name) => Some(name),
+            Self::Current | Self::Parent | Self::Top | Self::Blank => None,
+        }
+    }
+}
+
 /// Handle every realm holds to the renderer-process shared state.
 pub(crate) type SharedHandle = Rc<RefCell<Shared>>;
 
@@ -244,24 +304,24 @@ impl FrameTree {
     /// rules asked for a new top-level traversable. `window.open` turns that
     /// answer into an auxiliary context for a URL this renderer can host and
     /// falls back to a browser tab otherwise.
-    pub(crate) fn choose_navigable(&self, target: &str, current: FrameId) -> Option<FrameId> {
-        if target.is_empty() || target.eq_ignore_ascii_case("_self") {
-            return Some(current);
+    pub(crate) fn choose_navigable(
+        &self,
+        target: &TargetName,
+        current: FrameId,
+    ) -> Option<FrameId> {
+        match target {
+            TargetName::Current => Some(current),
+            TargetName::Parent => Some(self.parent(current).unwrap_or(current)),
+            TargetName::Top => Some(self.top_level(current)),
+            TargetName::Blank => None,
+            TargetName::Named(name) => {
+                let top = self.top_level(current);
+                [current, top]
+                    .into_iter()
+                    .find_map(|subtree| self.find_by_target_name(subtree, name))
+                    .or_else(|| self.find_by_auxiliary_name(top, name))
+            }
         }
-        if target.eq_ignore_ascii_case("_parent") {
-            return Some(self.parent(current).unwrap_or(current));
-        }
-        if target.eq_ignore_ascii_case("_top") {
-            return Some(self.top_level(current));
-        }
-        if target.eq_ignore_ascii_case("_blank") {
-            return None;
-        }
-        let top = self.top_level(current);
-        [current, top]
-            .into_iter()
-            .find_map(|subtree| self.find_by_target_name(subtree, target))
-            .or_else(|| self.find_by_auxiliary_name(top, target))
     }
 
     /// The top-level traversable of `frame`
@@ -840,7 +900,7 @@ impl Shared {
 
 #[cfg(test)]
 mod tests {
-    use super::FrameTree;
+    use super::{FrameTree, TargetName};
     use crate::dom::tree::NodeId;
     use crate::protocol::FrameId;
 
@@ -871,7 +931,7 @@ mod tests {
     /// as one number.
     fn chosen(target: &str, current: u64) -> u64 {
         tree()
-            .choose_navigable(target, FrameId::new(current))
+            .choose_navigable(&TargetName::parse(target), FrameId::new(current))
             .map_or(0, FrameId::get)
     }
 
@@ -920,8 +980,14 @@ mod tests {
         // accessors that only echo `add_auxiliary`'s arguments are not
         // asserted
         // (<https://html.spec.whatwg.org/multipage/document-sequences.html#the-rules-for-choosing-a-navigable>).
-        assert_eq!(tree.choose_navigable("popup", FrameId::new(4)), Some(popup));
-        assert_eq!(tree.choose_navigable("_top", popup), Some(popup));
+        assert_eq!(
+            tree.choose_navigable(&TargetName::parse("popup"), FrameId::new(4)),
+            Some(popup)
+        );
+        assert_eq!(
+            tree.choose_navigable(&TargetName::parse("_top"), popup),
+            Some(popup)
+        );
         assert!(tree.is_inclusive_descendant(popup, popup));
         assert!(!tree.is_inclusive_descendant(FrameId::new(1), popup));
     }
@@ -934,6 +1000,9 @@ mod tests {
         tree.set_name(popup, "popup".to_owned());
         assert_eq!(tree.opener(popup), None);
         assert_eq!(tree.auxiliary_opener(popup), Some(FrameId::new(1)));
-        assert_eq!(tree.choose_navigable("popup", FrameId::new(4)), Some(popup));
+        assert_eq!(
+            tree.choose_navigable(&TargetName::parse("popup"), FrameId::new(4)),
+            Some(popup)
+        );
     }
 }

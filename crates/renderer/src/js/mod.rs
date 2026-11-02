@@ -1543,9 +1543,17 @@ fn open_window<'js>(
     features: &str,
     known: bool,
 ) -> rquickjs::Result<Value<'js>> {
+    // The window open steps treat an absent target as `_blank`, unlike a link
+    // navigation where the empty string selects the current context
+    // (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#window-open-steps>).
+    let target = if name.is_empty() {
+        crate::messaging::TargetName::Blank
+    } else {
+        crate::messaging::TargetName::parse(name)
+    };
     let plan = {
         let world = world.borrow();
-        world.plan_window_open(url, name, features)
+        world.plan_window_open(url, &target, features)
     };
     let Some(plan) = plan else {
         return Ok(Value::new_null(ctx.clone()));
@@ -1555,21 +1563,33 @@ fn open_window<'js>(
     if known {
         return opened_window(ctx, "cached", None, plan.withholds);
     }
-    // Without `allow-popups` a sandboxed document cannot create an auxiliary
-    // context at all, whether this renderer or the browser would host it
+    // The one creation decision: a target that chooses no navigable creates a
+    // context. A sandboxed document without `allow-popups` cannot create one,
+    // whether this renderer or the browser would host it; spelling the name
+    // `_BLANK` or choosing an unknown `_x` must not change that
     // (<https://html.spec.whatwg.org/multipage/browsers.html#sandboxed-auxiliary-navigation-browsing-context-flag>).
-    let creates = !name.starts_with('_') || name == "_blank";
+    let creates = {
+        let world = world.borrow();
+        world
+            .runtime
+            .shared
+            .borrow()
+            .tree
+            .choose_navigable(&target, world.frame())
+            .is_none()
+    };
     if creates && !world.borrow().allows_auxiliary_navigation() {
         return Ok(Value::new_null(ctx.clone()));
     }
     // A context this renderer hosts keeps same-origin access to the opener: an
     // auxiliary context for a blank or same-origin URL, or the navigable a
     // name already selects. A cross-origin popup stays a browser tab.
-    if let Some(frame) = World::open_auxiliary(world, &plan.spec, name, plan.opener) {
+    if let Some(frame) = World::open_auxiliary(world, &plan.url, &target, plan.opener) {
         return opened_window(ctx, "frame", Some(js_number(frame.get())), plan.withholds);
     }
+    let allow_popups = world.borrow().allows_auxiliary_navigation();
     let services = world.borrow().runtime.services.clone();
-    let Some(tab) = services.window_open(&plan.spec, name, plan.opener, &plan.source) else {
+    let Some(tab) = services.window_open(&plan.url, plan.opener, &plan.source, allow_popups) else {
         return Ok(Value::new_null(ctx.clone()));
     };
     opened_window(ctx, "tab", Some(js_number(tab.get())), plan.withholds)

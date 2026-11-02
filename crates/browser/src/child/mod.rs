@@ -439,17 +439,17 @@ impl StorageHost for HostServices {
 impl BrowsingContextHost for HostServices {
     fn window_open(
         &self,
-        url: &str,
-        name: &str,
+        url: &Url,
         opener: OpenerPolicy,
         source: &renderer::NavigationSource,
+        allow_popups: bool,
     ) -> Option<WindowId> {
         match self.call(ServiceCall::BrowsingContext(
             BrowsingContextCall::WindowOpen {
-                url: url.to_owned(),
-                name: name.to_owned(),
+                url: url.clone(),
                 opener,
                 source: source.clone(),
+                allow_popups,
             },
         )) {
             Some(ServiceReply::Window(tab)) => tab,
