@@ -1763,10 +1763,11 @@ impl Document {
         shared.ports.owner(endpoint) != Some(self.frame)
     }
 
-    /// Document URL (cookie initiator and relative-URL base).
+    /// The document URL: the relative-URL base and the same-document
+    /// comparison every loader makes.
     #[must_use]
-    pub(crate) fn document_url(&self) -> &str {
-        self.url.as_str()
+    pub(crate) fn url(&self) -> &Url {
+        &self.url
     }
 
     /// Evaluates `source` as classic script on this document's JS context.

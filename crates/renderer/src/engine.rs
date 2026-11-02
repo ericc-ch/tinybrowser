@@ -1264,9 +1264,7 @@ impl Engine {
         let Some(document) = self.frames.get(&child) else {
             return false;
         };
-        let Ok(mut current) = Url::parse(document.document_url()) else {
-            return true;
-        };
+        let mut current = document.url().clone();
         let mut next = url.clone();
         current.set_fragment(None);
         next.set_fragment(None);
@@ -1283,10 +1281,7 @@ impl Engine {
             let Some(document) = self.frames.get(&frame) else {
                 break;
             };
-            let Ok(url) = Url::parse(document.document_url()) else {
-                break;
-            };
-            ancestors.push(url);
+            ancestors.push(document.url().clone());
             cursor = self.runtime.shared.borrow().tree.parent(frame);
         }
         ancestors
