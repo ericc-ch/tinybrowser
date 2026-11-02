@@ -15,6 +15,21 @@ Maximize web spec conformance per byte.
 - Commit messages should also record decisions.
 - Throwaway experiments belong in `/tmp/`.
 
+## Disk
+
+- `CARGO_TARGET_DIR` is `/mnt/ssd/rust-targets/<worktree>` (`flake.nix`).
+  Never override it to `$HOME`, `/tmp`, or any path on the root filesystem:
+  builds are tens of GB and home is not scratch space.
+- If `/mnt/ssd` is full, or any build says `No space left on device`, nuke
+  the target directories there before anything else:
+
+      rm -rf /mnt/ssd/rust-targets/*
+
+  `cargo clean` is not enough. Rerun the build; a cold rebuild is cheaper
+  than a full disk. Do not "fix" it by moving the target directory to home.
+- Check `df -h /mnt/ssd` before a long build, test, or WPT run. Below ~10G
+  free, clean first.
+
 ## Size and release
 
 - Size is an important constraint, but never try to gain smaller size by removing feature(s).
