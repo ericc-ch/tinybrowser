@@ -1354,15 +1354,17 @@ pub(super) fn set_pi_attributes(
     }
     let old_value = parsed.document.character_data(id.node);
     let old_length = old_value.units().len();
-    let data =
-        crate::dom_string::DomString::from(blitz_dom::pseudo_attributes::serialize(&attributes));
     // The fork serializes the map into the data itself and reloads an
-    // `xml-stylesheet` sheet the instruction names.
-    parsed
-        .document
-        .base
-        .mutate()
-        .set_processing_instruction_attributes(id.node, attributes);
+    // `xml-stylesheet` sheet the instruction names. It returns the string the
+    // tree now holds, so the exact-unit bookkeeping below keys off that copy
+    // rather than a second serialization of the same map.
+    let data = crate::dom_string::DomString::from(
+        parsed
+            .document
+            .base
+            .mutate()
+            .set_processing_instruction_attributes(id.node, attributes),
+    );
     parsed.document.remember_character_data(id.node, &data);
     crate::dom::range::adjust_for_replace_data(
         &mut parsed.document.side.ranges,

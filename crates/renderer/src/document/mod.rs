@@ -245,21 +245,6 @@ struct ActiveParse {
     delay: LoadDelayGuard,
 }
 
-/// A connection transition for one `iframe` container in this document.
-pub(crate) enum IframeLifecycle {
-    /// A container whose frame is gone or disconnected.
-    Removed(crate::dom::tree::NodeId),
-}
-
-/// A connection transition for one `<img>` element in this document. Insertion
-/// needs no event: Blitz's insertion steps start the request, and its
-/// settlement drives the element's state. Removal drops the state this
-/// document keeps for it.
-pub(crate) enum ImageLifecycle {
-    /// A disconnected image to stop tracking.
-    Disconnected(crate::dom::tree::NodeId),
-}
-
 /// The state a local-scheme document needs to be installed again: a
 /// session-history entry for an `about:blank` or `about:srcdoc` document
 /// restores the document it held instead of re-fetching it
@@ -1158,7 +1143,11 @@ impl Document {
         self.world.borrow_mut().policy = state.policy.clone();
     }
 
-    pub(crate) fn take_lifecycle(&mut self) -> (Vec<IframeLifecycle>, Vec<ImageLifecycle>) {
+    /// Takes the `iframe` containers that left this document. Insertion needs
+    /// no event: the frame host materializes a new container when it meets it
+    /// in tree order with scripts. This also drops the document's own state for
+    /// every `<img>` that left, because only this document's realm owns it.
+    pub(crate) fn take_removed_containers(&mut self) -> Vec<crate::dom::tree::NodeId> {
         let (connected, connected_images) = self
             .world
             .borrow()
@@ -1194,26 +1183,28 @@ impl Document {
         drop(shared);
         let connected_set: std::collections::HashSet<crate::dom::tree::NodeId> =
             connected.iter().copied().collect();
-        let mut iframe_events = Vec::new();
         // Insertion is the frame-host materialization (`Document`'s pending
         // frames) / `materialize_iframe` in tree order with scripts. Scanning
         // connected iframes here would start parser `src` loads before
         // preceding classic scripts run.
-        for container in &known {
-            if !connected_set.contains(container) {
-                iframe_events.push(IframeLifecycle::Removed(*container));
-            }
-        }
+        let removed = known
+            .iter()
+            .filter(|container| !connected_set.contains(container))
+            .copied()
+            .collect();
         let connected_image_set: std::collections::HashSet<crate::dom::tree::NodeId> =
             connected_images.iter().copied().collect();
-        let mut image_events = Vec::new();
         let previous = std::mem::replace(&mut self.connected_images, connected_image_set);
-        for element in previous {
-            if !self.connected_images.contains(&element) {
-                image_events.push(ImageLifecycle::Disconnected(element));
-            }
+        let disconnected: Vec<crate::dom::tree::NodeId> = previous
+            .into_iter()
+            .filter(|element| !self.connected_images.contains(element))
+            .collect();
+        // The connected set above already replaced the old one; what is left is
+        // this document's per-element state, which no engine-side reader shares.
+        for element in disconnected {
+            self.disconnect_image(element);
         }
-        (iframe_events, image_events)
+        removed
     }
 
     pub(crate) fn take_frame_navigations(&mut self) -> Vec<FrameNavigation> {
@@ -1248,7 +1239,7 @@ impl Document {
     /// settles through Blitz, which fires `load` or `error` on the element and
     /// owns every piece of request state
     /// (<https://html.spec.whatwg.org/multipage/images.html#update-the-image-data>).
-    pub(crate) fn disconnect_image(&mut self, element: crate::dom::tree::NodeId) {
+    fn disconnect_image(&mut self, element: crate::dom::tree::NodeId) {
         // A re-insertion starts a new load: drop the old trigger so the move
         // attributes to itself rather than to a stale `src` set.
         self.world

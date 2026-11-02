@@ -888,8 +888,7 @@ impl Engine {
                 self.frame_history.remove(frame);
             }
             let frame_ids: Vec<FrameId> = self.frames.keys().copied().collect();
-            let mut iframe_lifecycle = Vec::new();
-            let mut image_lifecycle = Vec::new();
+            let mut removed_containers = Vec::new();
             let mut navigations = Vec::new();
             let mut traversals = Vec::new();
             let mut streams = Vec::new();
@@ -902,9 +901,7 @@ impl Engine {
                 // not run there; its document's realm starts here, so its
                 // effects belong to this turn.
                 ran_scripts |= document.run_deferred_scripts();
-                let (iframes, images) = document.take_lifecycle();
-                iframe_lifecycle.extend(iframes.into_iter().map(|event| (frame, event)));
-                image_lifecycle.extend(images.into_iter().map(|event| (frame, event)));
+                removed_containers.extend(document.take_removed_containers());
                 navigations.extend(
                     document
                         .take_frame_navigations()
@@ -924,14 +921,14 @@ impl Engine {
             let deliveries = self.runtime.shared.borrow_mut().take_deliveries();
             let had_work = adopted
                 || ran_scripts
-                || !iframe_lifecycle.is_empty()
-                || !image_lifecycle.is_empty()
+                || !removed_containers.is_empty()
                 || !navigations.is_empty()
                 || !traversals.is_empty()
                 || !streams.is_empty()
                 || !deliveries.is_empty();
-            self.apply_iframe_lifecycle(iframe_lifecycle);
-            self.apply_image_lifecycle(image_lifecycle);
+            for container in removed_containers {
+                self.remove_subtree(container);
+            }
             self.apply_navigations(navigations);
             self.apply_frame_traversals(traversals);
             self.publish_streams(streams);
@@ -944,30 +941,6 @@ impl Engine {
             applied = true;
         }
         applied
-    }
-
-    /// Applies iframe connection transitions.
-    fn apply_iframe_lifecycle(&mut self, events: Vec<(FrameId, crate::document::IframeLifecycle)>) {
-        for (_parent, event) in events {
-            match event {
-                crate::document::IframeLifecycle::Removed(container) => {
-                    self.remove_subtree(container);
-                }
-            }
-        }
-    }
-
-    /// Applies image connection transitions.
-    fn apply_image_lifecycle(&mut self, events: Vec<(FrameId, crate::document::ImageLifecycle)>) {
-        for (parent, event) in events {
-            match event {
-                crate::document::ImageLifecycle::Disconnected(element) => {
-                    if let Some(document) = self.frames.get_mut(&parent) {
-                        document.disconnect_image(element);
-                    }
-                }
-            }
-        }
     }
 
     /// Removes a frame and every descendant it owns before the backing
