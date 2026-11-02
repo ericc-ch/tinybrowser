@@ -1111,50 +1111,32 @@ Object.defineProperty(globalThis, 'name', {
 
   globalThis.open = function(url, target, features) {
     if (arguments.length < 1 || url === undefined || url === null) url = '';
-    const spec = url === '' ? '' : host.__tbResolveUrl(String(url), undefined);
-    if (spec === null || spec === undefined) return null;
     const name = target === undefined || target === null ? '' : String(target);
-    const featureString = features === undefined || features === null ? '' : String(features);
-    // The engine tokenizes and parses the features argument; this shim only
-    // reads the answer, so the grammar lives in one place. The engine also
-    // needs the resolved URL for the blob-URL opener rule
-    // (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#concept-window-open-features-tokenize>).
-    const opener = host.__tbOpenerPolicy(featureString, spec);
-    const noopener = opener !== 'keep';
-    // `noopener` withholds the `WindowProxy` only when the call did not target
-    // this context or one of its ancestors
+    // The engine runs the window open steps: it encodes the URL, tokenizes the
+    // features, applies the blob-URL opener rule, and picks the context. The
+    // shim keeps only what the engine cannot see, the name-to-proxy cache
     // (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#window-open-steps>).
-    const withholds = noopener && !['_self', '_parent', '_top'].includes(name.toLowerCase());
+    const featureString = features === undefined || features === null ? '' : String(features);
     const special = name === '' || name.startsWith('_');
-    // Without `allow-popups` a sandboxed document cannot create an auxiliary
-    // context at all, whether this renderer or the browser would host it
-    // (<https://html.spec.whatwg.org/multipage/browsers.html#sandboxed-auxiliary-navigation-browsing-context-flag>).
-    const creates =
-      name === '' ||
-      name === '_blank' ||
-      (!name.startsWith('_') && !namedWindows.has(name));
-    if (creates && !host.__tbMayOpenPopup()) return null;
-    if (!special && namedWindows.has(name)) {
-      // A `noopener` call never hands back a `WindowProxy`, even for a context
-      // the name already selected
-      // (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#window-open-steps>).
-      return noopener ? null : namedWindows.get(name);
+    const known = !special && namedWindows.has(name);
+    const answer = host.__tbOpen(String(url), name, featureString, known);
+    if (answer === null || answer === undefined) return null;
+    let proxy;
+    if (answer.kind === 'cached') {
+      proxy = namedWindows.get(name);
+    } else if (answer.kind === 'frame') {
+      proxy = __tbFrameProxy(answer.id);
+    } else {
+      proxy = remoteWindow(answer.id);
+      if (!special) {
+        namedWindows.set(name, proxy);
+        tabNames.set(answer.id, name);
+      }
     }
-    // A context this renderer hosts keeps same-origin access to the opener: an
-    // auxiliary context for a blank or same-origin URL, or the navigable a
-    // name already selects. A cross-origin popup stays a browser tab.
-    const frame = host.__tbOpenAuxiliary(spec, name, opener);
-    if (frame !== null && frame !== undefined) {
-      return withholds ? null : __tbFrameProxy(frame);
-    }
-    const tab = host.__tbWindowOpen(spec, name, opener);
-    if (tab === null || tab === undefined) return null;
-    const proxy = remoteWindow(tab);
-    if (!special) {
-      namedWindows.set(name, proxy);
-      tabNames.set(tab, name);
-    }
-    return withholds ? null : proxy;
+    // `noopener` still selects and navigates the context, and never hands back
+    // its `WindowProxy`
+    // (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#window-open-steps>).
+    return answer.withholds ? null : proxy;
   };
 
   // https://html.spec.whatwg.org/multipage/window-object.html#dom-window-close

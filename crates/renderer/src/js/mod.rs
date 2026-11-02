@@ -1389,55 +1389,13 @@ fn random_bytes(ctx: Ctx<'_>, length: usize) -> rquickjs::Result<TypedArray<'_, 
 
 /// `window.open`/`window.close` hooks the JS shim calls.
 fn install_window_host_functions(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<(), JsError> {
-    // The shim parses the feature string once through `__tbOpenerPolicy` and
-    // hands the answer back here, so the engine never re-reads a grammar the
-    // page wrote. The blob-URL step of "get noopener" needs the resolved URL
-    // and the top-level origin, which the shim cannot see
-    // (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#concept-window-open-features-tokenize>,
-    // <https://html.spec.whatwg.org/multipage/nav-history-apis.html#get-noopener-for-window-open>).
-    let opener_policy = world.clone();
-    bridge::object(ctx)?.set(
-        "__tbOpenerPolicy",
-        Func::from(move |features: String, url: String| {
-            let world = opener_policy.borrow();
-            let blob_origin = (!url.is_empty())
-                .then(|| world.object_url_origin(&url))
-                .flatten();
-            crate::window_features::WindowFeatures::parse(&features)
-                .opener_policy(blob_origin.as_ref(), &world.top_level_origin())
-                .token()
-        }),
-    )?;
-
+    // The window open steps are one algorithm, so the engine runs them and the
+    // shim keeps only the name cache: `__tbOpen` encodes the URL once, reads
+    // the features once, decides the opener policy (including the blob rule,
+    // which needs the top-level origin), and picks the context
+    // (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#window-open-steps>).
     let window_open = world.clone();
-    bridge::object(ctx)?.set(
-        "__tbWindowOpen",
-        Func::from(move |url: String, name: String, opener: String| {
-            let opener = crate::protocol::OpenerPolicy::parse(&opener)?;
-            let world = window_open.borrow();
-            let spec = if url.is_empty() {
-                Some(String::new())
-            } else {
-                world
-                    .document_url
-                    .join(&url)
-                    .ok()
-                    .map(|url| url.to_string())
-            };
-            let initiator = crate::protocol::SerializedOrigin::from(&world.origin);
-            let referrer = world.referrer_url.clone();
-            let referrer_policy = world.policy.referrer_policy.unwrap_or_default();
-            drop(world);
-            spec.and_then(|spec| {
-                window_open
-                    .borrow()
-                    .runtime
-                    .services
-                    .window_open(&spec, &name, opener, &initiator, &referrer, referrer_policy)
-                    .map(|window| crate::js::js_number(window.get()))
-            })
-        }),
-    )?;
+    bridge::object(ctx)?.set("__tbOpen", Func::from(open_window_hook(window_open)))?;
 
     let window_close = world.clone();
     bridge::object(ctx)?.set(
@@ -1553,29 +1511,92 @@ fn install_window_messaging_functions(
     Ok(())
 }
 
-/// The hooks an auxiliary top-level context needs: opening one, reading its
-/// opener, and closing it. A same-origin `window.open` result stays in this
-/// renderer, so these never cross the browser tab seam.
+/// Binds [`open_window`] to one realm as the `__tbOpen` host function.
+///
+/// The closure must accept any JS lifetime, which `Func::from` reads from a
+/// `Ctx<'js>`, so the bound is written here instead of inferred.
+fn open_window_hook(
+    world: Rc<RefCell<World>>,
+) -> impl for<'js> Fn(Ctx<'js>, String, String, String, bool) -> rquickjs::Result<Value<'js>> {
+    move |ctx, url, name, features, known| open_window(&ctx, &world, &url, &name, &features, known)
+}
+
+/// One `window.open` call, split where the engine ends and the shim's name
+/// cache begins
+/// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#window-open-steps>).
+///
+/// The answer is `null` when the call opens nothing, or an object naming the
+/// context the call selected — `cached` for a name the shim already holds,
+/// `frame` for a context this renderer hosts, `tab` for a browser tab — with
+/// `withholds` saying whether the call still returns no `WindowProxy`.
+fn open_window<'js>(
+    ctx: &Ctx<'js>,
+    world: &Rc<RefCell<World>>,
+    url: &str,
+    name: &str,
+    features: &str,
+    known: bool,
+) -> rquickjs::Result<Value<'js>> {
+    let plan = {
+        let world = world.borrow();
+        world.plan_window_open(url, name, features)
+    };
+    let Some(plan) = plan else {
+        return Ok(Value::new_null(ctx.clone()));
+    };
+    // A name the shim already holds selects that context: the engine answers
+    // only the policy question, and the shim returns its cached proxy.
+    if known {
+        return opened_window(ctx, "cached", None, plan.withholds);
+    }
+    // Without `allow-popups` a sandboxed document cannot create an auxiliary
+    // context at all, whether this renderer or the browser would host it
+    // (<https://html.spec.whatwg.org/multipage/browsers.html#sandboxed-auxiliary-navigation-browsing-context-flag>).
+    let creates = !name.starts_with('_') || name == "_blank";
+    if creates && !world.borrow().allows_auxiliary_navigation() {
+        return Ok(Value::new_null(ctx.clone()));
+    }
+    // A context this renderer hosts keeps same-origin access to the opener: an
+    // auxiliary context for a blank or same-origin URL, or the navigable a
+    // name already selects. A cross-origin popup stays a browser tab.
+    if let Some(frame) = World::open_auxiliary(world, &plan.spec, name, plan.opener) {
+        return opened_window(ctx, "frame", Some(js_number(frame.get())), plan.withholds);
+    }
+    let services = world.borrow().runtime.services.clone();
+    let Some(tab) = services.window_open(
+        &plan.spec,
+        name,
+        plan.opener,
+        &plan.initiator,
+        &plan.referrer,
+        plan.referrer_policy,
+    ) else {
+        return Ok(Value::new_null(ctx.clone()));
+    };
+    opened_window(ctx, "tab", Some(js_number(tab.get())), plan.withholds)
+}
+
+/// One [`open_window`] answer, as the shim reads it.
+fn opened_window<'js>(
+    ctx: &Ctx<'js>,
+    kind: &str,
+    id: Option<f64>,
+    withholds: bool,
+) -> rquickjs::Result<Value<'js>> {
+    let opened = Object::new(ctx.clone())?;
+    opened.set("kind", kind)?;
+    if let Some(id) = id {
+        opened.set("id", id)?;
+    }
+    opened.set("withholds", withholds)?;
+    Ok(opened.into_value())
+}
+
+/// `window.open`'s auxiliary-context hooks: reading and closing the opener.
 fn install_auxiliary_host_functions(
     ctx: &Ctx<'_>,
     world: &Rc<RefCell<World>>,
 ) -> Result<(), JsError> {
-    let open = world.clone();
-    bridge::object(ctx)?.set(
-        "__tbOpenAuxiliary",
-        Func::from(move |url: String, name: String, opener: String| {
-            let opener = crate::protocol::OpenerPolicy::parse(&opener)?;
-            World::open_auxiliary(&open, &url, &name, opener)
-                .map(|frame| crate::js::js_number(frame.get()))
-        }),
-    )?;
-
-    let popups = world.clone();
-    bridge::object(ctx)?.set(
-        "__tbMayOpenPopup",
-        Func::from(move || popups.borrow().allows_auxiliary_navigation()),
-    )?;
-
     let opener = world.clone();
     bridge::object(ctx)?.set(
         "__tbWindowOpenerFrame",

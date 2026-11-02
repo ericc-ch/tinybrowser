@@ -1783,6 +1783,24 @@ impl Drop for World {
     }
 }
 
+/// What one `window.open` call resolved to before any context exists
+/// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#window-open-steps>).
+pub(crate) struct WindowOpenPlan {
+    /// The URL encoded against this document, or empty for `about:blank`.
+    pub(crate) spec: String,
+    /// What `noopener`, `noreferrer`, and the blob rule do to the opener.
+    pub(crate) opener: crate::protocol::OpenerPolicy,
+    /// Whether the call returns no `WindowProxy` even though the context it
+    /// selected exists: `noopener` withholds everything but this context and
+    /// the ancestors it may target directly
+    /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#window-open-steps>).
+    pub(crate) withholds: bool,
+    /// The navigation a browser-hosted tab's first request runs under.
+    pub(crate) initiator: crate::protocol::SerializedOrigin,
+    pub(crate) referrer: Url,
+    pub(crate) referrer_policy: net::ReferrerPolicy,
+}
+
 impl World {
     pub(crate) fn new(
         document_url: Url,
@@ -2296,6 +2314,42 @@ impl World {
         !self
             .sandbox
             .contains(crate::js::world::SandboxFlag::AuxiliaryNavigation)
+    }
+
+    /// Reads one `window.open` call: the URL encoded against this document, and
+    /// the feature list, the blob-URL opener rule, and the calling document's
+    /// navigation inputs, each read once
+    /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#window-open-steps>,
+    /// <https://html.spec.whatwg.org/multipage/nav-history-apis.html#get-noopener-for-window-open>).
+    ///
+    /// `None` when the URL cannot be encoded against this document.
+    pub(crate) fn plan_window_open(
+        &self,
+        url: &str,
+        name: &str,
+        features: &str,
+    ) -> Option<WindowOpenPlan> {
+        let spec = if url.is_empty() {
+            String::new()
+        } else {
+            self.resolve_relative(url)?.to_string()
+        };
+        let blob_origin = (!spec.is_empty())
+            .then(|| self.object_url_origin(&spec))
+            .flatten();
+        let opener = crate::window_features::WindowFeatures::parse(features)
+            .opener_policy(blob_origin.as_ref(), &self.top_level_origin());
+        Some(WindowOpenPlan {
+            spec,
+            opener,
+            withholds: opener != crate::protocol::OpenerPolicy::Keep
+                && !name.eq_ignore_ascii_case("_self")
+                && !name.eq_ignore_ascii_case("_parent")
+                && !name.eq_ignore_ascii_case("_top"),
+            initiator: crate::protocol::SerializedOrigin::from(&self.origin),
+            referrer: self.referrer_url.clone(),
+            referrer_policy: self.policy.referrer_policy.unwrap_or_default(),
+        })
     }
 
     /// Opens an auxiliary top-level browsing context, or returns the one a

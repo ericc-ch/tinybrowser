@@ -1302,31 +1302,6 @@ pub enum OpenerPolicy {
     NoReferrer,
 }
 
-impl OpenerPolicy {
-    /// The token the page shim exchanges with the host. The shim only passes
-    /// back a token [`Self::parse`] answered, so a rejected token means the
-    /// shim and the engine disagree about the vocabulary.
-    #[must_use]
-    pub const fn token(self) -> &'static str {
-        match self {
-            Self::Keep => "keep",
-            Self::NoOpener => "noopener",
-            Self::NoReferrer => "noreferrer",
-        }
-    }
-
-    /// Reads one [`Self::token`].
-    #[must_use]
-    pub fn parse(token: &str) -> Option<Self> {
-        match token {
-            "keep" => Some(Self::Keep),
-            "noopener" => Some(Self::NoOpener),
-            "noreferrer" => Some(Self::NoReferrer),
-            _ => None,
-        }
-    }
-}
-
 /// Browsing-context effects the page engine asks its host to perform.
 pub trait BrowsingContextHost: Send + Sync + 'static {
     /// `window.open(url, target, features)`; `None` when the browser refused
