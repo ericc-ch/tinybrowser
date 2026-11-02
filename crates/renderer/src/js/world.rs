@@ -3139,6 +3139,12 @@ impl World {
         self.state.implementations.clear();
         self.brands.clear();
         self.clear_observers();
+        // `set_input_files` roots the page's `File` objects so a form upload
+        // keeps them alive. Left in place, those roots keep the realm's
+        // context alive, the context keeps the globals (and their `Rc<World>`
+        // closures) alive, and the cycle never frees the runtime
+        // (<https://w3c.github.io/FileAPI/#file>).
+        self.input_files.clear();
     }
 
     /// Drops the captured host primitives. Like every other JS-holding field,
