@@ -10,6 +10,7 @@
 //! completion payload the host polls.
 
 mod cache;
+mod deps;
 mod engine;
 mod report;
 mod services;
@@ -32,6 +33,8 @@ struct Options {
     report: Option<PathBuf>,
     baseline: Option<PathBuf>,
     cache: Option<PathBuf>,
+    deps: Option<PathBuf>,
+    changed: Option<PathBuf>,
     verbose: bool,
     list: bool,
     limit: usize,
@@ -82,13 +85,14 @@ fn main() {
         }
         exit(0);
     }
-    let cases = match suite::select(&options.root, &options.paths, options.offset, options.limit) {
+    let mut cases = match suite::select(&options.root, &options.paths, options.offset, options.limit) {
         Ok(cases) => cases,
         Err(error) => {
             eprintln!("wpt-harness: cannot read suite: {error}");
             std::process::exit(2);
         }
     };
+    apply_selection(&options, &mut cases);
     if cases.is_empty() {
         eprintln!("wpt-harness: no tests selected");
         std::process::exit(2);
@@ -136,6 +140,63 @@ fn exit(code: i32) -> ! {
     use std::io::Write as _;
     let _ = std::io::stdout().flush();
     std::process::exit(code)
+}
+
+/// Narrows `cases` to what the changed-file list selects, if a map is given.
+fn apply_selection(options: &Options, cases: &mut Vec<TestCase>) {
+    let (Some(map), Some(changed)) = (&options.deps, &options.changed) else {
+        if options.deps.is_some() || options.changed.is_some() {
+            eprintln!("wpt-harness: --deps and --changed go together");
+            std::process::exit(2);
+        }
+        return;
+    };
+    match select_changed(map, changed) {
+        Ok(Some(selected)) => {
+            cases.retain(|case| selected.contains(&case.id()));
+            eprintln!(
+                "wpt-harness: dependency map selected {} tests",
+                cases.len()
+            );
+        }
+        Ok(None) => {
+            eprintln!("wpt-harness: a changed file has no recorded test; running everything");
+        }
+        Err(error) => {
+            eprintln!("wpt-harness: cannot select from the map: {error}");
+            std::process::exit(2);
+        }
+    }
+}
+
+/// The tests a changed-file list selects, or `None` for the whole suite.
+fn select_changed(
+    map: &std::path::Path,
+    changed: &std::path::Path,
+) -> std::io::Result<Option<std::collections::BTreeSet<String>>> {
+    let deps = deps::Deps::load(map)?;
+    let text = std::fs::read_to_string(changed)?;
+    let paths: Vec<String> = text
+        .split(['\n', ','])
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(|path| path.trim_start_matches("./").to_owned())
+        .collect();
+    let selection = deps.select(&paths);
+    match &selection {
+        Some(selected) => eprintln!(
+            "wpt-harness: {} changed files select {} tests (map knows {} files)",
+            paths.len(),
+            selected.len(),
+            deps.known().len()
+        ),
+        None => eprintln!(
+            "wpt-harness: {} changed files include one the map never saw (map knows {} files)",
+            paths.len(),
+            deps.known().len()
+        ),
+    }
+    Ok(selection)
 }
 
 /// Runs every case, reusing cached verdicts whose binary and inputs match.
@@ -217,7 +278,12 @@ fn run_selected(options: &Options, cases: &[TestCase]) -> (Vec<Outcome>, usize) 
 }
 
 /// Runs every case, one current-thread runtime per worker.
-fn run_all(root: &std::path::Path, cases: &[TestCase], jobs: usize, virtual_time: bool) -> Vec<Outcome> {
+fn run_all(
+    root: &std::path::Path,
+    cases: &[TestCase],
+    jobs: usize,
+    virtual_time: bool,
+) -> Vec<Outcome> {
     if cases.is_empty() {
         return Vec::new();
     }
@@ -253,32 +319,23 @@ fn run_all(root: &std::path::Path, cases: &[TestCase], jobs: usize, virtual_time
                     // run; the engine that saw it is abandoned rather than
                     // dropped, because dropping a half-torn heap can panic
                     // again during unwinding.
-                    let Ok(outcome) = std::panic::catch_unwind(
+                    let result = std::panic::catch_unwind(
                         std::panic::AssertUnwindSafe(|| {
                             runtime.block_on(session.run(case, virtual_time))
                         }),
-                    ) else {
+                    );
+                    let outcome = result.unwrap_or_else(|_| {
                         Box::leak(Box::new(session));
-                        if sender
-                            .send((
-                                index,
-                                Outcome {
-                                    id: case.id(),
-                                    kind: case.kind,
-                                    status: engine::Status::Error,
-                                    message: Some("engine panicked".into()),
-                                    subtests: Vec::new(),
-                                    duration: started.elapsed(),
-                                    inputs: Vec::new(),
-                                },
-                            ))
-                            .is_err()
-                        {
-                            break;
+                        Outcome {
+                            id: case.id(),
+                            kind: case.kind,
+                            status: engine::Status::Error,
+                            message: Some("engine panicked".into()),
+                            subtests: Vec::new(),
+                            duration: started.elapsed(),
+                            inputs: Vec::new(),
                         }
-                        continue;
-                    };
-                    if sender.send((index, outcome)).is_err() {
+                    });                    if sender.send((index, outcome)).is_err() {
                         break;
                     }
                 }
@@ -381,6 +438,8 @@ Runs WPT testharness and crashtest files in-process.
   --report PATH     write a wptreport JSON
   --baseline PATH   compare with an earlier --report and exit 1 on regressions
   --cache PATH      reuse unchanged verdicts from this cache file (and update it)
+  --deps PATH       test-to-source map for --changed
+  --changed PATH    one changed repository path per line (or comma separated)
   --limit N         stop after N selected files
   --offset N        skip the first N selected files (shards)
   --mark-crashed ID store an ERROR verdict for ID in --cache and exit
@@ -393,14 +452,22 @@ PATH is relative to the WPT root, such as dom/nodes or dom/events/foo.html.
 Reftests are selected but skipped until screenshot comparison lands.";
 
 /// Parses the command line.
-fn parse_args() -> Result<Options, String> {
-    let mut options = Options {
+/// Takes the next argument as a path.
+fn path_arg(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<PathBuf, String> {
+    args.next()
+        .map(PathBuf::from)
+        .ok_or_else(|| format!("{flag} needs a path"))
+}
+
+fn parse_args() -> Result<Options, String> {    let mut options = Options {
         root: suite::default_root(),
         paths: Vec::new(),
         jobs: std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
         report: None,
         baseline: None,
         cache: None,
+        deps: None,
+        changed: None,
         verbose: false,
         list: false,
         limit: usize::MAX,
@@ -415,12 +482,7 @@ fn parse_args() -> Result<Options, String> {
                 print!("{HELP}");
                 std::process::exit(0);
             }
-            "--wpt-root" => {
-                options.root = args
-                    .next()
-                    .map(PathBuf::from)
-                    .ok_or("--wpt-root needs a path")?;
-            }
+            "--wpt-root" => options.root = path_arg(&mut args, "--wpt-root")?,
             "--jobs" => {
                 options.jobs = args
                     .next()
@@ -428,27 +490,11 @@ fn parse_args() -> Result<Options, String> {
                     .parse()
                     .map_err(|_| "--jobs needs a number")?;
             }
-            "--report" => {
-                options.report = Some(
-                    args.next()
-                        .map(PathBuf::from)
-                        .ok_or("--report needs a path")?,
-                );
-            }
-            "--baseline" => {
-                options.baseline = Some(
-                    args.next()
-                        .map(PathBuf::from)
-                        .ok_or("--baseline needs a path")?,
-                );
-            }
-            "--cache" => {
-                options.cache = Some(
-                    args.next()
-                        .map(PathBuf::from)
-                        .ok_or("--cache needs a path")?,
-                );
-            }
+            "--report" => options.report = Some(path_arg(&mut args, "--report")?),
+            "--baseline" => options.baseline = Some(path_arg(&mut args, "--baseline")?),
+            "--cache" => options.cache = Some(path_arg(&mut args, "--cache")?),
+            "--deps" => options.deps = Some(path_arg(&mut args, "--deps")?),
+            "--changed" => options.changed = Some(path_arg(&mut args, "--changed")?),
             "--limit" => {
                 options.limit = args
                     .next()

@@ -78,6 +78,23 @@ driver) against those 7,206 s. A file that aborts the engine cannot record
 its own verdict, so the driver marks it with `--mark-crashed` and later runs
 read it as an ordinary cached ERROR instead of bisecting again.
 
+`--deps MAP --changed FILE` narrows a run to the tests that executed a
+changed repository file. `--changed` is one path per line, relative to the
+repository root; MAP is `{"version":1,"tests":{id:[source paths]}}` built by
+`tools/wpt/deps.py build` from an instrumented run. The rule is conservative
+in one place: a changed path the map never saw means the map cannot bound the
+blast radius, so every selected test runs. A file's own bytes are still an
+input through `--cache`, so editing a test reruns it even when the map is
+stale.
+
+Building a full map is not yet a per-push job: `-C instrument-coverage` makes
+this engine pay ~19 s of per-process setup (fontconfig through instrumented
+Rust) plus ~0.2 s per test, so one process per test is hours, and per-test
+profiles in one process need `__llvm_profile_reset_counters`, which is an
+FFI exception to the no-`unsafe` rule. A map for three dom/nodes files was
+recorded and verified: the known-file probe selected exactly those three, and
+an unknown path fell back to all 386.
+
 Known gap: an async listener that leaves a host object borrowed makes
 rquickjs panic with `AlreadyBorrowed` in `Class::borrow_mut`; rquickjs
 converts that panic into a script exception, so the run still finishes and
