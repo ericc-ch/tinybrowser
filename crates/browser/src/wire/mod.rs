@@ -14,11 +14,13 @@
 pub mod channel;
 
 use serde::{Deserialize, Serialize};
+use url::Url;
 
 use crate::exchange::{Frame, RequestId};
 use renderer::{
     BrowserEvent, DialFailure, DialOutcome, DialRequest, FrameId, OpenerPolicy, PostedMessage,
-    RemoteValue, StorageChange, StorageError, StorageKind, StreamId, TabError, WindowId,
+    RemoteValue, SerializedOrigin, StorageChange, StorageError, StorageKind, StreamId, TabError,
+    WindowId,
 };
 
 /// Browser-minted identity of one top-level document hosted by a renderer.
@@ -378,11 +380,11 @@ pub enum BrowsingContextCall {
         /// origin and the source of its `Sec-Fetch-Site`
         /// (<https://w3c.github.io/webappsec-fetch-metadata/#abstract-opdef-set-site>).
         /// `null` for an opaque document.
-        initiator: String,
+        initiator: SerializedOrigin,
         /// The calling document's `"client"` referrer source: its URL, walked
         /// out of an `srcdoc` chain
         /// (<https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
-        referrer: String,
+        referrer: Url,
         /// The calling document's referrer policy; the browser applies
         /// `noreferrer` on top of it.
         referrer_policy: net::ReferrerPolicy,
@@ -431,8 +433,9 @@ pub enum MessagingCall {
 /// Answer to a [`ServiceCall`].
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ServiceReply {
-    /// Dial result, with a typed failure.
-    Dial(Result<DialOutcome, DialFailure>),
+    /// Dial result, with a typed failure. Boxed: the outcome carries every
+    /// response field, and the other replies are a header of that size.
+    Dial(Box<Result<DialOutcome, DialFailure>>),
     /// Next streamed body chunk, or `None` at the end.
     StreamChunk(Result<Option<Vec<u8>>, DialFailure>),
     /// Cookie getter result.
@@ -458,7 +461,7 @@ impl ServiceReply {
     pub fn benign(call: &ServiceCall) -> Self {
         match call {
             ServiceCall::Network(NetworkCall::Dial(_)) => {
-                ServiceReply::Dial(Err(DialFailure::Connect))
+                ServiceReply::Dial(Box::new(Err(DialFailure::Connect)))
             }
             ServiceCall::Network(NetworkCall::DialRead { .. }) => {
                 ServiceReply::StreamChunk(Err(DialFailure::Connect))

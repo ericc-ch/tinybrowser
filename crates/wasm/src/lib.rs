@@ -422,7 +422,7 @@ fn next_hop(chain: &Chain, response: &FetchResponse) -> Result<Option<Url>, Dial
 /// A redirect the policy refused. Status 0 is not a response the page can
 /// use; `final_url` is the blocked hop so the renderer can report it.
 fn csp_blocked(url: &Url) -> DialOutcome {
-    DialOutcome::basic(0, url.to_string(), None, Vec::new(), Vec::new())
+    DialOutcome::basic(0, url.clone(), None, Vec::new(), Vec::new())
 }
 
 fn decode_fetch_result(response: FetchResponse, hop_url: &Url) -> Result<DialOutcome, DialFailure> {
@@ -440,7 +440,7 @@ fn decode_fetch_result(response: FetchResponse, hop_url: &Url) -> Result<DialOut
     // of a stream, and the page sees a response that was not streamed.
     let mut outcome = DialOutcome::basic(
         response.status,
-        final_url.into(),
+        final_url,
         response.content_type,
         Vec::new(),
         response.body,
@@ -492,7 +492,7 @@ impl NetworkHost for WasmServices {
         if request.policy.kind() == DialKind::CspReport {
             completion(Ok(DialOutcome::basic(
                 204,
-                request.url.to_string(),
+                request.url,
                 None,
                 Vec::new(),
                 Vec::new(),
@@ -510,7 +510,7 @@ impl NetworkHost for WasmServices {
             Chain {
                 dial,
                 url,
-                initiator: Url::parse(&request.initiator).ok(),
+                initiator: request.initiator.to_url(),
                 kind: request.policy.kind(),
                 cors: request.policy.cors(),
                 followed: 0,
@@ -654,8 +654,8 @@ impl BrowsingContextHost for WasmServices {
         _url: &str,
         _name: &str,
         _opener: renderer::OpenerPolicy,
-        _initiator: &str,
-        _referrer: &str,
+        _initiator: &renderer::SerializedOrigin,
+        _referrer: &Url,
         _referrer_policy: net::ReferrerPolicy,
     ) -> Option<renderer::WindowId> {
         None
@@ -735,6 +735,6 @@ mod tests {
         };
         let outcome = decode_fetch_result(response, &hop).expect("decoded");
         assert!(matches!(&outcome.body, renderer::ResponseBody::Bytes(body) if body == b"hi"));
-        assert_eq!(outcome.final_url, "https://example.test/docs");
+        assert_eq!(outcome.internal_url(), &hop);
     }
 }

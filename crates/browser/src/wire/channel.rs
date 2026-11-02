@@ -466,7 +466,10 @@ mod tests {
             RequestPolicy::CspReportUri,
         ] {
             let url = url::Url::parse("https://a.test/x").expect("URL");
-            let request = renderer::DialRequest::new(policy, &url, "https://a.test/");
+            // A different origin from the request URL, so the round trip
+            // proves the initiator travels on its own field
+            let initiator = url::Url::parse("https://b.test/").expect("origin");
+            let request = renderer::DialRequest::new(policy, &url, &initiator.origin());
             let message: crate::wire::FromRenderer = crate::exchange::Frame::Call {
                 id: crate::exchange::RequestId::new(1),
                 body: crate::wire::BrowserCall {
@@ -494,6 +497,11 @@ mod tests {
                 panic!("expected a dial");
             };
             assert_eq!(request.policy, policy, "the policy survives the wire");
+            assert_eq!(
+                request.initiator,
+                renderer::SerializedOrigin::Tuple(initiator.origin()),
+                "the initiator is the caller's origin, not the request URL"
+            );
         }
     }
 
@@ -844,5 +852,54 @@ mod tests {
                 .expect("closed channel")
                 .is_none()
         );
+    }
+
+    /// `window.open`'s caller crosses the wire as typed values: an opaque
+    /// document claims `null` rather than a sentinel URL it could forge, and
+    /// the referrer is a URL rather than text the browser parses again
+    /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#window-open-steps>).
+    #[test]
+    fn a_window_open_caller_survives_the_wire() {
+        let referrer = url::Url::parse("https://a.test/page").expect("referrer");
+        let call = crate::wire::ServiceCall::BrowsingContext(
+            crate::wire::BrowsingContextCall::WindowOpen {
+                url: "https://b.test/".to_owned(),
+                name: String::new(),
+                opener: renderer::OpenerPolicy::Keep,
+                initiator: renderer::SerializedOrigin::Opaque,
+                referrer: referrer.clone(),
+                referrer_policy: net::ReferrerPolicy::UnsafeUrl,
+            },
+        );
+        let message: crate::wire::FromRenderer = crate::exchange::Frame::Call {
+            id: crate::exchange::RequestId::new(1),
+            body: crate::wire::BrowserCall {
+                assignment: crate::wire::RendererAssignmentId::new(1),
+                call,
+            },
+        };
+        let mut bytes = Vec::new();
+        write_control(&mut bytes, &message).expect("write");
+        let back: crate::wire::FromRenderer =
+            read_control(&mut Cursor::new(bytes), &mut Vec::new())
+                .expect("read")
+                .expect("one frame");
+        let crate::exchange::Frame::Call { body, .. } = back else {
+            panic!("expected a call frame");
+        };
+        let crate::wire::ServiceCall::BrowsingContext(
+            crate::wire::BrowsingContextCall::WindowOpen {
+                initiator: back_initiator,
+                referrer: back_referrer,
+                referrer_policy: back_policy,
+                ..
+            },
+        ) = body.call
+        else {
+            panic!("expected a window.open call");
+        };
+        assert_eq!(back_initiator, renderer::SerializedOrigin::Opaque);
+        assert_eq!(back_referrer, referrer);
+        assert_eq!(back_policy, net::ReferrerPolicy::UnsafeUrl);
     }
 }

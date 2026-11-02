@@ -586,16 +586,6 @@ async fn race_dial(
     }
 }
 
-/// Whether `spec` names an opaque document's origin: its serialization is
-/// `null`, or it is a non-HTTP(S) URL whose origin is opaque. Opaque documents
-/// share their tab's renderer but never match its site lock, so their dials
-/// must fail as network errors rather than kill it. An unparseable initiator
-/// is not opaque: that is corruption or forgery, still a violation.
-fn is_opaque_initiator(spec: &str) -> bool {
-    spec == "null"
-        || url::Url::parse(spec).is_ok_and(|url| !matches!(url.scheme(), "http" | "https"))
-}
-
 /// The initiator a dial from an opaque document goes out with. The `data:`
 /// URL's origin is opaque and never equal to the request's client environment,
 /// so the referrer and the same-origin credential rules treat it as the
@@ -605,26 +595,17 @@ fn opaque_initiator() -> url::Url {
     url::Url::parse("data:,").expect("data:, is a valid URL")
 }
 
-/// The origin URL a renderer names as a navigation's initiator, when this
+/// The origin URL a renderer names as a request initiator, when this
 /// renderer's site lock authorizes it.
 ///
-/// The renderer sends `Origin::ascii_serialization`, so the claim is only a
-/// scheme, host, and port. [`Site::authorize`] reads document URLs and accepts
-/// `blob:`, `about:`, and `data:` URLs under an opaque lock; those URLs' origins
-/// belong to whichever tuple they wrap, which an opaque lock never granted, and
-/// a path or query would ride into the request's initiator as if it named a
-/// document. Both are forgeries, so only an origin-shaped HTTP(S) URL whose
-/// origin the lock covers passes
-/// (<https://w3c.github.io/webappsec-fetch-metadata/#abstract-opdef-set-site>).
-fn authorized_initiator(site: &Site, spec: &str) -> Option<url::Url> {
-    let url = url::Url::parse(spec).ok()?;
-    let names_an_origin = matches!(url.scheme(), "http" | "https")
-        && url.path() == "/"
-        && url.query().is_none()
-        && url.fragment().is_none()
-        && url.username().is_empty()
-        && url.password().is_none();
-    (names_an_origin && site.allows_origin(&url.origin())).then_some(url)
+/// The claim is a serialized origin, never a document URL: a path, query, or
+/// local-scheme URL parses to the tuple it wraps and is authorized as that
+/// origin, and the URL this returns is the origin's own serialization, so no
+/// other shape reaches the request
+/// (<https://fetch.spec.whatwg.org/#concept-request-origin>).
+fn authorized_initiator(site: &Site, claim: &renderer::SerializedOrigin) -> Option<Url> {
+    let url = claim.to_url()?;
+    site.allows_origin(&url.origin()).then_some(url)
 }
 
 /// Routes one browser service call from a renderer. This is a dispatch table:
@@ -663,7 +644,7 @@ async fn route_service_call(
             // (<https://fetch.spec.whatwg.org/#concept-request-origin>).
             let initiator = match authorized_initiator(&assignment.site, &request.initiator) {
                 Some(initiator) => initiator,
-                None if is_opaque_initiator(&request.initiator) => opaque_initiator(),
+                None if request.initiator.is_opaque() => opaque_initiator(),
                 None => return Err(RendererViolation),
             };
             let worker_network = assignment.network.clone();
@@ -727,7 +708,7 @@ async fn route_service_call(
                     .unwrap_or_else(PoisonError::into_inner)
                     .remove(&id);
                 if responder
-                    .reply(id, ServiceReply::Dial(outcome))
+                    .reply(id, ServiceReply::Dial(Box::new(outcome)))
                     .await
                     .is_err()
                 {
@@ -852,12 +833,13 @@ async fn route_window_call(
             // (<https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
             let origin = match authorized_initiator(&assignment.site, &initiator) {
                 Some(origin) => origin,
-                None if is_opaque_initiator(&initiator) => opaque_initiator(),
+                None if initiator.is_opaque() => opaque_initiator(),
                 None => return Err(RendererViolation),
             };
             let referrer = assignment
                 .site
-                .authorize(&referrer)
+                .allows(&referrer)
+                .then_some(referrer)
                 .filter(|referrer| referrer.origin() == origin.origin());
             let initiator = crate::actor::NavigationInitiator {
                 origin,
@@ -1173,7 +1155,7 @@ async fn send_released_reply(
 ) -> Result<(), RendererViolation> {
     let reply = match call {
         ServiceCall::Network(NetworkCall::Dial(_)) => {
-            ServiceReply::Dial(Err(renderer::DialFailure::Cancelled))
+            ServiceReply::Dial(Box::new(Err(renderer::DialFailure::Cancelled)))
         }
         call => ServiceReply::benign(call),
     };
