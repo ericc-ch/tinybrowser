@@ -15,7 +15,9 @@ mod transport;
 pub use client::{Agent, AgentOptions, Body, Clock, Request, Response, sec_fetch_site};
 pub use cookies::{CookieRecord, CookieSameSite, InitiatorKind, origins_same_site, site};
 pub use error::{NetError, TimeoutKind, TransportError};
-pub use identity::{Brand, ClientHints, DEFAULT_USER_AGENT, Identity, UserAgent};
+pub use identity::{
+    Brand, ClientHints, DEFAULT_USER_AGENT, Identity, InvalidIdentity, UserAgent, ValidIdentity,
+};
 pub use protocol::{
     HeaderError, HeaderMap, InvalidMethod, Method, combined_header, combined_header_in,
     get_decode_split, get_decode_split_decoded, isomorphic_decode, isomorphic_encode,

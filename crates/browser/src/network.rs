@@ -558,7 +558,7 @@ impl NetworkContext {
 
     /// The identity this partition was built with, for the renderers it
     /// spawns.
-    pub(crate) fn identity(&self) -> net::Identity {
+    pub(crate) fn identity(&self) -> net::ValidIdentity {
         self.agent.identity().clone()
     }
 

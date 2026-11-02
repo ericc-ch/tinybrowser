@@ -29,7 +29,7 @@ pub(crate) struct FrameRuntime {
     /// network uses for `User-Agent` and the client hints, so a page, a CSP
     /// report, and a request cannot name different products
     /// (<https://wicg.github.io/ua-client-hints/#http-ua-hints>).
-    pub(crate) identity: net::Identity,
+    pub(crate) identity: net::ValidIdentity,
     pub(crate) js_runtime: JsRuntimeHandle,
     pub(crate) wake: Arc<Notify>,
     pub(crate) stop: Arc<Stop>,

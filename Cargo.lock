@@ -1933,6 +1933,7 @@ dependencies = [
  "hyper-util",
  "native-tls",
  "percent-encoding",
+ "postcard",
  "secure-context",
  "serde",
  "thiserror",

@@ -602,15 +602,18 @@ fn identity(ctx: Ctx<'_>) -> Result<Object<'_>> {
     let identity = world(&ctx)?.borrow().runtime.identity.clone();
     let object = Object::new(ctx.clone())?;
     object.set("userAgent", identity.user_agent.as_str().to_owned())?;
-    object.set("platform", identity.platform)?;
-    object.set("platformVersion", identity.platform_version)?;
-    object.set("architecture", identity.architecture)?;
-    object.set("model", identity.model)?;
+    object.set("platform", identity.platform.clone())?;
+    object.set("platformVersion", identity.platform_version.clone())?;
+    object.set("architecture", identity.architecture.clone())?;
+    object.set("model", identity.model.clone())?;
     object.set("mobile", identity.mobile)?;
-    object.set("bitness", identity.bitness)?;
+    object.set("bitness", identity.bitness.clone())?;
     object.set("wow64", identity.wow64)?;
-    object.set("formFactors", identity.form_factors)?;
-    object.set("navigatorPlatform", identity.navigator_platform)?;
+    object.set("formFactors", identity.form_factors.clone())?;
+    object.set("navigatorPlatform", identity.navigator_platform.clone())?;
+    object.set("languages", identity.languages.clone())?;
+    object.set("vendor", identity.vendor.clone())?;
+    object.set("productSub", identity.product_sub.clone())?;
     object.set("brands", brand_array(&ctx, &identity.brands)?)?;
     object.set(
         "fullVersionList",
@@ -1808,7 +1811,7 @@ mod realm_tests {
     ) -> Rc<RefCell<World>> {
         let runtime = crate::js::FrameRuntime {
             services: Arc::clone(services),
-            identity: net::Identity::default(),
+            identity: net::ValidIdentity::default(),
             js_runtime: js_runtime.handle(),
             wake: Arc::new(tokio::sync::Notify::new()),
             stop: Arc::new(Stop::new()),
@@ -2397,7 +2400,8 @@ mod realm_tests {
         let services: Arc<dyn BrowserServices> = Arc::new(NullServices);
         let stop = Arc::new(Stop::new());
         let wake = Arc::new(tokio::sync::Notify::new());
-        let mut engine = crate::engine::Engine::new(services, stop, wake, net::Identity::default());
+        let mut engine =
+            crate::engine::Engine::new(services, stop, wake, net::ValidIdentity::default());
         let html = "<script>globalThis.__n = 0; for (let i = 0; i < 4; i++) setTimeout(() => { globalThis.__n++; for (;;) {} }, 0);</script>";
         engine
             .mount_frame(
@@ -2443,7 +2447,7 @@ mod realm_tests {
     #[test]
     fn embedded_yield_is_an_immediate_step() {
         let services: Arc<dyn BrowserServices> = Arc::new(NullServices);
-        let mut renderer = crate::EmbeddedRenderer::new(services, net::Identity::default());
+        let mut renderer = crate::EmbeddedRenderer::new(services, net::ValidIdentity::default());
         let html = "<script>globalThis.__n = 0; for (let i = 0; i < 4; i++) setTimeout(() => { globalThis.__n++; for (;;) {} }, 0);</script>";
         renderer
             .mount_for_test(&crate::protocol::Mount {
@@ -2534,7 +2538,7 @@ mod realm_tests {
             services,
             Arc::new(Stop::new()),
             Arc::new(tokio::sync::Notify::new()),
-            net::Identity::default(),
+            net::ValidIdentity::default(),
         );
         mount_html(
             &mut engine,
@@ -2560,7 +2564,7 @@ mod realm_tests {
             services,
             Arc::new(Stop::new()),
             Arc::new(tokio::sync::Notify::new()),
-            net::Identity::default(),
+            net::ValidIdentity::default(),
         );
         mount_html(
             &mut engine,
@@ -2593,7 +2597,7 @@ mod realm_tests {
             services,
             Arc::new(Stop::new()),
             Arc::new(tokio::sync::Notify::new()),
-            net::Identity::default(),
+            net::ValidIdentity::default(),
         );
         mount_html(
             &mut engine,
@@ -2667,7 +2671,7 @@ mod realm_tests {
             services,
             Arc::new(Stop::new()),
             Arc::new(tokio::sync::Notify::new()),
-            net::Identity::default(),
+            net::ValidIdentity::default(),
         );
         mount_html(
             &mut engine,
@@ -2688,7 +2692,7 @@ mod realm_tests {
             services,
             Arc::new(Stop::new()),
             Arc::new(tokio::sync::Notify::new()),
-            net::Identity::default(),
+            net::ValidIdentity::default(),
         );
         mount_html(
             &mut engine,
@@ -2708,7 +2712,7 @@ mod realm_tests {
             services,
             Arc::new(Stop::new()),
             Arc::new(tokio::sync::Notify::new()),
-            net::Identity::default(),
+            net::ValidIdentity::default(),
         );
         mount_html(
             &mut engine,

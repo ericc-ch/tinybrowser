@@ -156,8 +156,10 @@ pub enum HostNotice {
     /// carries the identity every page and CDP answer in this process reports
     /// (<https://wicg.github.io/ua-client-hints/#http-ua-hints>).
     Hello {
-        /// The browser's identity.
-        identity: net::Identity,
+        /// The browser's identity. Boxed because the handshake is one frame
+        /// per process and the identity must not set the size of every other
+        /// notice.
+        identity: Box<net::ValidIdentity>,
     },
     /// Stops the renderer process.
     Shutdown,

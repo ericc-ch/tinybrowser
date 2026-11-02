@@ -119,7 +119,7 @@ impl GuestTab for Tab {
         let owner = services.owner;
         // The component is its own host; a host-supplied identity arrives with
         // the `fetch-request` contract change in #192.
-        let mut renderer = EmbeddedRenderer::new(services, net::Identity::default());
+        let mut renderer = EmbeddedRenderer::new(services, net::ValidIdentity::default());
         let mount = Mount {
             head: renderer::ResponseHead::local(
                 url::Url::parse(&url).map_err(|_| format!("invalid url: {url}"))?,

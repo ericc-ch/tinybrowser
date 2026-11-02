@@ -1288,7 +1288,7 @@ fn subscribe_renderer_events(
 /// Browser services one renderer process hosts for its assignments.
 pub(crate) struct RendererServices {
     /// The identity the new renderer reports to its pages and its CDP clients.
-    pub(crate) identity: net::Identity,
+    pub(crate) identity: net::ValidIdentity,
     /// Partition services shared with the new process.
     pub(crate) partition: PartitionServices,
     /// Session storage owned by the browser.
@@ -1366,7 +1366,12 @@ pub(crate) async fn spawn_process(
     // Detached child task: it reaps the child when the channel closes or the
     // handle signals a kill. Dropping every kill sender also stops it.
     let _reaper = tokio::spawn(child_task(child, kill_rx));
-    if client.notify(HostNotice::Hello { identity }).await.is_err()
+    if client
+        .notify(HostNotice::Hello {
+            identity: Box::new(identity),
+        })
+        .await
+        .is_err()
         || timeout(HANDSHAKE_TIMEOUT, ready_rx).await != Ok(Ok(true))
     {
         let _ = kill.send(true);

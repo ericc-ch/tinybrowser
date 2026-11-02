@@ -41,7 +41,7 @@ pub(super) async fn run(
     let mut engines = HashMap::<RendererAssignmentId, Engine>::new();
     let mut responses = ResponseStreams::default();
     let mut session = Session {
-        identity: net::Identity::default(),
+        identity: net::ValidIdentity::default(),
         stop: Arc::clone(stop),
         wake: Arc::clone(&wake),
     };
@@ -104,7 +104,7 @@ pub(super) async fn run(
 /// The values every engine this process hosts shares: the browser's identity,
 /// and the stop and wake handles its loop waits on.
 struct Session {
-    identity: net::Identity,
+    identity: net::ValidIdentity,
     stop: Arc<Stop>,
     wake: Arc<Notify>,
 }
@@ -119,7 +119,7 @@ fn handle_host(
 ) -> bool {
     match received {
         Some(Frame::Notify(HostNotice::Hello { identity })) => {
-            session.identity = identity;
+            session.identity = *identity;
             true
         }
         Some(Frame::Notify(HostNotice::Assign { assignment })) => {

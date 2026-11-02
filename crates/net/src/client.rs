@@ -79,7 +79,7 @@ impl std::fmt::Debug for Clock {
 pub struct AgentOptions {
     /// The browser identity: `User-Agent`, client hints, and the values the
     /// renderer and CDP report for it.
-    pub identity: crate::Identity,
+    pub identity: crate::ValidIdentity,
     /// Cap on the whole call, including redirects.
     pub timeout_global: Option<Duration>,
     /// Cap on a single hop.
@@ -113,7 +113,7 @@ impl std::fmt::Debug for AgentOptions {
 impl Default for AgentOptions {
     fn default() -> Self {
         Self {
-            identity: crate::Identity::default(),
+            identity: crate::ValidIdentity::default(),
             timeout_global: None,
             timeout_per_call: None,
             max_redirects: DEFAULT_MAX_REDIRECTS,
@@ -131,12 +131,7 @@ impl Default for AgentOptions {
 #[derive(Clone)]
 pub struct Agent {
     pub(crate) engine: HttpEngine,
-    identity: crate::Identity,
-    /// The identity's hint values, formatted once. `None` when its brands or
-    /// platform are not field values: `Identity::validate` is how a caller
-    /// checks first, and the browser does so before it opens, so this only
-    /// affects a direct `Agent` caller that skipped it.
-    client_hints: Option<crate::ClientHints>,
+    identity: crate::ValidIdentity,
     max_redirects: u32,
     jar: Arc<Mutex<CookieJar>>,
     clock: Clock,
@@ -177,7 +172,6 @@ impl Agent {
                 resolve.into(),
                 &tls_cas,
             ),
-            client_hints: identity.client_hints().ok(),
             identity,
             max_redirects,
             jar: Arc::new(Mutex::new(CookieJar::default())),
@@ -187,7 +181,7 @@ impl Agent {
 
     /// The identity every request, page, and CDP answer reports.
     #[must_use]
-    pub fn identity(&self) -> &crate::Identity {
+    pub fn identity(&self) -> &crate::ValidIdentity {
         &self.identity
     }
 
@@ -406,7 +400,7 @@ impl Agent {
         }
         let dial = Dial {
             cors: &request.cors,
-            client_hints: self.client_hints.as_ref(),
+            client_hints: self.identity.hints(),
             initiator_kind: request.initiator_kind,
             initiator: request.initiator.as_ref(),
             on_redirect: request.on_redirect.as_ref(),
@@ -431,8 +425,10 @@ impl Agent {
                 .append(header::ACCEPT, HeaderValue::from_static("*/*"));
         }
         if hop.headers.value("accept-language").is_none() {
-            hop.headers
-                .append(header::ACCEPT_LANGUAGE, HeaderValue::from_static("en-US"));
+            hop.headers.append(
+                header::ACCEPT_LANGUAGE,
+                self.identity.accept_language().clone(),
+            );
         }
         let empty_body = hop.body.as_ref().is_none_or(Bytes::is_empty);
         if empty_body
@@ -915,16 +911,14 @@ fn prepare_credentials(
     } else {
         headers.remove("cookie");
     }
-    if let Some(hints) = dial.client_hints {
-        hints.write(headers, url);
-    }
+    dial.client_hints.write(headers, url);
     Ok(())
 }
 
 /// Request-scoped values shared by every hop of one `send` call.
 struct Dial<'a> {
     cors: &'a crate::cors::CorsSettings,
-    client_hints: Option<&'a crate::ClientHints>,
+    client_hints: &'a crate::ClientHints,
     initiator_kind: InitiatorKind,
     initiator: Option<&'a Url>,
     on_redirect: Option<&'a RedirectGate>,

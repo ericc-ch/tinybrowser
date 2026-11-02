@@ -128,7 +128,7 @@ impl Engine {
         services: Arc<dyn BrowserServices>,
         stop: Arc<Stop>,
         wake: Arc<Notify>,
-        identity: net::Identity,
+        identity: net::ValidIdentity,
     ) -> Self {
         let js_runtime = SharedJsRuntime::default();
         let init_scripts: Rc<RefCell<Vec<(u64, String)>>> = Rc::new(RefCell::new(Vec::new()));
@@ -2048,7 +2048,7 @@ mod navigator_tests {
     /// (<https://wicg.github.io/ua-client-hints/#http-ua-hints>).
     #[test]
     fn navigator_reports_the_identity_the_engine_was_built_with() {
-        let identity = net::Identity {
+        let identity = net::ValidIdentity::try_from(net::Identity {
             user_agent: net::UserAgent::parse("probe/1").expect("user agent"),
             brands: vec![net::Brand {
                 brand: "Probe".to_owned(),
@@ -2062,8 +2062,10 @@ mod navigator_tests {
             mobile: true,
             form_factors: vec!["Mobile".to_owned()],
             navigator_platform: "ProbeOS 1.0".to_owned(),
+            languages: vec!["fr-FR".to_owned(), "fr".to_owned()],
             ..net::Identity::default()
-        };
+        })
+        .expect("identity");
         let mut engine = Engine::new(
             Arc::new(NullServices),
             Arc::new(crate::js::Stop::new()),
@@ -2093,6 +2095,11 @@ mod navigator_tests {
         assert_eq!(evaluate("navigator.userAgentData.mobile"), "true");
         assert_eq!(evaluate("navigator.userAgentData.platform"), "ProbeOS");
         assert_eq!(evaluate("navigator.platform"), "ProbeOS 1.0");
+        assert_eq!(evaluate("navigator.language"), "fr-FR");
+        assert_eq!(evaluate("navigator.languages.join(',')"), "fr-FR,fr");
+        assert_eq!(evaluate("Object.isFrozen(navigator.languages)"), "true");
+        assert_eq!(evaluate("navigator.vendor"), "Google Inc.");
+        assert_eq!(evaluate("navigator.productSub"), "20030107");
     }
 }
 
@@ -2165,7 +2172,7 @@ mod messaging_tests {
             Arc::new(NullServices),
             Arc::new(crate::js::Stop::new()),
             Arc::new(tokio::sync::Notify::new()),
-            net::Identity::default(),
+            net::ValidIdentity::default(),
         )
     }
 

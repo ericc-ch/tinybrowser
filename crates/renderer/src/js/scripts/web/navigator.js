@@ -6,6 +6,10 @@
   const uaFullVersionList = Object.freeze(identity.fullVersionList.map((entry) => Object.freeze(entry)));
   const uaMobile = identity.mobile;
   const uaPlatform = identity.platform;
+  // `navigator.languages` is a FrozenArray of the identity's language list, in
+  // preference order, and `language` is its first tag
+  // https://html.spec.whatwg.org/multipage/system-state.html#dom-navigator-languages
+  const languages = Object.freeze(identity.languages.slice());
   // `uaFullVersion` reports the engine version, so the Chromium brand wins; an
   // identity without one falls back to its last brand rather than to nothing
   // https://wicg.github.io/ua-client-hints/#getHighEntropyValues
@@ -102,12 +106,12 @@
     get appCodeName() { return 'Mozilla'; }
     get appName() { return 'Netscape'; }
     get product() { return 'Gecko'; }
-    get productSub() { return '20030107'; }
-    get vendor() { return 'Google Inc.'; }
+    get productSub() { return identity.productSub; }
+    get vendor() { return identity.vendor; }
     get vendorSub() { return ''; }
     get platform() { return identity.navigatorPlatform; }
-    get language() { return 'en-US'; }
-    get languages() { return Object.freeze(['en-US', 'en']); }
+    get language() { return languages[0]; }
+    get languages() { return languages; }
     get onLine() { return true; }
     get hardwareConcurrency() { return 1; }
     get maxTouchPoints() { return 0; }

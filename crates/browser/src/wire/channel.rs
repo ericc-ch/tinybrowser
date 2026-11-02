@@ -672,17 +672,18 @@ mod tests {
     /// (<https://wicg.github.io/ua-client-hints/#http-ua-hints>).
     #[test]
     fn a_handshake_carries_the_browser_identity() {
-        let identity = net::Identity {
+        let identity = net::ValidIdentity::try_from(net::Identity {
             user_agent: net::UserAgent::parse("probe/1").expect("user agent"),
             brands: vec![net::Brand {
                 brand: "Probe".to_owned(),
                 version: "7".to_owned(),
             }],
             ..net::Identity::default()
-        };
+        })
+        .expect("identity");
         let message: crate::wire::ToRenderer =
             crate::exchange::Frame::Notify(crate::wire::HostNotice::Hello {
-                identity: identity.clone(),
+                identity: Box::new(identity.clone()),
             });
         let mut bytes = Vec::new();
         write_control(&mut bytes, &message).expect("write");
@@ -694,7 +695,7 @@ mod tests {
         else {
             panic!("expected a handshake");
         };
-        assert_eq!(back, identity);
+        assert_eq!(*back, identity);
     }
 
     #[test]

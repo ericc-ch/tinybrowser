@@ -10,6 +10,11 @@
   delete host.__tbIntlFormatNumber;
   delete host.__tbIntlFormatDateTime;
 
+  // The first language of the identity is the default locale, so `Intl`
+  // resolves to the same locale `navigator.language` reports when the caller
+  // asks for nothing and nothing matches.
+  const defaultLocale = host.__tbIdentity().languages[0];
+
   const call = Function.prototype.call.bind(Function.prototype.call);
   const objectConstructor = Object;
   const objectCreate = Object.create;
@@ -95,7 +100,7 @@
       const resolved = nativeResolveLocale(requested[index]);
       if (resolved) return resolved;
     }
-    return 'en-US';
+    return defaultLocale;
   }
 
   // https://402.ecma-international.org/#sec-supportedlocales

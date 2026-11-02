@@ -305,10 +305,11 @@ async fn request_shaping_custom_method_fragments_and_rejections_are_wire_visible
 
     let server = scripted([b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec()]);
     let agent = Agent::new(AgentOptions {
-        identity: net::Identity {
+        identity: net::ValidIdentity::try_from(net::Identity {
             user_agent: net::UserAgent::from_static("builder/default"),
             ..net::Identity::default()
-        },
+        })
+        .expect("identity"),
         ..AgentOptions::default()
     });
     let mut request = Request::new(Method::POST, server.url("/shape#fragment"));
@@ -1148,10 +1149,11 @@ async fn a_no_cors_manual_request_is_refused_before_sending() {
 #[tokio::test]
 async fn a_trustworthy_hop_carries_the_identity_and_its_hints() {
     let server = scripted([canned_ok(&[], b"")]);
-    let identity = net::Identity {
+    let identity = net::ValidIdentity::try_from(net::Identity {
         user_agent: net::UserAgent::parse("probe/1").expect("user agent"),
         ..net::Identity::default()
-    };
+    })
+    .expect("identity");
     let agent = Agent::new(AgentOptions {
         identity: identity.clone(),
         ..AgentOptions::default()
@@ -1178,6 +1180,11 @@ async fn a_trustworthy_hop_carries_the_identity_and_its_hints() {
     assert_eq!(
         request.header("sec-ch-ua-platform"),
         Some(identity.sec_ch_ua_platform().as_str())
+    );
+    assert_eq!(
+        request.header("accept-language"),
+        Some("en-US,en;q=0.9"),
+        "the language list becomes one header with Chromium's q-values"
     );
     server.assert_clean();
 }
