@@ -36,6 +36,7 @@ struct Options {
     list: bool,
     limit: usize,
     offset: usize,
+    mark_crashed: Option<String>,
     virtual_time: bool,
 }
 
@@ -54,6 +55,32 @@ fn main() {
             options.root.display()
         );
         std::process::exit(2);
+    }
+    if let Some(id) = &options.mark_crashed {
+        let Some(path) = &options.cache else {
+            eprintln!("wpt-harness: --mark-crashed needs --cache");
+            exit(2);
+        };
+        let binary = match cache::binary_digest(Some(path)) {
+            Ok(binary) => binary,
+            Err(error) => {
+                eprintln!("wpt-harness: cannot hash the harness binary: {error}");
+                exit(2);
+            }
+        };
+        let mut stored = match Cache::load(path, &binary) {
+            Ok(cache) => cache,
+            Err(error) => {
+                eprintln!("wpt-harness: cannot read {}: {error}", path.display());
+                exit(2);
+            }
+        };
+        stored.mark_crashed(id, &options.root);
+        if let Err(error) = stored.save(path) {
+            eprintln!("wpt-harness: cannot write {}: {error}", path.display());
+            exit(2);
+        }
+        exit(0);
     }
     let cases = match suite::select(&options.root, &options.paths, options.offset, options.limit) {
         Ok(cases) => cases,
@@ -356,6 +383,7 @@ Runs WPT testharness and crashtest files in-process.
   --cache PATH      reuse unchanged verdicts from this cache file (and update it)
   --limit N         stop after N selected files
   --offset N        skip the first N selected files (shards)
+  --mark-crashed ID store an ERROR verdict for ID in --cache and exit
   --real-time       use the wall clock instead of the paused clock
   --verbose         print failing tests and the ten slowest files
   --list            print the selected files and exit
@@ -377,6 +405,7 @@ fn parse_args() -> Result<Options, String> {
         list: false,
         limit: usize::MAX,
         offset: 0,
+        mark_crashed: None,
         virtual_time: true,
     };
     let mut args = std::env::args().skip(1);
@@ -434,6 +463,12 @@ fn parse_args() -> Result<Options, String> {
                     .parse()
                     .map_err(|_| "--offset needs a number")?;
             }
+            "--mark-crashed" => {
+                options.mark_crashed = Some(
+                    args.next()
+                        .ok_or("--mark-crashed needs a test id")?,
+                );
+            }
             "--real-time" => options.virtual_time = false,
             "--verbose" => options.verbose = true,
             "--list" => options.list = true,
@@ -441,7 +476,7 @@ fn parse_args() -> Result<Options, String> {
             other => options.paths.push(other.trim_start_matches('/').to_owned()),
         }
     }
-    if options.paths.is_empty() {
+    if options.paths.is_empty() && options.mark_crashed.is_none() {
         return Err("pass at least one test path".into());
     }
     Ok(options)

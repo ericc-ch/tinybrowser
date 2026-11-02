@@ -182,6 +182,29 @@ impl Cache {
         );
     }
 
+    /// Writes an ERROR entry for a file that crashed the engine.
+    ///
+    /// The process that would have recorded the verdict is gone, so the
+    /// driver marks it here after isolating it. Later runs treat it as a
+    /// cached verdict instead of crashing again.
+    pub fn mark_crashed(&mut self, id: &str, root: &Path) {
+        let path = id.trim_start_matches('/').to_owned();
+        let inputs = vec![Input {
+            hash: digest(root, &path),
+            path,
+        }];
+        self.tests.insert(
+            id.to_owned(),
+            Entry {
+                kind: "testharness".into(),
+                status: "ERROR".into(),
+                message: Some("engine crashed in this file".into()),
+                subtests: Vec::new(),
+                inputs,
+            },
+        );
+    }
+
     /// Writes the cache file.
     ///
     /// # Errors

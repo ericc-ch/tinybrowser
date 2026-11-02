@@ -1959,12 +1959,15 @@ FAST_HARNESS_VALUE_FLAGS = {
 }
 
 
-def split_harness_args(argv: list[str]) -> tuple[list[str], list[str], Path | None, Path | None]:
-    """Separates paths, flags to forward, and the report/baseline paths."""
+def split_harness_args(
+    argv: list[str],
+) -> tuple[list[str], list[str], Path | None, Path | None, Path | None]:
+    """Separates paths, flags to forward, and report/baseline/cache paths."""
     paths: list[str] = []
     forward: list[str] = []
     report: Path | None = None
     baseline: Path | None = None
+    cache: Path | None = None
     index = 0
     while index < len(argv):
         arg = argv[index]
@@ -1974,6 +1977,11 @@ def split_harness_args(argv: list[str]) -> tuple[list[str], list[str], Path | No
             continue
         if arg == "--baseline":
             baseline = Path(argv[index + 1])
+            index += 2
+            continue
+        if arg == "--cache":
+            cache = Path(argv[index + 1])
+            forward.extend(argv[index : index + 2])
             index += 2
             continue
         if arg in FAST_HARNESS_VALUE_FLAGS:
@@ -1986,7 +1994,7 @@ def split_harness_args(argv: list[str]) -> tuple[list[str], list[str], Path | No
             continue
         paths.append(arg.removeprefix("/"))
         index += 1
-    return paths, forward, report, baseline
+    return paths, forward, report, baseline, cache
 
 
 def harness_selection(binary: Path, wpt: Path, paths: list[str]) -> list[str]:
@@ -2010,7 +2018,7 @@ def fast_harness_shards(
     binary: Path, wpt: Path, shard_size: int, argv: list[str]
 ) -> int:
     """Runs the selection in chunks and bisects any chunk that crashes."""
-    paths, forward, report, baseline = split_harness_args(argv)
+    paths, forward, report, baseline, cache = split_harness_args(argv)
     if baseline is not None:
         return die(
             "fast-harness",
@@ -2023,10 +2031,21 @@ def fast_harness_shards(
         return die("fast-harness", "no tests selected")
     with tempfile.TemporaryDirectory(prefix="wpt-harness-shards-") as scratch:
         scratch_path = Path(scratch)
-        reports = run_shard_range(
-            binary, wpt, paths, forward, ids, 0, len(ids), max(1, shard_size),
-            scratch_path, 1,
-        )
+        # A warm cache needs no sharding: nothing runs, so nothing can crash.
+        # Try one process first and only split when it dies.
+        reports: list[Path] = []
+        if cache is not None:
+            single = scratch_path / "single.json"
+            single_report = run_one_harness(
+                binary, wpt, paths, forward, single
+            )
+            if single_report is not None:
+                reports = [single_report]
+        if not reports:
+            reports = run_shard_range(
+                binary, wpt, paths, cache, forward, ids, 0, len(ids),
+                max(1, shard_size), scratch_path, 1,
+            )
         if not reports:
             return die("fast-harness", "no shard produced a report")
         loaded: list[tuple[Path, dict]] = []
@@ -2051,10 +2070,50 @@ def fast_harness_shards(
         return summarize_results(merged["results"])
 
 
+def run_one_harness(
+    binary: Path, wpt: Path, paths: list[str], forward: list[str], out: Path
+) -> Path | None:
+    """Runs the whole selection in one process; None means it died."""
+    command = [
+        str(binary),
+        "--wpt-root",
+        str(wpt),
+        *paths,
+        "--report",
+        str(out),
+        *forward,
+    ]
+    eprint("wpt: " + " ".join(command))
+    try:
+        code = subprocess.run(command, cwd=str(ROOT), check=False).returncode
+    except OSError as error:
+        eprint(f"wpt: fast-harness: cannot run {binary}: {error}")
+        return None
+    return out if code == 0 and out.exists() else None
+
+
+def mark_crashed(binary: Path, wpt: Path, cache: Path, test_id: str) -> None:
+    """Stores an ERROR verdict so a later run does not retry a known crash."""
+    command = [
+        str(binary),
+        "--wpt-root",
+        str(wpt),
+        "--cache",
+        str(cache),
+        "--mark-crashed",
+        "/" + test_id.lstrip("/"),
+    ]
+    try:
+        subprocess.run(command, cwd=str(ROOT), check=False)
+    except OSError as error:
+        eprint(f"wpt: fast-harness: cannot mark {test_id}: {error}")
+
+
 def run_shard_range(
     binary: Path,
     wpt: Path,
     paths: list[str],
+    cache: Path | None,
     forward: list[str],
     ids: list[str],
     offset: int,
@@ -2116,6 +2175,8 @@ def run_shard_range(
                 )
             )
             eprint(f"wpt: fast-harness: engine crashed on /{ids[offset]}")
+            if cache is not None:
+                mark_crashed(binary, wpt, cache, ids[offset])
             reports.append(broken)
             offset += 1
             continue
@@ -2123,14 +2184,14 @@ def run_shard_range(
         half = size // 2
         reports.extend(
             run_shard_range(
-                binary, wpt, paths, forward, ids, offset, half, shard_size,
-                scratch, depth + 1,
+                binary, wpt, paths, cache, forward, ids, offset, half,
+                shard_size, scratch, depth + 1,
             )
         )
         reports.extend(
             run_shard_range(
-                binary, wpt, paths, forward, ids, offset + half, size - half,
-                shard_size, scratch, depth + 1,
+                binary, wpt, paths, cache, forward, ids, offset + half,
+                size - half, shard_size, scratch, depth + 1,
             )
         )
         offset += size
@@ -2968,6 +3029,7 @@ def _selftest() -> None:
         ["--jobs", "8", "--cache", "c.json", "--verbose"],
         Path("r.json"),
         None,
+        Path("c.json"),
     )
     assert split_harness_args(["/dom/nodes", "--baseline", "b.json"])[0] == ["dom/nodes"]
 

@@ -150,6 +150,14 @@ impl Session {
                 (status, message, subtests)
             }
         };
+        let mut inputs = self.services.take_inputs();
+        // Every verdict depends on the file itself. Mounts record it already,
+        // but a skipped kind (reftest, testdriver) never mounts, and a WPT
+        // pin change to that file must still invalidate the stored SKIP.
+        let test_file = self.root.join(&case.relative);
+        if !inputs.contains(&test_file) {
+            inputs.push(test_file);
+        }
         Outcome {
             id: case.id(),
             kind: case.kind,
@@ -157,7 +165,7 @@ impl Session {
             message,
             subtests,
             duration: started.elapsed(),
-            inputs: self.services.take_inputs(),
+            inputs,
         }
     }
 
