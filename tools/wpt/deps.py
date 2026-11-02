@@ -165,6 +165,8 @@ def run_batch(
     )
     if run.returncode == 0 and raw.exists():
         sources = sources_for(binary, raw, tools, scratch)
+        # A raw profile is tens of megabytes; keep only a couple alive.
+        raw.unlink(missing_ok=True)
         return {f"/{relative}": sources for _, relative in batch}
     if len(batch) == 1:
         print(f"deps: /{batch[0][1]} produced no profile", file=sys.stderr)
