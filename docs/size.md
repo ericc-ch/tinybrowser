@@ -19,6 +19,7 @@ pass/unexp/timeout/crash counts, and a release smoke via
 | panic = "abort" + synchronous panic hook for diagnostics | 10.61 MiB |
 | postcard renderer IPC control payloads | 10.47 MiB |
 | current: shared interface installer funnel | **10.43 MiB** |
+| `publicsuffix` replaces the hand-rolled matcher, list refreshed (12,138,648 B) | 11.58 MiB |
 
 The generated bindings emitted the same six-line installer for all 90
 interfaces — look up the constructor the web shims created, take its prototype,
@@ -65,6 +66,12 @@ in a JS callback (see `docs/upstream.md`).
 
 ## Experiments measured flat (do not retry)
 
+- `psl` 2.1.246 (compiled-in suffix trie) instead of `publicsuffix` over the
+  text list: 12,131,240 → 12,652,664 B, **+521,424 B** for the same answers.
+  The text snapshot plus the crate's matcher costs 7,408 B (12,131,240 →
+  12,138,648 B), so the crate form wins by 0.50 MiB. `psl` would refresh with
+  `cargo update`, but the list is data and the matcher is the only code worth
+  sharing; `tools/update-public-suffix-list` owns the refresh instead.
 - Replacing `serde_json` in the protocol layer (`cdp`, `webdriver`, `server`).
   Measured in a standalone probe with the same flags (`opt-level = "z"`, fat
   LTO, `codegen-units = 1`, `panic = "abort"`), same workload, byte-identical

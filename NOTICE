@@ -46,9 +46,11 @@ Crates index: https://crates.io/crates/icu_provider
 ## Public Suffix List
 
 crates/cookies/src/public_suffix_list.dat — snapshot from
-https://publicsuffix.org/list/public_suffix_list.dat (retrieved 2026-08-27;
-see file header). Upstream terms: https://publicsuffix.org/list/
-(Mozilla Public License 2.0 for the list).
+https://publicsuffix.org/list/public_suffix_list.dat (retrieved 2026-11-02;
+refresh with `tools/update-public-suffix-list`). Read by the `publicsuffix`
+crate (MIT OR Apache-2.0, https://crates.io/crates/publicsuffix). Upstream
+terms: https://publicsuffix.org/list/ (Mozilla Public License 2.0 for the
+list).
 
 ## Test-only trees
 

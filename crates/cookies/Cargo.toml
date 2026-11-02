@@ -9,5 +9,6 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+publicsuffix = "2.3.0"
 secure-context = { workspace = true }
 url = "2"

@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Refreshes the vendored Public Suffix List. The cookie jar and the renderer
+# site lock both trust this snapshot, so a stale list is a correctness bug, not
+# just missed private suffixes. Run after checking upstream's changes:
+#
+#   tools/update-public-suffix-list
+#
+# Then rebuild and commit the regenerated file with the date in the header.
+set -euo pipefail
+
+list_url=https://publicsuffix.org/list/public_suffix_list.dat
+output=crates/cookies/src/public_suffix_list.dat
+
+workspace=$(git rev-parse --show-toplevel)
+cd "$workspace"
+
+source=$(curl --fail --silent --show-error "$list_url")
+retrieved=$(date -u +%Y-%m-%d)
+
+{
+    printf '// Public Suffix List snapshot from %s\n' "$list_url"
+    printf '// Retrieved %s. Comment lines stripped; section markers and rules kept.\n' "$retrieved"
+    # `publicsuffix` only reads rules after a section begins, and the upstream
+    # section markers are comment lines. They are part of the format, not
+    # documentation.
+    printf '%s\n' "$source" \
+        | awk '/^[[:space:]]*\/\// { if ($0 ~ /(BEGIN|END) (ICANN|PRIVATE) DOMAINS/) print; next } NF { print }'
+} > "$output"
+
+printf 'wrote %s (%s rules, retrieved %s)\n' \
+    "$output" "$(wc -l < "$output")" "$retrieved"

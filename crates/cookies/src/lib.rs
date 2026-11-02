@@ -12,10 +12,12 @@
 //! Behavior follows
 //! [draft-ietf-httpbis-rfc6265bis](https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use publicsuffix::Psl;
 
 use url::{Host, Origin, Url};
 
@@ -869,76 +871,34 @@ fn registrable_domain(host: &str) -> String {
         return host.to_owned();
     }
     let host = host.trim_matches('.');
-    let suffix = public_suffix(host);
-    let Some(prefix) = host.strip_suffix(suffix).and_then(|p| p.strip_suffix('.')) else {
-        return host.to_owned();
-    };
-    let label = prefix.rsplit('.').next().unwrap_or(prefix);
-    format!("{label}.{suffix}")
+    // A host with no registrable domain is its own site: a public suffix, or a
+    // single label. The cookie rules and the renderer lock both key on that
+    // answer, so the fallback is the host itself rather than nothing.
+    suffix_list()
+        .domain(host.as_bytes())
+        .and_then(|domain| std::str::from_utf8(domain.as_bytes()).ok())
+        .map_or_else(|| host.to_owned(), str::to_owned)
 }
 
 fn is_public_suffix(domain: &str) -> bool {
     let d = domain.trim_matches('.');
-    !d.is_empty() && public_suffix(d) == d
+    !d.is_empty()
+        && suffix_list()
+            .suffix(d.as_bytes())
+            .is_some_and(|suffix| suffix.as_bytes() == d.as_bytes())
 }
 
-struct SuffixList {
-    rules: HashSet<Box<str>>,
-    wildcards: HashSet<Box<str>>,
-    exceptions: HashSet<Box<str>>,
-}
-
-fn suffix_list() -> &'static SuffixList {
-    static LIST: OnceLock<SuffixList> = OnceLock::new();
+/// The vendored Public Suffix List, parsed once per process.
+///
+/// Refresh it with `tools/update-public-suffix-list`; a stale list would let
+/// two tenants of one private suffix share a site, a cookie jar, and a
+/// renderer (<https://publicsuffix.org/list/>).
+fn suffix_list() -> &'static publicsuffix::List {
+    static LIST: OnceLock<publicsuffix::List> = OnceLock::new();
     LIST.get_or_init(|| {
-        let mut rules = HashSet::new();
-        let mut wildcards = HashSet::new();
-        let mut exceptions = HashSet::new();
-        for raw in include_str!("public_suffix_list.dat").lines() {
-            let line = raw.trim();
-            if line.is_empty() || line.starts_with("//") {
-                continue;
-            }
-            let (set, body) = if let Some(rest) = line.strip_prefix('!') {
-                (&mut exceptions, rest)
-            } else if let Some(rest) = line.strip_prefix("*.") {
-                (&mut wildcards, rest)
-            } else {
-                (&mut rules, line)
-            };
-            if let Ok(Host::Domain(ascii)) = Host::parse(body) {
-                set.insert(Box::from(ascii));
-            }
-        }
-        SuffixList {
-            rules,
-            wildcards,
-            exceptions,
-        }
+        publicsuffix::List::from_bytes(include_bytes!("public_suffix_list.dat"))
+            .expect("the vendored public suffix list is valid")
     })
-}
-
-// https://github.com/publicsuffix/list/wiki/Format#formal-algorithm
-fn public_suffix(host: &str) -> &str {
-    let list = suffix_list();
-    let mut matched_rule = None;
-    let mut candidate = host;
-    loop {
-        let parent = candidate.split_once('.').map(|(_, rest)| rest);
-        if list.exceptions.contains(candidate) {
-            return parent.unwrap_or("");
-        }
-        if matched_rule.is_none()
-            && (list.rules.contains(candidate)
-                || parent.is_some_and(|parent| list.wildcards.contains(parent)))
-        {
-            matched_rule = Some(candidate);
-        }
-        match parent {
-            Some(parent) => candidate = parent,
-            None => return matched_rule.unwrap_or(candidate),
-        }
-    }
 }
 
 // https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#section-5.1.3
@@ -1301,6 +1261,26 @@ mod tests {
             jar.cookie_string(http(&url("https://b.www.ck/"), at(NOW))),
             "a=1"
         );
+    }
+
+    /// A private suffix (`surge.sh` and its neighbours) separates tenants, so
+    /// one tenant cannot plant a `Domain=` cookie on another. The list comes
+    /// from the `psl` crate, and this is the case the old snapshot missed.
+    #[test]
+    fn private_suffixes_name_separate_sites() {
+        for suffix in ["surge.sh", "cloud.run", "retool.app"] {
+            let tenant = url(&format!("https://a.{suffix}/"));
+            let expected = format!("https://a.{suffix}");
+            assert_eq!(site(&tenant).as_deref(), Some(expected.as_str()));
+            let mut jar = CookieJar::default();
+            assert!(
+                !jar.store(
+                    &format!("sid=attacker; Domain={suffix}"),
+                    http(&tenant, at(NOW))
+                ),
+                "{suffix} is a public suffix"
+            );
+        }
     }
 
     /// The origin form agrees with the URL form, including the tuple fields a
