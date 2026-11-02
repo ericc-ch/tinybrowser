@@ -72,6 +72,12 @@ shards) took ~322 s of shard wall with 5 crashing files isolated, and
 files) is 45 s cold and 0.6 s warm, 325/325 matched. The nightly report
 gives 8,140 s of per-test time for those three slices together.
 
+A warm cache needs no sharding, so the driver tries one process first and
+only splits when it dies: html/ warm is 1.2 s at 16 jobs (3 s through the
+driver) against those 7,206 s. A file that aborts the engine cannot record
+its own verdict, so the driver marks it with `--mark-crashed` and later runs
+read it as an ordinary cached ERROR instead of bisecting again.
+
 Known gap: an async listener that leaves a host object borrowed makes
 rquickjs panic with `AlreadyBorrowed` in `Class::borrow_mut`; rquickjs
 converts that panic into a script exception, so the run still finishes and
