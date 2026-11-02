@@ -838,7 +838,6 @@ impl Tab {
         self.ensure_renderer(site).await?;
         self.pending_mount = None;
         self.document_loaded = false;
-        let document_url = mount.head.url.clone();
         let result = self
             .renderer
             .as_ref()
@@ -848,8 +847,6 @@ impl Tab {
             .and_then(reply_unit);
         if result.is_err() {
             self.drop_renderer();
-        } else {
-            self.record_committed_origin(&document_url);
         }
         result
     }
@@ -863,7 +860,6 @@ impl Tab {
         self.ensure_renderer(site).await?;
         self.pending_mount = None;
         self.document_loaded = false;
-        let document_url = mount.head.url.clone();
         let renderer = self.renderer.as_ref().ok_or(TabError::ActorStopped)?;
         let stream = renderer.start_response(FrameId::MAIN, &mount).await?;
         let mut received = 0usize;
@@ -900,17 +896,8 @@ impl Tab {
         let result = stream.finish().await.and_then(reply_unit);
         if result.is_err() {
             self.drop_renderer();
-        } else {
-            self.record_committed_origin(&document_url);
         }
         result
-    }
-
-    /// Records the browser-owned origin of the document the renderer mounted.
-    fn record_committed_origin(&self, url: &Url) {
-        if let Some(renderer) = self.renderer.as_ref() {
-            renderer.set_committed_origin(url.origin());
-        }
     }
 
     fn drop_renderer(&mut self) {
@@ -1194,10 +1181,6 @@ impl Tab {
             BrowserEvent::Navigated { url } => {
                 if let Ok(url) = Url::parse(url) {
                     self.history.navigate(url.clone(), None);
-                    // The committed origin is an authorization input; record it
-                    // from the navigated URL, as a browser-initiated mount does
-                    // (<https://html.spec.whatwg.org/multipage/browsers.html#concept-origin>).
-                    self.record_committed_origin(&url);
                     self.document_url = url;
                 }
                 self.document_loaded = false;

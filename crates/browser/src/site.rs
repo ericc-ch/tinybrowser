@@ -48,6 +48,31 @@ impl Site {
         Url::parse(spec).ok().filter(|url| self.allows(url))
     }
 
+    /// Whether a renderer-supplied origin string names an origin inside this
+    /// lock.
+    ///
+    /// The renderer hosts every same-site frame, and a frame's origin differs
+    /// from the top-level document's while staying inside the lock:
+    /// `https://ads.example.test` inside `https://www.example.test`, or one
+    /// host on another port (`site` ignores the port). The lock is the trust
+    /// boundary — one renderer process is one authority — and it is the same
+    /// bound `postMessage` and `BroadcastChannel` apply. Recording per-frame
+    /// origins would not narrow it: the browser would learn them from the
+    /// process it is checking, and every frame in that process is the same
+    /// trust unit
+    /// (<https://chromium.googlesource.com/chromium/src/+/main/docs/process_model_and_site_isolation.md#process-locks>).
+    ///
+    /// An opaque claim names no origin data: it has no storage keyed by a
+    /// tuple, and `"null"` is shared by every opaque document
+    /// (<https://html.spec.whatwg.org/multipage/browsers.html#serialized-origins>).
+    #[must_use]
+    pub(crate) fn authorizes_origin_claim(&self, spec: &str) -> bool {
+        match renderer::SerializedOrigin::parse(spec) {
+            Some(renderer::SerializedOrigin::Tuple(origin)) => self.allows_origin(&origin),
+            Some(renderer::SerializedOrigin::Opaque) | None => false,
+        }
+    }
+
     /// Whether one message's claimed sender origin belongs in a renderer locked
     /// to this site.
     ///
@@ -96,5 +121,34 @@ mod tests {
         assert!(opaque.allows(&Url::parse("about:blank").expect("url")));
         assert!(!opaque.allows(&Url::parse("file:///etc/passwd").expect("url")));
         assert!(!opaque.allows(&Url::parse("https://example.test/").expect("url")));
+    }
+
+    /// A renderer's origin claim is bounded by the site, not by the top-level
+    /// document's origin: every same-site frame lives in the same process, so
+    /// its own origin is a legitimate claim while another site's is not
+    /// (<https://chromium.googlesource.com/chromium/src/+/main/docs/process_model_and_site_isolation.md#process-locks>).
+    #[test]
+    fn a_same_site_frame_may_claim_its_own_origin() {
+        let locked =
+            Site::for_url(&Url::parse("https://www.example.test/").expect("url")).expect("site");
+        for allowed in [
+            "https://www.example.test",
+            "https://ads.example.test",
+            "https://example.test:8443",
+        ] {
+            assert!(locked.authorizes_origin_claim(allowed), "{allowed}");
+        }
+        for rejected in [
+            "https://other.test",
+            "http://ads.example.test",
+            "null",
+            "about:blank",
+            "garbage",
+        ] {
+            assert!(!locked.authorizes_origin_claim(rejected), "{rejected}");
+        }
+        let opaque = Site::opaque(TabId::new(7));
+        assert!(!opaque.authorizes_origin_claim("null"));
+        assert!(!opaque.authorizes_origin_claim("https://www.example.test"));
     }
 }

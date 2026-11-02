@@ -907,7 +907,7 @@ async fn route_window_call(
             origin,
             key,
         } => {
-            if !assignment.authorize_origin(&origin) {
+            if !assignment.site.authorizes_origin_claim(&origin) {
                 return Err(RendererViolation);
             }
             let target = TabId::new(window.get());
