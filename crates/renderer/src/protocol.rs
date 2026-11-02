@@ -1557,9 +1557,6 @@ mod request_policy_tests {
         }
     }
 
-    // One row per variant and per `crossorigin` state, which no smaller shape
-    // states as clearly.
-    #[allow(clippy::type_complexity, reason = "one row per policy state")]
     fn policy_table() -> [(RequestPolicy, RequestMode, CredentialsMode); 16] {
         let anonymous = Some(CrossOrigin::Anonymous);
         let credentials = Some(CrossOrigin::UseCredentials);

@@ -1616,7 +1616,7 @@ mod tests {
     /// authorized. The renderer's table is only a claim until this holds.
     #[test]
     // The table is the contract: one row per policy, readable in one place.
-    #[allow(clippy::too_many_lines, reason = "one table, one place")]
+    #[expect(clippy::too_many_lines, reason = "one table, one place")]
     fn every_policy_reaches_the_wire_with_its_own_parameters() {
         use net::cors::{CredentialsMode, RedirectMode, RequestMode};
 
