@@ -8,14 +8,6 @@ use crate::fixture::{Fixture, TestServer, ok};
 use base64::Engine as _;
 use serde_json::{Value, json};
 
-/// A self-signed P-256 certificate authority, valid 2020..2126. It only has to
-/// parse as a trust anchor: the test that uses it never dials TLS, and a
-/// backdated `notBefore` keeps it valid on any clock. Generated with
-/// `openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes`
-/// and `openssl x509 -req -not_before 20200101000000Z -extfile ca-ext.cnf`.
-const TEST_CA_PEM: &str = "\
------BEGIN CERTIFICATE-----\nMIIBgzCCASigAwIBAgIUSNx7VI4e5SLZuNEFo5kbWXRXyE8wCgYIKoZIzj0EAwIw\nHjEcMBoGA1UEAwwTdGlueWJyb3dzZXIgdGVzdCBDQTAgFw0yMDAxMDEwMDAwMDBa\nGA8yMTI2MTAwNDEyNTAzNlowHjEcMBoGA1UEAwwTdGlueWJyb3dzZXIgdGVzdCBD\nQTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABKU9fBtT1+UGeogoYQSLS6nG2tnj\nRw3do3csdFcOKLg/Fxdu2zNZ6jpf92433JR6aWOEFWicdvo49pc38f6so36jQjBA\nMA8GA1UdEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgKEMB0GA1UdDgQWBBSOZhVi\nNDBFj1qlDs94zVCIB+hc2zAKBggqhkjOPQQDAgNJADBGAiEAplMHuFG4TeQ8yb33\njaO5SVY/gz+vDtYABNvhXOk4uCoCIQDTaPHky5y2ASpqmjjgr9HMD5rS5BlDEFgI\nRIOQknuKug==\n-----END CERTIFICATE-----\n";
-
 fn start(extra_args: Vec<String>) -> (String, Fixture) {
     start_in(Fixture::new("tinybrowser-webdriver"), extra_args)
 }
@@ -69,13 +61,13 @@ fn request(addr: &str, method: &str, path: &str, body: Option<&str>) -> Value {
     panic!("webdriver not reachable: {last_error:?}");
 }
 
-/// The loopback HTTPS server identity: the same backdated P-256 certificate, with `IP:127.0.0.1` in its SAN.
-const TLS_SERVER_CERT_PEM: &str = "\
------BEGIN CERTIFICATE-----\nMIIBlDCCATqgAwIBAgIUU0WLSMuBxc90xf5bqrSoJ3BhfW4wCgYIKoZIzj0EAwIw\nFDESMBAGA1UEAwwJMTI3LjAuMC4xMCAXDTIwMDEwMTAwMDAwMFoYDzIxMjYxMDA0\nMTI1MDI2WjAUMRIwEAYDVQQDDAkxMjcuMC4wLjEwWTATBgcqhkjOPQIBBggqhkjO\nPQMBBwNCAARaU9LlsB9YYhjXs5HSIoylgAjx9GY8haKduRJhUaGe0xXXBx62Rf7X\nRCdAfnzL4svr8w4EgUe5iEbWNJTWNBdKo2gwZjAPBgNVHREECDAGhwR/AAABMA8G\nA1UdEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgKEMBMGA1UdJQQMMAoGCCsGAQUF\nBwMBMB0GA1UdDgQWBBSJt9gEngSo78Z1vt8HrZVBBps2LTAKBggqhkjOPQQDAgNI\nADBFAiAibmMFAzKrTOUYvmE1fHAGvzkU/Rh4hPHDZYQCc3iqowIhAO9S4q5/hvq7\nkoQ6Jyma3wsQ8tFsLRWZ34G9goS0nAyq\n-----END CERTIFICATE-----\n";
+/// The loopback HTTPS server identity: the same backdated P-256 certificate,
+/// with `IP:127.0.0.1` in its SAN, that the `net` crate's TLS test dials.
+const TLS_SERVER_CERT_PEM: &str = include_str!("../fixtures/tls/loopback-127.0.0.1.crt.pem");
 
-/// The key for [`TLS_SERVER_CERT_PEM`]. Test-only: it signs nothing but this fixture.
-const TLS_SERVER_KEY_PEM: &str = "\
------BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgiOq3Tq7nKzsvkH8R\nCv2ScQ1xyfEou4Fvhl0JLJDob3ihRANCAARaU9LlsB9YYhjXs5HSIoylgAjx9GY8\nhaKduRJhUaGe0xXXBx62Rf7XRCdAfnzL4svr8w4EgUe5iEbWNJTWNBdK\n-----END PRIVATE KEY-----\n";
+/// The key for [`TLS_SERVER_CERT_PEM`]. Test-only: it signs nothing but this
+/// fixture.
+const TLS_SERVER_KEY_PEM: &str = include_str!("../fixtures/tls/loopback-127.0.0.1.key.pem");
 
 /// One HTTPS loopback server whose page title says it was reached over TLS.
 ///
@@ -198,19 +190,6 @@ fn an_https_child_of_an_insecure_parent_is_not_a_secure_context() {
         );
         thread::sleep(Duration::from_millis(20));
     }
-}
-
-/// A readable `--tls-ca` is part of the network configuration, so the server
-/// starts with it. A refused flag and an unreadable file are covered next to
-/// the other usage errors in `modes`.
-#[test]
-fn a_valid_tls_ca_is_read_before_the_server_starts() {
-    let fixture = Fixture::new("tinybrowser-webdriver-tls-ca-valid");
-    let ca = fixture.data().join("test-ca.pem");
-    std::fs::write(&ca, TEST_CA_PEM).expect("write CA");
-    let (addr, _fixture) = start_in(fixture, vec![format!("--tls-ca={}", ca.display())]);
-    let status = request(&addr, "GET", "/status", None);
-    assert_eq!(status["value"]["ready"], json!(true), "{status}");
 }
 
 #[test]

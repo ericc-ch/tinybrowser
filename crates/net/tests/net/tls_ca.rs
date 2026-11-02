@@ -3,9 +3,10 @@
 //!
 //! The certificate is self-signed for `127.0.0.1`, so it is both the server's
 //! identity and the client's only trust anchor. Without the anchor the dial
-//! must be a TLS transport failure; with it the same dial must reach the
-//! request handler. That is the part a CLI test cannot see: it proves the
-//! parsed CA reaches the connector, not just that the file parses
+//! must fail as a TLS transport error; with it the same dial must reach the
+//! request handler. The CLI test in `tests/browser/webdriver.rs` proves the
+//! same through a whole browser, so what this adds is the exact failure kind,
+//! `NetError::Transport(TransportError::Tls(_))`, with no process in the way
 //! (<https://docs.rs/native-tls/latest/native_tls/struct.TlsConnector.html>).
 
 use std::io::{Read, Write};
@@ -15,29 +16,11 @@ use std::time::Duration;
 use native_tls::{Identity, TlsAcceptor};
 use net::{Agent, AgentOptions, Method, NetError, Request, TransportError, TrustedCa};
 
-/// A self-signed P-256 certificate for `127.0.0.1`, valid 2020..2126, with
-/// `CA:TRUE` and `keyCertSign` so it can verify itself as a chain of one.
-/// Generated with
-/// `openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes`
-/// and `openssl x509 -req -not_before 20200101000000Z -extfile ...`.
-const TLS_CERT_PEM: &str = "-----BEGIN CERTIFICATE-----
-MIIBlDCCATqgAwIBAgIUU0WLSMuBxc90xf5bqrSoJ3BhfW4wCgYIKoZIzj0EAwIw
-FDESMBAGA1UEAwwJMTI3LjAuMC4xMCAXDTIwMDEwMTAwMDAwMFoYDzIxMjYxMDA0
-MTI1MDI2WjAUMRIwEAYDVQQDDAkxMjcuMC4wLjEwWTATBgcqhkjOPQIBBggqhkjO
-PQMBBwNCAARaU9LlsB9YYhjXs5HSIoylgAjx9GY8haKduRJhUaGe0xXXBx62Rf7X
-RCdAfnzL4svr8w4EgUe5iEbWNJTWNBdKo2gwZjAPBgNVHREECDAGhwR/AAABMA8G
-A1UdEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgKEMBMGA1UdJQQMMAoGCCsGAQUF
-BwMBMB0GA1UdDgQWBBSJt9gEngSo78Z1vt8HrZVBBps2LTAKBggqhkjOPQQDAgNI
-ADBFAiAibmMFAzKrTOUYvmE1fHAGvzkU/Rh4hPHDZYQCc3iqowIhAO9S4q5/hvq7
-koQ6Jyma3wsQ8tFsLRWZ34G9goS0nAyq
------END CERTIFICATE-----";
-
-/// The key for [`TLS_CERT_PEM`]. Test-only: it signs nothing but this fixture.
-const TLS_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----
-MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgiOq3Tq7nKzsvkH8R
-Cv2ScQ1xyfEou4Fvhl0JLJDob3ihRANCAARaU9LlsB9YYhjXs5HSIoylgAjx9GY8
-haKduRJhUaGe0xXXBx62Rf7XRCdAfnzL4svr8w4EgUe5iEbWNJTWNBdK
------END PRIVATE KEY-----";
+/// The self-signed loopback identity the browser tests also dial
+/// (`tests/fixtures/tls/README.md` explains how to regenerate it).
+const TLS_CERT_PEM: &str =
+    include_str!("../../../../tests/fixtures/tls/loopback-127.0.0.1.crt.pem");
+const TLS_KEY_PEM: &str = include_str!("../../../../tests/fixtures/tls/loopback-127.0.0.1.key.pem");
 
 /// One HTTPS loopback server that serves `responses` completed requests.
 ///
