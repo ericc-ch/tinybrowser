@@ -35,6 +35,7 @@ struct Options {
     verbose: bool,
     list: bool,
     limit: usize,
+    offset: usize,
     virtual_time: bool,
 }
 
@@ -54,7 +55,7 @@ fn main() {
         );
         std::process::exit(2);
     }
-    let cases = match suite::select(&options.root, &options.paths, options.limit) {
+    let cases = match suite::select(&options.root, &options.paths, options.offset, options.limit) {
         Ok(cases) => cases,
         Err(error) => {
             eprintln!("wpt-harness: cannot read suite: {error}");
@@ -214,12 +215,42 @@ fn run_all(root: &std::path::Path, cases: &[TestCase], jobs: usize, virtual_time
                     let Some(case) = cases.get(index) else {
                         break;
                     };
+                    let started = Instant::now();
                     // One engine per file. Reusing one engine across a worker's
                     // files is faster, but a page can leave a `QuickJS` class
                     // cell borrowed, and the next mount then panics inside
                     // rquickjs. A file's own engine cannot see that state.
                     let mut session = engine::Session::new(root);
-                    let outcome = runtime.block_on(session.run(case, virtual_time));
+                    // Layout, paint, and the bindings can panic on a hostile
+                    // page. A panic is this file's ERROR, not the end of the
+                    // run; the engine that saw it is abandoned rather than
+                    // dropped, because dropping a half-torn heap can panic
+                    // again during unwinding.
+                    let Ok(outcome) = std::panic::catch_unwind(
+                        std::panic::AssertUnwindSafe(|| {
+                            runtime.block_on(session.run(case, virtual_time))
+                        }),
+                    ) else {
+                        Box::leak(Box::new(session));
+                        if sender
+                            .send((
+                                index,
+                                Outcome {
+                                    id: case.id(),
+                                    kind: case.kind,
+                                    status: engine::Status::Error,
+                                    message: Some("engine panicked".into()),
+                                    subtests: Vec::new(),
+                                    duration: started.elapsed(),
+                                    inputs: Vec::new(),
+                                },
+                            ))
+                            .is_err()
+                        {
+                            break;
+                        }
+                        continue;
+                    };
                     if sender.send((index, outcome)).is_err() {
                         break;
                     }
@@ -324,6 +355,7 @@ Runs WPT testharness and crashtest files in-process.
   --baseline PATH   compare with an earlier --report and exit 1 on regressions
   --cache PATH      reuse unchanged verdicts from this cache file (and update it)
   --limit N         stop after N selected files
+  --offset N        skip the first N selected files (shards)
   --real-time       use the wall clock instead of the paused clock
   --verbose         print failing tests and the ten slowest files
   --list            print the selected files and exit
@@ -344,6 +376,7 @@ fn parse_args() -> Result<Options, String> {
         verbose: false,
         list: false,
         limit: usize::MAX,
+        offset: 0,
         virtual_time: true,
     };
     let mut args = std::env::args().skip(1);
@@ -393,6 +426,13 @@ fn parse_args() -> Result<Options, String> {
                     .ok_or("--limit needs a number")?
                     .parse()
                     .map_err(|_| "--limit needs a number")?;
+            }
+            "--offset" => {
+                options.offset = args
+                    .next()
+                    .ok_or("--offset needs a number")?
+                    .parse()
+                    .map_err(|_| "--offset needs a number")?;
             }
             "--real-time" => options.virtual_time = false,
             "--verbose" => options.verbose = true,

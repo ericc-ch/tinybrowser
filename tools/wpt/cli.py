@@ -1900,6 +1900,11 @@ def fast_harness_main(options: Options, argv: list[str]) -> int:
     No WebDriver, wptserve, or renderer child. The WPT checkout is read-only;
     requests are served from these files, and the paused clock jumps over
     timer waits. Use `--report` and `--baseline` like `fast`.
+
+    `--shard-size N` runs the selection in N-file chunks, each in its own
+    process, so an engine abort costs that chunk instead of the run. A chunk
+    that exits non-zero is split in half until the crashing file is found,
+    which is recorded as ERROR.
     """
     wpt = resolve_wpt_root(options)
     if not (wpt / "wpt").is_file():
@@ -1911,12 +1916,224 @@ def fast_harness_main(options: Options, argv: list[str]) -> int:
     if check_pin(wpt, options) != 0:
         return 1
     binary = build_harness_binary()
-    command = [str(binary), "--wpt-root", str(wpt), *argv]
-    eprint("wpt: " + " ".join(command))
+    shard_size, argv = take_shard_size(argv)
+    if shard_size is None:
+        command = [str(binary), "--wpt-root", str(wpt), *argv]
+        eprint("wpt: " + " ".join(command))
+        try:
+            return subprocess.run(command, cwd=str(ROOT), check=False).returncode
+        except OSError as error:
+            return die("fast-harness", f"cannot run {binary}: {error}")
+    return fast_harness_shards(binary, wpt, shard_size, argv)
+
+
+def take_shard_size(argv: list[str]) -> tuple[int | None, list[str]]:
+    """Takes `--shard-size N` out of the arguments."""
+    rest: list[str] = []
+    size: int | None = None
+    index = 0
+    while index < len(argv):
+        if argv[index] == "--shard-size":
+            if index + 1 >= len(argv):
+                return None, argv
+            try:
+                size = int(argv[index + 1])
+            except ValueError:
+                return None, argv
+            index += 2
+            continue
+        rest.append(argv[index])
+        index += 1
+    return size, rest
+
+
+# Flags whose value is the next argument, for reading paths and passthrough.
+FAST_HARNESS_VALUE_FLAGS = {
+    "--wpt-root",
+    "--jobs",
+    "--report",
+    "--baseline",
+    "--cache",
+    "--limit",
+    "--offset",
+}
+
+
+def split_harness_args(argv: list[str]) -> tuple[list[str], list[str], Path | None, Path | None]:
+    """Separates paths, flags to forward, and the report/baseline paths."""
+    paths: list[str] = []
+    forward: list[str] = []
+    report: Path | None = None
+    baseline: Path | None = None
+    index = 0
+    while index < len(argv):
+        arg = argv[index]
+        if arg == "--report":
+            report = Path(argv[index + 1])
+            index += 2
+            continue
+        if arg == "--baseline":
+            baseline = Path(argv[index + 1])
+            index += 2
+            continue
+        if arg in FAST_HARNESS_VALUE_FLAGS:
+            forward.extend(argv[index : index + 2])
+            index += 2
+            continue
+        if arg.startswith("-"):
+            forward.append(arg)
+            index += 1
+            continue
+        paths.append(arg.removeprefix("/"))
+        index += 1
+    return paths, forward, report, baseline
+
+
+def harness_selection(binary: Path, wpt: Path, paths: list[str]) -> list[str]:
+    """The sorted wptreport ids the same selection would run."""
+    command = [str(binary), "--wpt-root", str(wpt), *paths, "--list"]
     try:
-        return subprocess.run(command, cwd=str(ROOT), check=False).returncode
+        result = subprocess.run(
+            command, cwd=str(ROOT), check=False, capture_output=True, text=True
+        )
     except OSError as error:
-        return die("fast-harness", f"cannot run {binary}: {error}")
+        die("fast-harness", f"cannot run {binary}: {error}")
+        return []
+    if result.returncode != 0:
+        eprint(result.stderr.rstrip())
+        die("fast-harness", "cannot list the selection")
+        return []
+    return [line.split("\t", 1)[1] for line in result.stdout.splitlines() if "\t" in line]
+
+
+def fast_harness_shards(
+    binary: Path, wpt: Path, shard_size: int, argv: list[str]
+) -> int:
+    """Runs the selection in chunks and bisects any chunk that crashes."""
+    paths, forward, report, baseline = split_harness_args(argv)
+    if baseline is not None:
+        return die(
+            "fast-harness",
+            "--shard-size does not take --baseline; merge the shard reports first",
+        )
+    if not paths:
+        return die("fast-harness", "--shard-size needs at least one test path")
+    ids = harness_selection(binary, wpt, paths)
+    if not ids:
+        return die("fast-harness", "no tests selected")
+    with tempfile.TemporaryDirectory(prefix="wpt-harness-shards-") as scratch:
+        scratch_path = Path(scratch)
+        reports = run_shard_range(
+            binary, wpt, paths, forward, ids, 0, len(ids), max(1, shard_size),
+            scratch_path, 1,
+        )
+        if not reports:
+            return die("fast-harness", "no shard produced a report")
+        loaded: list[tuple[Path, dict]] = []
+        for path in reports:
+            data, problem = load_report(path)
+            if data is None:
+                eprint(f"wpt: fast-harness: skipping {problem}")
+                continue
+            loaded.append((path, data))
+        merged, warnings, error = fold_reports(loaded)
+        for warning in warnings:
+            eprint(f"wpt: fast-harness: {warning}")
+        if error or merged is None:
+            return die("fast-harness", error or "no usable shard reports", 2)
+        if report is not None:
+            report.parent.mkdir(parents=True, exist_ok=True)
+            report.write_text(json.dumps(merged))
+            eprint(
+                f"wpt: fast-harness: {len(reports)} shards -> {report} "
+                f"({len(merged['results'])} results)"
+            )
+        return summarize_results(merged["results"])
+
+
+def run_shard_range(
+    binary: Path,
+    wpt: Path,
+    paths: list[str],
+    forward: list[str],
+    ids: list[str],
+    offset: int,
+    count: int,
+    shard_size: int,
+    scratch: Path,
+    depth: int,
+) -> list[Path]:
+    """Runs one slice; on a crash, halves it instead of losing the slice.
+
+    A slice of one file that still crashes records an ERROR for that file and
+    moves on, so one broken page cannot take the rest of the suite with it.
+    """
+    size = min(count, shard_size)
+    reports: list[Path] = []
+    end = offset + count
+    while offset < end:
+        size = min(size, end - offset)
+        tag = f"{offset}-{size}-d{depth}"
+        out = scratch / f"shard-{tag}.json"
+        command = [
+            str(binary),
+            "--wpt-root",
+            str(wpt),
+            *paths,
+            "--offset",
+            str(offset),
+            "--limit",
+            str(size),
+            "--report",
+            str(out),
+            *forward,
+        ]
+        eprint("wpt: " + " ".join(command))
+        try:
+            code = subprocess.run(command, cwd=str(ROOT), check=False).returncode
+        except OSError as error:
+            return die("fast-harness", f"cannot run {binary}: {error}")
+        if code == 0 and out.exists():
+            reports.append(out)
+            offset += size
+            continue
+        if size == 1:
+            broken = scratch / f"crashed-{offset}.json"
+            broken.write_text(
+                json.dumps(
+                    {
+                        "results": [
+                            {
+                                "test": "/" + ids[offset].lstrip("/"),
+                                "subsuite": "",
+                                "status": "ERROR",
+                                "message": "engine crashed in this file",
+                                "subtests": [],
+                            }
+                        ]
+                    }
+                )
+            )
+            eprint(f"wpt: fast-harness: engine crashed on /{ids[offset]}")
+            reports.append(broken)
+            offset += 1
+            continue
+        # Split and retry; keep the parent's remaining range for later.
+        half = size // 2
+        reports.extend(
+            run_shard_range(
+                binary, wpt, paths, forward, ids, offset, half, shard_size,
+                scratch, depth + 1,
+            )
+        )
+        reports.extend(
+            run_shard_range(
+                binary, wpt, paths, forward, ids, offset + half, size - half,
+                shard_size, scratch, depth + 1,
+            )
+        )
+        offset += size
+    return reports
 
 
 def manifest_main(options: Options, argv: list[str]) -> int:
@@ -2995,7 +3212,8 @@ TOP_HELP = """tinybrowser WPT harness: run | score | rerun | merge | profile | f
   fast-harness PATH... [--jobs N] [--report FILE] [--baseline FILE]
     Run WPT testharness and crashtest files in the engine process, with a
     paused clock. No WebDriver, wptserve, or renderer child. Reftests and
-    testdriver are not implemented yet.
+    testdriver are not implemented yet. --cache FILE reuses unchanged
+    verdicts; --shard-size N isolates an engine abort to one file.
   overnight [--save-report FILE] [--dry-run] [-- runner...]
     Full-suite run + score. Long; needs explicit approval per AGENTS.md.
   selftest

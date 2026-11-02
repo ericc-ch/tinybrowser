@@ -28,8 +28,11 @@ pub struct TestCase {
     pub relative: String,
     /// The executor to use.
     pub kind: Kind,
-    /// Source text, read once before workers start.
-    pub source: String,
+    /// Source bytes, read once before workers start.
+    ///
+    /// Bytes, not `String`: WPT files are not all UTF-8, and the response
+    /// charset tells the parser how to decode them.
+    pub source: Vec<u8>,
     /// Whether the file declares `<meta name=timeout content=long>`.
     pub long_timeout: bool,
 }
@@ -51,7 +54,12 @@ impl TestCase {
 /// # Errors
 ///
 /// A selected path, its directory, or a file cannot be read.
-pub fn select(root: &Path, paths: &[String], limit: usize) -> io::Result<Vec<TestCase>> {
+pub fn select(
+    root: &Path,
+    paths: &[String],
+    offset: usize,
+    limit: usize,
+) -> io::Result<Vec<TestCase>> {
     let mut files = Vec::new();
     for path in paths {
         let target = root.join(path);
@@ -68,12 +76,16 @@ pub fn select(root: &Path, paths: &[String], limit: usize) -> io::Result<Vec<Tes
     }
     files.sort();
     files.dedup();
-    files.truncate(limit);
+    // A shard runs one contiguous slice of the sorted selection; the driver
+    // can shrink a slice that crashes the engine without changing what the
+    // slice means.
+    let files: Vec<String> = files.into_iter().skip(offset).take(limit).collect();
     let mut cases = Vec::with_capacity(files.len());
     for relative in files {
-        let source = fs::read_to_string(root.join(&relative))?;
-        let kind = classify(&source);
-        let long_timeout = declares_long_timeout(&source);
+        let source = fs::read(root.join(&relative))?;
+        let text = String::from_utf8_lossy(&source);
+        let kind = classify(&text);
+        let long_timeout = declares_long_timeout(&text);
         cases.push(TestCase {
             relative,
             kind,

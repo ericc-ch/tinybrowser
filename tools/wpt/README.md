@@ -58,6 +58,16 @@ changes. On dom/nodes/ (100 files) a cold run is ~6 s at 8 jobs; a warm run is
 `interrupted` when the engine cuts a script short, and the runner gives each
 file one drain with its whole budget instead of a short slice.
 
+`--shard-size N` (in cli.py) runs the sorted selection in N-file processes.
+Each shard is a separate `--offset`/`--limit` slice, so an engine abort costs
+one shard instead of the run; a shard that exits non-zero is bisected until
+the single crashing file is found, and that file is recorded as ERROR. Use it
+for directories where layout or paint can panic (html/ currently does): a
+panic in-process bypasses the harness's per-file error framing, and unwinding
+a half-torn engine can abort outright. dom/ needs no sharding and runs 692
+files in ~25 s at 16 jobs, with 557/557 file verdicts matching the nightly
+report and 93 files skipped (testdriver/reftest).
+
 Known gap: an async listener that leaves a host object borrowed makes
 rquickjs panic with `AlreadyBorrowed` in `Class::borrow_mut`; rquickjs
 converts that panic into a script exception, so the run still finishes and

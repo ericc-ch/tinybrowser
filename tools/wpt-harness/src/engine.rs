@@ -180,7 +180,7 @@ impl Session {
             .mount_bounded(
                 &Mount {
                     head,
-                    body: case.source.as_bytes().to_vec(),
+                    body: case.source.clone(),
                 },
                 deadline.saturating_duration_since(Instant::now()),
             )
