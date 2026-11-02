@@ -2954,6 +2954,23 @@ def _selftest() -> None:
     assert parse_merge_argv(["a.json", "b.json", "--out"])[3] is not None
     assert parse_merge_argv(["a.json", "b.json", "--total-chunks", "2"])[3] is not None
 
+    # fast-harness sharding: the flag is ours, not the Rust runner's.
+    assert take_shard_size(["dom", "--shard-size", "50", "--jobs", "8"]) == (
+        50,
+        ["dom", "--jobs", "8"],
+    )
+    assert take_shard_size(["dom"]) == (None, ["dom"])
+    assert take_shard_size(["dom", "--shard-size"]) == (None, ["dom", "--shard-size"])
+    assert split_harness_args(
+        ["dom", "--jobs", "8", "--report", "r.json", "--cache", "c.json", "--verbose"]
+    ) == (
+        ["dom"],
+        ["--jobs", "8", "--cache", "c.json", "--verbose"],
+        Path("r.json"),
+        None,
+    )
+    assert split_harness_args(["/dom/nodes", "--baseline", "b.json"])[0] == ["dom/nodes"]
+
     _selftest_profile()
     _selftest_failures()
     _selftest_baseline()
