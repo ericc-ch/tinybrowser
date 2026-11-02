@@ -21,9 +21,10 @@ members = [
     "crates/wasm",
     "crates/webdriver",
     "crates/webidl-bindgen",
-    # Developer tooling: the native test262 lane. Never a release
-    # dependency.
+    # Developer tooling: the native test262 lane and the in-process
+    # testharness lane. Never a release dependency.
     "tools/wpt-fast",
+    "tools/wpt-harness",
 ]
 
 [workspace.package]

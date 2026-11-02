@@ -13,6 +13,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 
 use tokio::sync::Notify;
@@ -56,6 +57,11 @@ pub(crate) struct DialLedger {
     /// completion task runs, so cancellation can still find adopted work.
     in_flight: HashMap<DialId, InFlightDial>,
     next_id: DialId,
+    /// Completions sent but not yet adopted. Incremented before the send and
+    /// decremented in [`DialLedger::adopt`], so a host that asks whether the
+    /// document owes work never sleeps while a completion waits in the
+    /// channel.
+    pending: Arc<AtomicUsize>,
     /// A frame that is shutting down drops completions instead of waking the
     /// session for work nobody will run.
     stop: Arc<Stop>,
@@ -72,6 +78,7 @@ impl DialLedger {
             queued: VecDeque::new(),
             in_flight: HashMap::new(),
             next_id: DialId::default(),
+            pending: Arc::new(AtomicUsize::new(0)),
             stop,
             wake,
         }
@@ -91,8 +98,14 @@ impl DialLedger {
         self.queued.pop_front()
     }
 
+    /// Whether the document owes dial work: an unstarted dial, or a completion
+    /// that was sent and has not been adopted yet.
+    ///
+    /// A host that waits on this must not call it "nothing to do" while a
+    /// completion sits in the channel; the document cannot make progress
+    /// without running its completion task.
     pub(crate) fn has_queued(&self) -> bool {
-        !self.queued.is_empty()
+        !self.queued.is_empty() || self.pending.load(Ordering::Acquire) > 0
     }
 
     /// Starts one network dial and files its cancellation and delay.
@@ -106,6 +119,7 @@ impl DialLedger {
         let completed = self.tx.clone();
         let wake = Arc::clone(&self.wake);
         let stop = Arc::clone(&self.stop);
+        let pending = Arc::clone(&self.pending);
         let context = dial.context;
         let request = dial.req.clone();
         let cancel = start(
@@ -115,8 +129,13 @@ impl DialLedger {
                     return;
                 }
                 let result = super::dial::complete(dial, outcome);
+                // Count before the send so an adopt on another thread never
+                // observes the message and decrements first.
+                pending.fetch_add(1, Ordering::AcqRel);
                 if completed.send((id, result)).is_ok() {
                     wake.notify_one();
+                } else {
+                    pending.fetch_sub(1, Ordering::AcqRel);
                 }
             }),
         );
@@ -136,6 +155,7 @@ impl DialLedger {
     pub(crate) fn adopt(&mut self) -> AdoptedDials {
         let mut adopted = AdoptedDials::default();
         while let Ok((id, completed)) = self.rx.try_recv() {
+            self.pending.fetch_sub(1, Ordering::AcqRel);
             if !self.in_flight.contains_key(&id) {
                 // The dial was cancelled after it finished, so no task will
                 // read this response

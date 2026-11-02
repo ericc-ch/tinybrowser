@@ -45,7 +45,24 @@ impl EmbeddedRenderer {
     /// The engine rejected the mount.
     pub fn mount(&mut self, mount: &Mount) -> Result<(), TabError> {
         self.engine.mount_frame(FrameId::MAIN, mount)?;
-        self.drain_until(std::time::Instant::now() + crate::TURN_SCRIPT_BUDGET);
+        let _yielded =
+            self.drain_until(std::time::Instant::now() + crate::TURN_SCRIPT_BUDGET);
+        Ok(())
+    }
+
+    /// Mounts with a caller-chosen script budget instead of the engine's
+    /// 45-second turn.
+    ///
+    /// A host that enforces a shorter test timeout uses this so one runaway
+    /// script cannot spend the whole harness budget before the host checks
+    /// it.
+    ///
+    /// # Errors
+    ///
+    /// The engine rejected the mount.
+    pub fn mount_bounded(&mut self, mount: &Mount, budget: Duration) -> Result<(), TabError> {
+        self.engine.mount_frame(FrameId::MAIN, mount)?;
+        let _yielded = self.drain_until(std::time::Instant::now() + budget);
         Ok(())
     }
 
@@ -85,7 +102,8 @@ impl EmbeddedRenderer {
     ///
     /// [`Engine::drain_ready_until`] returns true only after `deadline` has
     /// passed, so one call spends the budget.
-    fn drain_until(&mut self, deadline: std::time::Instant) -> bool {
+    #[must_use]
+    pub fn drain_until(&mut self, deadline: std::time::Instant) -> bool {
         let yielded = self.engine.drain_ready_until(deadline);
         self.ready_queued = yielded;
         yielded
@@ -102,12 +120,11 @@ impl EmbeddedRenderer {
 
     /// Duration until the next page timer is ready.
     ///
-    /// `Some(0)` when the last drain left ready work queued. Fired timers
-    /// are not a deadline, and a host that waited on `None` would never
-    /// run them.
+    /// `Some(0)` when ready work is queued. Fired timers are not a deadline,
+    /// and a host that waited on `None` would never run them.
     #[must_use]
     pub fn time_until_deadline(&self) -> Option<Duration> {
-        if self.ready_queued {
+        if self.ready_queued || self.engine.has_ready_work() {
             return Some(Duration::ZERO);
         }
         self.engine

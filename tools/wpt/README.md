@@ -37,6 +37,34 @@ loader; import attributes (JSON/text) and `$262.agent` are not implemented
 yet. On this machine the 53,640 test262 files take ~27 s wall across 12 jobs
 (~2m25s CPU) versus 20,587 s in the harness.
 
+`fast-harness` is the in-process testharness/crashtest lane: each file is
+mounted in the real engine in the harness process, with no WebDriver,
+wptserve, or renderer child. Requests are served from the checkout, the
+only replaced resource is `/resources/testharnessreport.js` (a small
+reporter the host polls), and a paused Tokio clock jumps over timer waits,
+so a hung file costs its harness budget instead of a browser round trip.
+Budgets match upstream: 5 s, or 7 s for `<meta name=timeout content=long>`.
+Reftests and testdriver files are selected but skipped: `testdriver.js`
+needs a WebDriver session, and screenshot comparison is not implemented.
+
+    nix develop --command python3 tools/wpt/cli.py fast-harness dom/nodes --jobs 8
+
+`--cache FILE` keeps verdicts keyed by the harness binary plus the SHA-256 of
+every file a test read, so an unchanged file is reused without running it.
+The digest of the `wpt` binary (hundreds of MB with debug info) is remembered
+in `FILE.binary` and refreshed when the executable's path, size, or mtime
+changes. On dom/nodes/ (100 files) a cold run is ~6 s at 8 jobs; a warm run is
+~15 ms. A truncated file is never cached as a verdict: testharness reports
+`interrupted` when the engine cuts a script short, and the runner gives each
+file one drain with its whole budget instead of a short slice.
+
+Known gap: a few files leave a generated binding's `Persistent` reachable at
+realm teardown, and QuickJS aborts in `JS_FreeRuntime` when that engine is
+dropped (reproduced by `dom/ranges/crashtests/Range-setEnd-to-node-removed-by-extractContents.html`,
+whose `CSS.highlights` registry is a maplike). The process then dies after
+the results it already collected. This is an engine lifecycle bug, not a
+harness one; until it is fixed, treat a non-zero exit as a truncated run.
+
 A conformance change is a failure-list diff: failures prints the
 canonical list of a --score log, baseline runs both sides in a detached
 worktree (exit 1 on new failures). Metadata-expected TIMEOUTs:
