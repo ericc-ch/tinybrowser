@@ -2,110 +2,101 @@
 //! window-open steps need it
 //! (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#concept-window-open-features-tokenize>).
 //!
-//! One parser here replaces the page shim's own comma split and the browser's
-//! whitespace split, which disagreed: `noopener=1` was true in the shim and
-//! false in the browser, and `noopener noreferrer` was the other way round.
+//! The parser reads the list once for the whole open: the page shim no longer
+//! splits it, so there is one grammar and one answer. The comma split the shim
+//! used to run and the whitespace split the browser ran disagreed on
+//! `noopener=1` and `noopener noreferrer`.
+//!
+//! Only `noopener` and `noreferrer` are read today, and both are booleans, so
+//! the tokenized map is two flags whose last value wins. A feature the window
+//! open steps never ask about — a size, `popup` — is tokenized and dropped; add
+//! its storage when something reads it.
 
 use crate::protocol::OpenerPolicy;
 
 /// A feature separator: ASCII whitespace, U+003D, or U+002C
 /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dfn-feature-separator>).
-fn is_separator(character: char) -> bool {
-    character.is_ascii_whitespace() || character == '=' || character == ','
-}
-
-/// One feature name, normalized to the names the platform reads: `left`,
-/// `top`, `width`, and `height`
-/// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#normalize-the-feature-name>).
-fn normalize(name: &str) -> &str {
-    match name {
-        "screenx" => "left",
-        "screeny" => "top",
-        "innerwidth" => "width",
-        "innerheight" => "height",
-        other => other,
-    }
+fn is_separator(byte: u8) -> bool {
+    byte.is_ascii_whitespace() || byte == b'=' || byte == b','
 }
 
 /// A boolean feature's value: absent or empty is true, `yes` and `true` are
 /// true, and anything else is true only when its integer form is non-zero
 /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#parse-a-boolean-feature>).
+///
+/// The feature tokenizer lowercases every value, so the words are matched
+/// without case. An integer wider than any integer type still parses: one
+/// non-zero digit decides it.
 fn parse_boolean(value: &str) -> bool {
-    match value {
-        "" | "yes" | "true" => true,
-        other => {
-            let rest = other.trim_start_matches(|character: char| character.is_ascii_whitespace());
-            let digits = rest
-                .strip_prefix(['+', '-'])
-                .unwrap_or(rest)
-                .trim_start_matches(|character: char| character.is_ascii_whitespace());
-            let digits: String = digits.chars().take_while(char::is_ascii_digit).collect();
-            // Any non-zero digit makes the integer non-zero, whatever its
-            // width, so a value too long for an integer type still parses.
-            digits.bytes().any(|digit| digit != b'0')
-        }
+    if value.is_empty() || value.eq_ignore_ascii_case("yes") || value.eq_ignore_ascii_case("true") {
+        return true;
     }
+    let digits = value.trim_start_matches(|character: char| character.is_ascii_whitespace());
+    let digits = digits.strip_prefix(['+', '-']).unwrap_or(digits);
+    digits
+        .bytes()
+        .take_while(u8::is_ascii_digit)
+        .any(|digit| digit != b'0')
 }
 
-/// The tokenized `features` argument: every `name=value` pair the caller gave,
-/// with a repeated name keeping its first position and its last value.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct WindowFeatures(Vec<(String, String)>);
+/// The `noopener` and `noreferrer` features, keeping the last value a repeated
+/// name gives them
+/// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#tokenize-the-features-argument>).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct WindowFeatures {
+    noopener: bool,
+    noreferrer: bool,
+}
 
 impl WindowFeatures {
     /// Tokenizes one `features` argument
     /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#tokenize-the-features-argument>).
     pub(crate) fn parse(features: &str) -> Self {
-        let characters: Vec<char> = features.chars().collect();
-        let mut pairs: Vec<(String, String)> = Vec::new();
+        let mut parsed = Self::default();
+        // Every separator is ASCII, so byte positions are character
+        // boundaries and the slices below are always valid UTF-8.
+        let bytes = features.as_bytes();
         let mut position = 0;
-        while position < characters.len() {
-            while position < characters.len() && is_separator(characters[position]) {
+        while position < bytes.len() {
+            while position < bytes.len() && is_separator(bytes[position]) {
                 position += 1;
             }
-            let mut name = String::new();
-            while position < characters.len() && !is_separator(characters[position]) {
-                name.push(characters[position].to_ascii_lowercase());
+            let name_start = position;
+            while position < bytes.len() && !is_separator(bytes[position]) {
                 position += 1;
             }
-            let name = normalize(&name).to_owned();
+            let name = &features[name_start..position];
             // Skip to the first `=` but never past a `,` or a name character.
-            while position < characters.len() && characters[position] != '=' {
-                if characters[position] == ',' || !is_separator(characters[position]) {
+            while position < bytes.len() && bytes[position] != b'=' {
+                if bytes[position] == b',' || !is_separator(bytes[position]) {
                     break;
                 }
                 position += 1;
             }
-            let mut value = String::new();
-            if position < characters.len() && is_separator(characters[position]) {
-                while position < characters.len() && is_separator(characters[position]) {
-                    if characters[position] == ',' {
+            let mut value = "";
+            if position < bytes.len() && is_separator(bytes[position]) {
+                while position < bytes.len() && is_separator(bytes[position]) {
+                    if bytes[position] == b',' {
                         break;
                     }
                     position += 1;
                 }
-                while position < characters.len() && !is_separator(characters[position]) {
-                    value.push(characters[position].to_ascii_lowercase());
+                let value_start = position;
+                while position < bytes.len() && !is_separator(bytes[position]) {
                     position += 1;
                 }
+                value = &features[value_start..position];
             }
             if name.is_empty() {
                 continue;
             }
-            match pairs.iter_mut().find(|(existing, _)| *existing == name) {
-                Some(pair) => pair.1 = value,
-                None => pairs.push((name, value)),
+            if name.eq_ignore_ascii_case("noopener") {
+                parsed.noopener = parse_boolean(value);
+            } else if name.eq_ignore_ascii_case("noreferrer") {
+                parsed.noreferrer = parse_boolean(value);
             }
         }
-        Self(pairs)
-    }
-
-    /// Whether the argument names `name` as a true boolean feature.
-    fn boolean(&self, name: &str) -> bool {
-        self.0
-            .iter()
-            .find(|(existing, _)| existing == name)
-            .is_some_and(|(_, value)| parse_boolean(value))
+        parsed
     }
 
     /// What the parsed `noopener` and `noreferrer` features do to the context
@@ -121,15 +112,15 @@ impl WindowFeatures {
     /// origins being opaque is not same-site: an opaque blob can never be
     /// attributed to the top-level document's site.
     pub(crate) fn opener_policy(
-        &self,
+        self,
         blob_origin: Option<&url::Origin>,
         top_level_origin: &url::Origin,
     ) -> OpenerPolicy {
         let blob_severs =
             blob_origin.is_some_and(|origin| !net::origins_same_site(origin, top_level_origin));
-        if self.boolean("noreferrer") {
+        if self.noreferrer {
             OpenerPolicy::NoReferrer
-        } else if blob_severs || self.boolean("noopener") {
+        } else if blob_severs || self.noopener {
             OpenerPolicy::NoOpener
         } else {
             OpenerPolicy::Keep
@@ -167,6 +158,9 @@ mod tests {
         assert_eq!(policy("noopener=yes"), OpenerPolicy::NoOpener);
         assert_eq!(policy("noopener=0"), OpenerPolicy::Keep);
         assert_eq!(policy("noopener=false"), OpenerPolicy::Keep);
+        assert_eq!(policy("noopener=00x1"), OpenerPolicy::Keep);
+        assert_eq!(policy("noopener=x1"), OpenerPolicy::Keep);
+        assert_eq!(policy("noopener=-5"), OpenerPolicy::NoOpener);
         assert_eq!(policy("noopener noreferrer"), OpenerPolicy::NoReferrer);
         assert_eq!(policy("width=100 noopener"), OpenerPolicy::NoOpener);
         assert_eq!(policy("popup,noopener=1"), OpenerPolicy::NoOpener);
@@ -223,14 +217,5 @@ mod tests {
             WindowFeatures::parse("").opener_policy(Some(&top), &top),
             OpenerPolicy::Keep
         );
-    }
-
-    /// A name alias maps to the feature the platform reads, so `screenX` and
-    /// `left` are one entry
-    /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#normalize-the-feature-name>).
-    #[test]
-    fn a_feature_alias_is_the_same_entry() {
-        let features = WindowFeatures::parse("screenX=10,left=20");
-        assert_eq!(features, WindowFeatures(vec![("left".into(), "20".into())]));
     }
 }
