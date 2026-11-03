@@ -98,11 +98,36 @@ fn retarget_adopted_subtree(ctx: &Ctx<'_>, from: NodeId, to: NodeId) -> Result<(
                 if let Some(slot) = world.state.nonce_slots.remove(&from) {
                     world.state.nonce_slots.insert(to, slot);
                 }
+                if let Some(control) = world.state.controls.remove(&from) {
+                    world.state.controls.insert(to, control);
+                    // The exposed value is re-materialized from the adopted
+                    // snapshot, so an edit buffer from the old document no
+                    // longer describes it. Custom validity and the output
+                    // defaults are not edit state and travel with the node
+                    // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#the-constraint-validation-api>).
+                    if let Some(control) = world.state.controls.get_mut(&to) {
+                        control.clear_edit_position();
+                    }
+                }
             } else {
                 let slot = from_owner.borrow().state.nonce_slots.get(&from).cloned();
                 if let Some(slot) = slot {
                     from_owner.borrow_mut().state.nonce_slots.remove(&from);
                     to_owner.borrow_mut().state.nonce_slots.insert(to, slot);
+                }
+                let control = from_owner.borrow().state.controls.get(&from).cloned();
+                if let Some(control) = control {
+                    from_owner.borrow_mut().state.controls.remove(&from);
+                    let mut target = to_owner.borrow_mut();
+                    target.state.controls.insert(to, control);
+                    // The exposed value is re-materialized from the adopted
+                    // snapshot, so an edit buffer from the old document no
+                    // longer describes it. Custom validity and the output
+                    // defaults are not edit state and travel with the node
+                    // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#the-constraint-validation-api>).
+                    if let Some(control) = target.state.controls.get_mut(&to) {
+                        control.clear_edit_position();
+                    }
                 }
             }
         }

@@ -100,6 +100,31 @@ const TWO_CHECKED_RADIOS: &str = "(() => {
   return [form.querySelector('#a').checked, form.querySelector('#b').checked];
 })()";
 
+/// A canceled `reset` event leaves every control, including an `<output>` in
+/// value mode, untouched; an uncanceled reset restores the output's default
+/// and replaces its markup with text
+/// (<https://html.spec.whatwg.org/multipage/forms.html#concept-form-reset>,
+/// <https://html.spec.whatwg.org/multipage/form-elements.html#the-output-element>).
+const CANCELED_RESET: &str = "(() => {
+  const form = document.createElement('form');
+  form.innerHTML = '<output id=o>abc</output><output id=m><b>x</b></output>';
+  document.body.append(form);
+  const output = form.querySelector('#o');
+  const markup = form.querySelector('#m');
+  output.value = 'heya';
+  const cancel = event => event.preventDefault();
+  form.addEventListener('reset', cancel);
+  form.reset();
+  const canceled = [output.textContent, output.defaultValue];
+  form.removeEventListener('reset', cancel);
+  form.reset();
+  return [
+    canceled[0], canceled[1],
+    output.textContent, output.defaultValue,
+    markup.textContent, markup.childNodes.length, markup.firstChild.nodeType,
+  ];
+})()";
+
 #[test]
 fn control_state_follows_markup_insertion_and_activation() {
     let (listener, page) = server();
@@ -119,6 +144,13 @@ fn control_state_follows_markup_insertion_and_activation() {
 
     let state = evaluate(&mut client, &session, ACTIVATION_AND_RESET);
     assert_eq!(state, json!([false, false, true]));
+
+    let state = evaluate(&mut client, &session, CANCELED_RESET);
+    assert_eq!(
+        state,
+        json!(["heya", "abc", "abc", "abc", "x", 1, 3]),
+        "a canceled reset keeps the output, and an uncanceled reset restores it"
+    );
 
     let state = evaluate(&mut client, &session, CHECKED_BEFORE_LAYOUT);
     assert_eq!(state, json!([true, true, true, true]));

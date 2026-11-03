@@ -1296,13 +1296,73 @@ pub(crate) struct DocumentState {
     /// reports these as `sourceFile`, `lineNumber`, and `columnNumber`
     /// (<https://w3c.github.io/webappsec-csp/#create-violation-for-global>).
     pub(crate) creator_stacks: HashMap<NodeId, CreatorInfo>,
+    /// Per form-associated element state: the flags and edit buffers that are
+    /// neither content attributes nor part of Blitz's sanitized value slot.
+    /// They live here so every path that changes a control (a value set, a
+    /// type change, a reset) updates them together instead of leaving a JS
+    /// `WeakMap` behind.
+    ///
+    /// Entries deliberately outlive a node's removal: custom validity and a
+    /// user edit survive a temporary detach and reinsertion. Only document
+    /// teardown prunes them, so the bound is one entry per element that ever
+    /// used a form API in this document.
+    pub(crate) controls: HashMap<NodeId, ControlState>,
+}
+
+/// The mutable state of one form-associated element.
+///
+/// The value itself (and its dirty flag) stays in Blitz's sanitized slot; this
+/// is everything the validity and editing algorithms derive from or maintain
+/// beside it
+/// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#the-constraint-validation-api>).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ControlState {
+    /// The value was last changed by a user edit, so `maxlength`/`minlength`
+    /// apply.
+    pub(crate) user_edited: bool,
+    /// The value cannot be converted to its state's value.
+    pub(crate) bad_input: bool,
+    /// The message from `setCustomValidity`, as UTF-16 units so a lone
+    /// surrogate survives the round trip through `validationMessage`.
+    pub(crate) custom_validity: Vec<u16>,
+    /// The `number` state's in-progress edit buffer, which can hold a partial
+    /// number the exposed value does not.
+    pub(crate) number_buffer: Option<String>,
+    /// The caret for a control without a real selection API.
+    pub(crate) caret: Option<u32>,
+    /// `<output>`'s value mode; when set, the text is the value and the
+    /// frozen default lives beside it.
+    pub(crate) output_value_mode: bool,
+    /// `<output>`'s frozen default value, as UTF-16 units so a lone surrogate
+    /// survives the round trip through `defaultValue`. `None` while the value
+    /// mode flag is clear: the text itself is then the default.
+    pub(crate) output_default_value: Option<Vec<u16>>,
+}
+
+impl ControlState {
+    /// Drops the state a reset, a script value set, or a type change ends.
+    /// Custom validity is not an edit and survives all three.
+    pub(crate) fn clear_edit_state(&mut self) {
+        self.user_edited = false;
+        self.bad_input = false;
+        self.number_buffer = None;
+        self.caret = None;
+    }
+
+    /// Drops the edit position and buffer that a cross-document adoption
+    /// invalidates. The value-derived state (the user-edit flag and bad input)
+    /// and custom validity stay: adoption does not change the value.
+    pub(crate) fn clear_edit_position(&mut self) {
+        self.number_buffer = None;
+        self.caret = None;
+    }
 }
 
 impl DocumentState {
     /// Drops everything keyed to the active document, which a navigation is
     /// about to replace. Entries of *other* documents this realm still owns
-    /// (`owned`) survive, so `nonce_slots` and `creator_stacks` are pruned by
-    /// id in [`Self::forget_document`] instead.
+    /// (`owned`) survive, so `nonce_slots`, `creator_stacks`, and `controls`
+    /// are pruned by id in [`Self::forget_document`] instead.
     fn reset(&mut self) {
         self.applied_csp_metas.clear();
         self.frame_navigations.clear();
@@ -1323,6 +1383,7 @@ impl DocumentState {
         self.nonce_slots.retain(|node, _| node.document != document);
         self.creator_stacks
             .retain(|node, _| node.document != document);
+        self.controls.retain(|node, _| node.document != document);
     }
 }
 
@@ -2415,6 +2476,24 @@ impl World {
         self.input_files.get(&id).map(Vec::as_slice)
     }
 
+    /// The form-associated element's state, created on first use.
+    pub(crate) fn control(&mut self, id: NodeId) -> &mut ControlState {
+        self.state.controls.entry(id).or_default()
+    }
+
+    /// The form-associated element's state, when something already created it.
+    pub(crate) fn control_state(&self, id: NodeId) -> Option<&ControlState> {
+        self.state.controls.get(&id)
+    }
+
+    /// Drops the edit state a reset, a script value set, or a type change
+    /// ends, keeping the element's custom validity message.
+    pub(crate) fn clear_control_edit_state(&mut self, id: NodeId) {
+        if let Some(control) = self.state.controls.get_mut(&id) {
+            control.clear_edit_state();
+        }
+    }
+
     /// The `<img>` request `id`'s pixels belong to, cloned out of Blitz's
     /// per-node record. Blitz owns request identity, so `currentSrc`,
     /// `complete`, `naturalWidth`, and `drawImage` read this instead of
@@ -3209,5 +3288,37 @@ impl AttributeRegistry {
     fn clear(&mut self) {
         self.entries.clear();
         self.attached.clear();
+    }
+}
+
+#[cfg(test)]
+mod control_state_tests {
+    use super::ControlState;
+
+    /// Ending an edit drops only the edit-derived state; a custom validity
+    /// message and `<output>`'s value mode survive, matching the reset and
+    /// script-value-set rules.
+    #[test]
+    fn clearing_an_edit_keeps_custom_validity_and_output_state() {
+        let mut state = ControlState {
+            user_edited: true,
+            bad_input: true,
+            custom_validity: vec![u16::from(b'x')],
+            number_buffer: Some("1e".to_owned()),
+            caret: Some(2),
+            output_value_mode: true,
+            output_default_value: Some("default".encode_utf16().collect()),
+        };
+        state.clear_edit_state();
+        assert!(!state.user_edited);
+        assert!(!state.bad_input);
+        assert!(state.number_buffer.is_none());
+        assert!(state.caret.is_none());
+        assert_eq!(state.custom_validity, vec![u16::from(b'x')]);
+        assert!(state.output_value_mode);
+        assert_eq!(
+            state.output_default_value,
+            Some("default".encode_utf16().collect::<Vec<u16>>())
+        );
     }
 }

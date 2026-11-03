@@ -1640,16 +1640,31 @@ struct InputValueStore {
 /// Recomputes an input's sanitized stored value after one of the content
 /// attributes that feeds its value sanitization changed
 /// (<https://html.spec.whatwg.org/multipage/input.html#the-input-element>).
-fn apply_input_value_attribute_change(ctx: &Ctx<'_>, element: NodeId) -> Result<()> {
-    let world = world_for_node(ctx, element)?;
-    let world = world.borrow();
-    let Some(mut parsed) = world.document_mut(element) else {
-        return Ok(());
+fn apply_input_value_attribute_change(ctx: &Ctx<'_>, element: NodeId, local: &str) -> Result<()> {
+    let world_rc = world_for_node(ctx, element)?;
+    let drives_value = {
+        let world = world_rc.borrow();
+        let Some(mut parsed) = world.document_mut(element) else {
+            return Ok(());
+        };
+        if !crate::dom::tree::is_html_element(&parsed.document.base, element.node, "input") {
+            return Ok(());
+        }
+        let dirty = parsed
+            .document
+            .base
+            .get_node(element.node)
+            .and_then(|node| node.data.downcast_element())
+            .is_some_and(|input| input.form_state.dirty_value());
+        crate::dom::input::sync_sanitized_value(&mut parsed.document, element.node);
+        local == "value" && !dirty
     };
-    if !crate::dom::tree::is_html_element(&parsed.document.base, element.node, "input") {
-        return Ok(());
+    // Only a `value` attribute write that still drives the value ends the edit
+    // state; `min`/`max`/`step` do not mark a user edit over
+    // (<https://html.spec.whatwg.org/multipage/input.html#concept-fe-value>).
+    if drives_value {
+        world_rc.borrow_mut().clear_control_edit_state(element);
     }
-    crate::dom::input::sync_sanitized_value(&mut parsed.document, element.node);
     Ok(())
 }
 
@@ -1721,6 +1736,10 @@ fn apply_input_type_change(ctx: &Ctx<'_>, element: NodeId, previous: Option<&str
             .set_value(element.node, store.value, store.dirtiness);
     }
     apply_input_selection(&world_rc, element, old, new);
+    // The edit buffer, caret, and bad-input flag belong to the previous input
+    // type
+    // (<https://html.spec.whatwg.org/multipage/input.html#the-input-element>).
+    world_rc.borrow_mut().clear_control_edit_state(element);
     Ok(())
 }
 
@@ -1881,7 +1900,7 @@ pub(crate) fn after_attribute_change(
         local,
         "value" | "min" | "max" | "step" | "multiple" | "colorspace" | "alpha"
     ) {
-        apply_input_value_attribute_change(ctx, element)?;
+        apply_input_value_attribute_change(ctx, element, local)?;
     }
     if local != "src" && local != "srcdoc" {
         return Ok(());

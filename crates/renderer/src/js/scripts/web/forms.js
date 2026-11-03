@@ -74,26 +74,7 @@
     configurable: true,
   });
 
-  const customErrors = host.slots();
   const validityStates = host.slots();
-  // Controls whose value was last changed by a user edit. `maxlength` and
-  // `minlength` apply only then
-  // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#suffering-from-being-too-long>).
-  const userEdited = host.slots();
-  // The input/typing paths call this so `maxlength`/`minlength` can tell a
-  // user edit from a script assignment
-  // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#suffering-from-being-too-long>).
-  Object.defineProperty(host, '__tbMarkUserEdited', {
-    value: element => { userEdited.add(element); },
-    writable: false, configurable: false, enumerable: false,
-  });
-  // A script assignment, a reset, or an input-type change ends a user edit, so
-  // `maxlength`/`minlength` stop applying
-  // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#suffering-from-being-too-long>).
-  Object.defineProperty(host, '__tbClearUserEdited', {
-    value: element => { userEdited.delete(element); },
-    writable: false, configurable: false, enumerable: false,
-  });
 
   const VALUE_MODE_TYPES = new Set([
     'text', 'search', 'tel', 'url', 'email', 'password', 'date', 'month',
@@ -242,13 +223,13 @@
   };
 
   const tooLong = element => {
-    if (!isTextControl(element) || !userEdited.has(element)) return false;
+    if (!isTextControl(element) || !host.__tbUserEdited(element)) return false;
     const maximum = element.maxLength;
     return maximum >= 0 && element.value.length > maximum;
   };
 
   const tooShort = element => {
-    if (!isTextControl(element) || !userEdited.has(element)) return false;
+    if (!isTextControl(element) || !host.__tbUserEdited(element)) return false;
     const minimum = element.minLength;
     return minimum > 0 && element.value.length !== 0 && element.value.length < minimum;
   };
@@ -367,14 +348,14 @@
   const FLAGS = {
     valueMissing,
     typeMismatch,
-    badInput: element => host.slots('tinybrowser.number.badinput').has(element),
+    badInput: element => host.__tbBadInput(element),
     patternMismatch,
     tooLong,
     tooShort,
     rangeUnderflow,
     rangeOverflow,
     stepMismatch,
-    customError: element => (customErrors.get(element) || '') !== '',
+    customError: element => host.__tbCustomValidity(element) !== '',
   };
 
   const isValid = element => !Object.values(FLAGS).some(check => check(element));
@@ -419,7 +400,7 @@
   const validationMessageOf = element => {
     // A barred control has no validation message.
     if (barredFromValidation(element)) return '';
-    const custom = customErrors.get(element) || '';
+    const custom = host.__tbCustomValidity(element);
     if (custom !== '') return custom;
     return isValid(element) ? '' : 'Constraints not satisfied';
   };
@@ -466,9 +447,9 @@
     },
     setCustomValidity: {
       value: function(message) {
-        // The message is normalized to LF line breaks
+        // The message is normalized to LF line breaks by the binding
         // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-cva-setcustomvalidity>).
-        customErrors.set(this, String(message).replace(/\r\n|\r/g, '\n'));
+        host.__tbSetCustomValidity(this, String(message));
       },
       writable: true,
       enumerable: true,
@@ -800,7 +781,7 @@
   // before it crosses the JS boundary; the form data set conversion and the
   // attribute setters both apply the same replacement
   // (<https://infra.spec.whatwg.org/#javascript-string-convert>).
-  const wellFormedSetter = (prototype, property, nullToEmpty = false, clearUserEdit = false) => {
+  const wellFormedSetter = (prototype, property, nullToEmpty = false) => {
     if (!prototype) return;
     const descriptor = Object.getOwnPropertyDescriptor(prototype, property);
     if (descriptor === undefined || descriptor.set === undefined) return;
@@ -808,22 +789,19 @@
       get: descriptor.get,
       set(value) {
         const text = nullToEmpty && value === null ? '' : String(value);
+        // The value binding clears the edit state after it stores the string
+        // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#suffering-from-being-too-long>).
         descriptor.set.call(this, toWellFormed(text));
-        // A script assignment is not a user edit, so `maxlength`/`minlength`
-        // stop applying (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#suffering-from-being-too-long>).
-        if (clearUserEdit && typeof host.__tbClearUserEdited === 'function') {
-          host.__tbClearUserEdited(this);
-        }
       },
       enumerable: descriptor.enumerable,
       configurable: true,
     });
   };
   wellFormedSetter(globalThis.HTMLInputElement && globalThis.HTMLInputElement.prototype, 'name');
-  wellFormedSetter(globalThis.HTMLInputElement && globalThis.HTMLInputElement.prototype, 'value', true, true);
+  wellFormedSetter(globalThis.HTMLInputElement && globalThis.HTMLInputElement.prototype, 'value', true);
   wellFormedSetter(globalThis.HTMLSelectElement && globalThis.HTMLSelectElement.prototype, 'name');
-  wellFormedSetter(globalThis.HTMLSelectElement && globalThis.HTMLSelectElement.prototype, 'value', true, true);
-  wellFormedSetter(globalThis.HTMLTextAreaElement && globalThis.HTMLTextAreaElement.prototype, 'value', true, true);
+  wellFormedSetter(globalThis.HTMLSelectElement && globalThis.HTMLSelectElement.prototype, 'value', true);
+  wellFormedSetter(globalThis.HTMLTextAreaElement && globalThis.HTMLTextAreaElement.prototype, 'value', true);
   wellFormedSetter(globalThis.HTMLOptionElement && globalThis.HTMLOptionElement.prototype, 'value');
   // The tentative `switch` attribute on a checkbox is a reflected boolean;
   // the stable IDL has no member for it yet
@@ -1588,17 +1566,9 @@
 
   // `output.value` follows its text content, with a value-mode flag that
   // freezes `defaultValue` once the value is set directly; resetting restores
-  // the frozen default
+  // the frozen default. The flag and the frozen default live in the engine's
+  // control state
   // (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-output-defaultvalue>).
-  const outputStates = new WeakMap();
-  const outputState = element => {
-    let state = outputStates.get(element);
-    if (state === undefined) {
-      state = { valueMode: false, defaultValue: element.textContent };
-      outputStates.set(element, state);
-    }
-    return state;
-  };
   if (globalThis.HTMLOutputElement) {
     Object.defineProperties(globalThis.HTMLOutputElement.prototype, {
       type: {
@@ -1607,14 +1577,18 @@
       },
       defaultValue: {
         get() {
-          const state = outputState(this);
-          return state.valueMode ? state.defaultValue : this.textContent;
+          if (!host.__tbOutputValueMode(this)) return this.textContent;
+          const frozen = host.__tbOutputDefaultValue(this);
+          return frozen === null ? this.textContent : frozen;
         },
         set(value) {
           const text = __tbToDOMString(value);
-          const state = outputState(this);
-          state.defaultValue = text;
-          if (!state.valueMode) this.textContent = text;
+          // While the value mode flag is clear, the default is the text, so
+          // the setter writes the text; a frozen override exists only in value
+          // mode
+          // (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-output-defaultvalue>).
+          if (host.__tbOutputValueMode(this)) host.__tbSetOutputDefaultValue(this, text);
+          else this.textContent = text;
         },
         configurable: true,
       },
@@ -1622,10 +1596,9 @@
         get() { return this.textContent; },
         set(value) {
           const text = __tbToDOMString(value);
-          const state = outputState(this);
-          if (!state.valueMode) {
-            state.defaultValue = this.textContent;
-            state.valueMode = true;
+          if (!host.__tbOutputValueMode(this)) {
+            host.__tbSetOutputDefaultValue(this, this.textContent);
+            host.__tbSetOutputValueMode(this, true);
           }
           this.textContent = text;
         },
@@ -1634,38 +1607,15 @@
     });
   }
   const nativeFormReset = globalThis.HTMLFormElement.prototype.reset;
-  // The internal reset algorithm. Native activation calls this through
+  // The engine's reset algorithm, captured before page scripts can replace
+  // the prototype method. Native activation calls it through
   // `host.__tbResetForm`, so a page that replaces
   // `HTMLFormElement.prototype.reset` cannot intercept a reset button
   // (<https://html.spec.whatwg.org/multipage/input.html#reset-button-state-(type=reset)>).
-  const resetFormInternal = form => {
-    nativeFormReset.call(form);
-    for (const output of form.querySelectorAll('output')) {
-      const state = outputState(output);
-      // In value mode the stored default is restored; otherwise the
-      // current text already is the default value.
-      if (!state.valueMode) state.defaultValue = output.textContent;
-      state.valueMode = false;
-      output.textContent = state.defaultValue;
-    }
-    // The reset algorithm restores each control's default value and clears the
-    // dirty flags; the per-control JS edit state must follow
-    // (<https://html.spec.whatwg.org/multipage/input.html#the-input-element>).
-    for (const control of form.elements) {
-      userEdited.delete(control);
-      if (typeof host.__tbClearInputState === 'function') host.__tbClearInputState(control);
-    }
-  };
   Object.defineProperty(host, '__tbResetForm', {
-    value: resetFormInternal,
+    value: form => nativeFormReset.call(form),
     writable: false, enumerable: false, configurable: false,
   });
-  if (globalThis.HTMLOutputElement) {
-    Object.defineProperty(globalThis.HTMLFormElement.prototype, 'reset', {
-      value: function() { resetFormInternal(this); },
-      writable: true, enumerable: true, configurable: true,
-    });
-  }
 
   // <https://html.spec.whatwg.org/multipage/form-elements.html#dom-progress-position>
   if (globalThis.HTMLProgressElement) {

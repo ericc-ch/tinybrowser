@@ -102,7 +102,200 @@ pub(super) fn install(_ctx: &Ctx<'_>, globals: &Object<'_>) -> Result<()> {
         "__tbNumberBufferState",
         rquickjs::prelude::Func::from(number_buffer_state_js),
     )?;
+    install_control_state(globals)?;
     Ok(())
+}
+
+/// Registers the per-control state shims: the edit state the validity and
+/// editing algorithms maintain beside Blitz's value slot.
+fn install_control_state(globals: &Object<'_>) -> Result<()> {
+    globals.set("__tbUserEdited", rquickjs::prelude::Func::from(user_edited))?;
+    globals.set(
+        "__tbMarkUserEdited",
+        rquickjs::prelude::Func::from(mark_user_edited),
+    )?;
+    globals.set("__tbBadInput", rquickjs::prelude::Func::from(bad_input))?;
+    globals.set(
+        "__tbSetBadInput",
+        rquickjs::prelude::Func::from(set_bad_input),
+    )?;
+    globals.set(
+        "__tbCustomValidity",
+        rquickjs::prelude::Func::from(custom_validity),
+    )?;
+    globals.set(
+        "__tbSetCustomValidity",
+        rquickjs::prelude::Func::from(set_custom_validity),
+    )?;
+    globals.set(
+        "__tbNumberBuffer",
+        rquickjs::prelude::Func::from(number_buffer),
+    )?;
+    globals.set(
+        "__tbSetNumberBuffer",
+        rquickjs::prelude::Func::from(set_number_buffer),
+    )?;
+    globals.set("__tbCaret", rquickjs::prelude::Func::from(caret))?;
+    globals.set("__tbSetCaret", rquickjs::prelude::Func::from(set_caret))?;
+    globals.set(
+        "__tbOutputValueMode",
+        rquickjs::prelude::Func::from(output_value_mode),
+    )?;
+    globals.set(
+        "__tbSetOutputValueMode",
+        rquickjs::prelude::Func::from(set_output_value_mode),
+    )?;
+    globals.set(
+        "__tbOutputDefaultValue",
+        rquickjs::prelude::Func::from(output_default_value),
+    )?;
+    globals.set(
+        "__tbSetOutputDefaultValue",
+        rquickjs::prelude::Func::from(set_output_default_value),
+    )?;
+    Ok(())
+}
+
+/// The owning world and node for a form-associated element argument. A stale
+/// wrapper or a node from a dead document answers `None`, and that is a no-op
+/// rather than a throw: these are internal shims.
+fn control_of<'js>(ctx: &Ctx<'js>, element: &Value<'js>) -> Option<(NodeId, Rc<RefCell<World>>)> {
+    let node = host_node_id(ctx, element)?;
+    let world = owning_world(ctx, node)?;
+    Some((node, world))
+}
+
+fn user_edited<'js>(ctx: Ctx<'js>, element: Value<'js>) -> bool {
+    control_of(&ctx, &element).is_some_and(|(node, world)| {
+        world
+            .borrow()
+            .control_state(node)
+            .is_some_and(|control| control.user_edited)
+    })
+}
+
+fn mark_user_edited<'js>(ctx: Ctx<'js>, element: Value<'js>) {
+    if let Some((node, world)) = control_of(&ctx, &element) {
+        world.borrow_mut().control(node).user_edited = true;
+    }
+}
+
+fn bad_input<'js>(ctx: Ctx<'js>, element: Value<'js>) -> bool {
+    control_of(&ctx, &element).is_some_and(|(node, world)| {
+        world
+            .borrow()
+            .control_state(node)
+            .is_some_and(|control| control.bad_input)
+    })
+}
+
+fn set_bad_input<'js>(ctx: Ctx<'js>, element: Value<'js>, value: bool) {
+    if let Some((node, world)) = control_of(&ctx, &element) {
+        world.borrow_mut().control(node).bad_input = value;
+    }
+}
+
+fn custom_validity<'js>(ctx: Ctx<'js>, element: Value<'js>) -> Result<Value<'js>> {
+    let units = control_of(&ctx, &element).map_or_else(Vec::new, |(node, world)| {
+        world
+            .borrow()
+            .control_state(node)
+            .map_or_else(Vec::new, |control| control.custom_validity.clone())
+    });
+    Ok(rquickjs::String::from_utf16(ctx, &units)?.into_value())
+}
+
+/// `setCustomValidity` normalizes CR and CRLF to LF, on UTF-16 units so a
+/// lone surrogate is preserved.
+fn set_custom_validity<'js>(ctx: Ctx<'js>, element: Value<'js>, message: rquickjs::String<'js>) {
+    let Ok(units) = message.to_utf16() else {
+        return;
+    };
+    let mut normalized = Vec::with_capacity(units.len());
+    let mut index = 0;
+    while index < units.len() {
+        if units[index] == u16::from(b'\r') {
+            normalized.push(u16::from(b'\n'));
+            if units.get(index + 1) == Some(&u16::from(b'\n')) {
+                index += 1;
+            }
+        } else {
+            normalized.push(units[index]);
+        }
+        index += 1;
+    }
+    if let Some((node, world)) = control_of(&ctx, &element) {
+        world.borrow_mut().control(node).custom_validity = normalized;
+    }
+}
+
+fn number_buffer<'js>(ctx: Ctx<'js>, element: Value<'js>) -> Result<Value<'js>> {
+    let buffer = control_of(&ctx, &element).and_then(|(node, world)| {
+        world
+            .borrow()
+            .control_state(node)
+            .and_then(|control| control.number_buffer.clone())
+    });
+    optional(buffer, &ctx)
+}
+
+fn set_number_buffer<'js>(ctx: Ctx<'js>, element: Value<'js>, value: String) {
+    if let Some((node, world)) = control_of(&ctx, &element) {
+        world.borrow_mut().control(node).number_buffer = Some(value);
+    }
+}
+
+fn caret<'js>(ctx: Ctx<'js>, element: Value<'js>) -> Result<Value<'js>> {
+    let caret = control_of(&ctx, &element).and_then(|(node, world)| {
+        world
+            .borrow()
+            .control_state(node)
+            .and_then(|control| control.caret)
+    });
+    optional(caret, &ctx)
+}
+
+fn set_caret<'js>(ctx: Ctx<'js>, element: Value<'js>, position: u32) {
+    if let Some((node, world)) = control_of(&ctx, &element) {
+        world.borrow_mut().control(node).caret = Some(position);
+    }
+}
+
+fn output_value_mode<'js>(ctx: Ctx<'js>, element: Value<'js>) -> bool {
+    control_of(&ctx, &element).is_some_and(|(node, world)| {
+        world
+            .borrow()
+            .control_state(node)
+            .is_some_and(|control| control.output_value_mode)
+    })
+}
+
+fn set_output_value_mode<'js>(ctx: Ctx<'js>, element: Value<'js>, value: bool) {
+    if let Some((node, world)) = control_of(&ctx, &element) {
+        world.borrow_mut().control(node).output_value_mode = value;
+    }
+}
+
+fn output_default_value<'js>(ctx: Ctx<'js>, element: Value<'js>) -> Result<Value<'js>> {
+    let units = control_of(&ctx, &element).and_then(|(node, world)| {
+        world
+            .borrow()
+            .control_state(node)
+            .and_then(|control| control.output_default_value.clone())
+    });
+    match units {
+        Some(units) => Ok(rquickjs::String::from_utf16(ctx, &units)?.into_value()),
+        None => Ok(Value::new_null(ctx)),
+    }
+}
+
+fn set_output_default_value<'js>(ctx: Ctx<'js>, element: Value<'js>, value: rquickjs::String<'js>) {
+    let Ok(units) = value.to_utf16() else {
+        return;
+    };
+    if let Some((node, world)) = control_of(&ctx, &element) {
+        world.borrow_mut().control(node).output_default_value = Some(units);
+    }
 }
 
 /// The floating-point grammar over an owned string, with `null` for a parse

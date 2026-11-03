@@ -157,18 +157,15 @@
   const supportsSelection = element =>
     element.tagName === 'TEXTAREA' || element.selectionStart !== null;
   // The number and date-like states reject the selection APIs, but typing
-  // still needs a caret. Keep one per element for those controls; it starts
-  // at the end and follows edits.
-  const internalCaret = new WeakMap();
+  // still needs a caret. The engine keeps one per control in its control
+  // state; it starts at the end and follows edits.
   // A number control's exposed value is sanitized to empty while the user has
   // typed only a partial number (`1e`), but the editor must remember that
   // partial text so the next keystroke can complete it
   // (<https://html.spec.whatwg.org/multipage/input.html#number-state-(type=number)>).
-  const numberBuffer = new WeakMap();
-  const badInputs = host.slots('tinybrowser.number.badinput');
   const editText = element =>
     element.tagName === 'INPUT' && element.type === 'number'
-      ? (numberBuffer.get(element) ?? element.value)
+      ? (host.__tbNumberBuffer(element) ?? element.value)
       : element.value;
   const caretStart = element => {
     const text = editText(element);
@@ -176,8 +173,8 @@
       return element.selectionStart === null || element.selectionStart === undefined
         ? text.length : element.selectionStart;
     }
-    const position = internalCaret.get(element);
-    return position === undefined ? text.length : Math.min(position, text.length);
+    const position = host.__tbCaret(element);
+    return position === null ? text.length : Math.min(position, text.length);
   };
   const caretEnd = element => {
     const text = editText(element);
@@ -185,12 +182,12 @@
       return element.selectionEnd === null || element.selectionEnd === undefined
         ? text.length : element.selectionEnd;
     }
-    const position = internalCaret.get(element);
-    return position === undefined ? text.length : Math.min(position, text.length);
+    const position = host.__tbCaret(element);
+    return position === null ? text.length : Math.min(position, text.length);
   };
   const setCaret = (element, position) => {
     if (supportsSelection(element)) element.setSelectionRange(position, position);
-    else internalCaret.set(element, position);
+    else host.__tbSetCaret(element, position);
   };
   // A number control may hold a partial number while the user types
   // (`-`, `1.`, `1e+`). The engine classifies the edit buffer against its one
@@ -201,56 +198,6 @@
   const NUMBER_EMPTY = 1;
   const NUMBER_COMPLETE = 3;
   const NUMBER_TRAILING_DOT = 4;
-  // A programmatic value assignment starts a fresh edit at the new end.
-  const inputValue = Object.getOwnPropertyDescriptor(globalThis.HTMLInputElement.prototype, 'value');
-  Object.defineProperty(globalThis.HTMLInputElement.prototype, 'value', {
-    get: inputValue.get,
-    set(value) {
-      internalCaret.delete(this);
-      numberBuffer.delete(this);
-      badInputs.delete(this);
-      // A script assignment is not a user edit, so `maxlength`/`minlength`
-      // must stop treating the control as user-edited
-      // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#suffering-from-being-too-long>).
-      if (typeof host.__tbClearUserEdited === 'function') host.__tbClearUserEdited(this);
-      // `[LegacyNullToEmptyString]` maps null to the empty string before the
-      // DOMString conversion (<https://webidl.spec.whatwg.org/#LegacyNullToEmptyString>).
-      inputValue.set.call(this, value === null ? '' : value);
-    },
-    enumerable: inputValue.enumerable,
-    configurable: true,
-  });
-
-  // Clear the per-control edit state that only this shim owns. The reset and
-  // type-change paths call it, so state from a previous value or input type
-  // cannot leak into the next one
-  // (<https://html.spec.whatwg.org/multipage/input.html#the-input-element>).
-  Object.defineProperty(host, '__tbClearInputState', {
-    value: element => {
-      internalCaret.delete(element);
-      numberBuffer.delete(element);
-      badInputs.delete(element);
-    },
-    writable: false, enumerable: false, configurable: false,
-  });
-
-  // A type change runs the value-mode transition: the edit buffer, caret, and
-  // bad-input flag belong to the previous input type.
-  const inputType = Object.getOwnPropertyDescriptor(globalThis.HTMLInputElement.prototype, 'type');
-  if (inputType !== undefined && inputType.set !== undefined) {
-    Object.defineProperty(globalThis.HTMLInputElement.prototype, 'type', {
-      get: inputType.get,
-      set(value) {
-        inputType.set.call(this, value);
-        internalCaret.delete(this);
-        numberBuffer.delete(this);
-        badInputs.delete(this);
-        if (typeof host.__tbClearUserEdited === 'function') host.__tbClearUserEdited(this);
-      },
-      enumerable: inputType.enumerable,
-      configurable: true,
-    });
-  }
   const fireInput = (element, inputType, data) => {
     fire(element, new InputEvent('input', {
       bubbles: true, composed: true, inputType: inputType, data: data,
@@ -264,13 +211,13 @@
       bubbles: true, cancelable: true, composed: true, inputType: inputType, data: data,
     });
     if (!fire(element, before)) return;
-    if (typeof host.__tbMarkUserEdited === 'function') host.__tbMarkUserEdited(element);
+    host.__tbMarkUserEdited(element);
     if (element.tagName === 'INPUT' && element.type === 'number') {
       const buffer = editText(element);
       const value = buffer.slice(0, start) + text + buffer.slice(end);
       const state = host.__tbNumberBufferState(value);
       if (state === NUMBER_INVALID) return;
-      numberBuffer.set(element, value);
+      host.__tbSetNumberBuffer(element, value);
       // A trailing dot parses as the integer before it, so `1.` exposes `1`
       // rather than bad input. Other incomplete buffers expose the empty
       // string and set `badInput`. A leading `+` stays in the edit buffer but
@@ -280,14 +227,14 @@
       let exposed = '';
       if (state === NUMBER_COMPLETE) {
         exposed = value.startsWith('+') ? value.slice(1) : value;
-        badInputs.delete(element);
+        host.__tbSetBadInput(element, false);
       } else if (state === NUMBER_TRAILING_DOT) {
         exposed = value.startsWith('+') ? value.slice(1, -1) : value.slice(0, -1);
-        badInputs.delete(element);
+        host.__tbSetBadInput(element, false);
       } else if (state === NUMBER_EMPTY) {
-        badInputs.delete(element);
+        host.__tbSetBadInput(element, false);
       } else {
-        badInputs.add(element);
+        host.__tbSetBadInput(element, true);
       }
       host.__tbSetNativeValue(element, exposed);
       setCaret(element, start + text.length);

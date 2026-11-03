@@ -505,7 +505,7 @@ impl JsNode {
         let Some(local) = local else {
             return Ok(());
         };
-        match local.as_str() {
+        let result = match local.as_str() {
             "textarea" => self.set_textarea_value(&ctx, value.0),
             "select" => self.set_select_value(&ctx, value.0),
             "input" => {
@@ -559,7 +559,17 @@ impl JsNode {
                 }
             }
             _ => set_attribute_sync(&ctx, self.handle.0, "value", &value.0),
+        };
+        // A script assignment is not a user edit, and it ends any in-progress
+        // edit buffer or bad-input state. Only a successful assignment gets
+        // here: a rejected one leaves the control as it was
+        // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#suffering-from-being-too-long>).
+        if result.is_ok()
+            && let Ok(world) = world(&ctx)
+        {
+            world.borrow_mut().clear_control_edit_state(self.handle.0);
         }
+        result
     }
 
     /// Sets a textarea's dirty value. The children stay the default value
@@ -808,26 +818,85 @@ impl JsNode {
         )? {
             return Ok(());
         }
-        let world = world(&ctx)?;
-        let world = world.borrow();
-        let Some(mut parsed) = world.document_mut(self.handle.0) else {
-            return Ok(());
-        };
-        let controls = form_controls(&parsed.document.base, parsed.id, self.handle.0.node);
-        {
-            let mut mutator = parsed.document.base.mutate();
+        let world_rc = world(&ctx)?;
+        let (document, controls, outputs) = {
+            let world = world_rc.borrow();
+            let Some(mut parsed) = world.document_mut(self.handle.0) else {
+                return Ok(());
+            };
+            let controls = form_controls(&parsed.document.base, parsed.id, self.handle.0.node);
+            {
+                let mut mutator = parsed.document.base.mutate();
+                for control in &controls {
+                    mutator.reset_control(*control);
+                }
+            }
+            let mut outputs = Vec::new();
             for control in &controls {
-                mutator.reset_control(*control);
+                if crate::dom::tree::is_html_element(&parsed.document.base, *control, "input") {
+                    crate::dom::input::sync_sanitized_value(&mut parsed.document, *control);
+                } else if crate::dom::tree::is_html_element(
+                    &parsed.document.base,
+                    *control,
+                    "select",
+                ) {
+                    crate::dom::forms::reset_select_selectedness(&mut parsed, *control);
+                } else if crate::dom::tree::is_html_element(
+                    &parsed.document.base,
+                    *control,
+                    "output",
+                ) {
+                    // The reset algorithm replaces all of the output's
+                    // children with its default value as text, which also
+                    // drops any markup. A value-mode output restores its
+                    // frozen default; a default-mode one keeps the text it
+                    // has
+                    // (<https://html.spec.whatwg.org/multipage/form-elements.html#the-output-element>).
+                    let id = NodeId {
+                        document: parsed.id,
+                        node: *control,
+                    };
+                    let frozen = world
+                        .control_state(id)
+                        .filter(|state| state.output_value_mode)
+                        .and_then(|state| state.output_default_value.clone());
+                    let text = frozen.map_or_else(
+                        || parsed.document.descendant_dom_text(*control),
+                        |units| crate::dom_string::DomString::from(units.as_slice()),
+                    );
+                    outputs.push((*control, text));
+                }
+            }
+            (parsed.id, controls, outputs)
+        };
+        // The reset algorithm restores each control's default value and clears
+        // its dirty and edit state
+        // (<https://html.spec.whatwg.org/multipage/input.html#the-input-element>).
+        {
+            let mut world = world_rc.borrow_mut();
+            for control in controls {
+                let id = NodeId {
+                    document,
+                    node: control,
+                };
+                world.clear_control_edit_state(id);
+                if outputs.iter().any(|(output, _)| *output == control) {
+                    // The output's value-mode flag is clear and its override
+                    // is null, so its default value is now its text
+                    // (<https://html.spec.whatwg.org/multipage/form-elements.html#the-output-element>).
+                    let state = world.control(id);
+                    state.output_value_mode = false;
+                    state.output_default_value = None;
+                }
             }
         }
-        for control in controls {
-            if crate::dom::tree::is_html_element(&parsed.document.base, control, "input") {
-                crate::dom::input::sync_sanitized_value(&mut parsed.document, control);
-            } else if crate::dom::tree::is_html_element(&parsed.document.base, control, "select") {
-                crate::dom::forms::reset_select_selectedness(&mut parsed, control);
-            }
+        if outputs.is_empty() {
+            return Ok(());
         }
-        Ok(())
+        // The output's reset algorithm replaces its text with the restored
+        // default
+        // (<https://html.spec.whatwg.org/multipage/form-elements.html#the-output-element>).
+        restore_outputs(&ctx, &world_rc, document, outputs)
     }
 
     // https://html.spec.whatwg.org/multipage/forms.html#dom-form-action
@@ -1259,6 +1328,45 @@ pub(super) fn direction_code(direction: &str) -> u8 {
     }
 }
 
+/// Replaces each output's text with the default the reset algorithm restored
+/// (<https://html.spec.whatwg.org/multipage/form-elements.html#the-output-element>).
+fn restore_outputs(
+    ctx: &Ctx<'_>,
+    world_rc: &std::rc::Rc<std::cell::RefCell<crate::js::World>>,
+    document: u32,
+    outputs: Vec<(blitz_traits::node_id::NodeId, crate::dom_string::DomString)>,
+) -> Result<()> {
+    let iframes = {
+        let world = world_rc.borrow();
+        let Some(mut parsed) = world.document_mut_by_id(document) else {
+            return Ok(());
+        };
+        let mut iframes = Vec::new();
+        for (control, text) in &outputs {
+            // "String replace all" with the empty string leaves no child, not
+            // an empty Text node
+            // (<https://html.spec.whatwg.org/multipage/form-elements.html#the-output-element>).
+            let added = if text.is_empty() {
+                Vec::new()
+            } else {
+                let node = parsed.document.create_text(text);
+                vec![NodeId { document, node }]
+            };
+            iframes.extend(replace_all_journaled(
+                &mut parsed,
+                NodeId {
+                    document,
+                    node: *control,
+                },
+                added,
+            ));
+        }
+        iframes
+    };
+    world_rc.borrow().destroy_child_navigables(&iframes);
+    schedule_mutation_delivery(ctx)
+}
+
 /// Form-associated elements whose form owner is `form`.
 fn form_controls(
     base: &blitz_dom::BaseDocument,
@@ -1288,7 +1396,7 @@ fn form_controls(
         }
         if !matches!(
             element.name.local.as_str(),
-            "input" | "textarea" | "select" | "button" | "option"
+            "input" | "textarea" | "select" | "button" | "option" | "output"
         ) {
             continue;
         }
