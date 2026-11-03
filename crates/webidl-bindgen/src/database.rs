@@ -146,7 +146,13 @@ impl<'idl> Database<'idl> {
             partials: BTreeMap::new(),
             includes: BTreeMap::new(),
         };
-        for source in sources {
+        // Partial definitions merge in encounter order, so the source order
+        // would otherwise leak into the generated member order. Sort by the
+        // caller-supplied name: two callers that hand over the same corpus in
+        // a different order must compile to the same bytes.
+        let mut ordered: Vec<&Source<'idl>> = sources.iter().collect();
+        ordered.sort_by(|left, right| left.name.cmp(right.name));
+        for source in ordered {
             let (remaining, definitions) = Definitions::parse(source.text)
                 .map_err(|error| Error(format!("{}: invalid Web IDL: {error}", source.name)))?;
             if !remaining.trim().is_empty() {
