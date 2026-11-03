@@ -29,6 +29,8 @@ pub(crate) mod world;
 mod observers;
 mod reactions;
 
+pub(crate) use bindings::selector_matching_elements;
+pub(crate) use bindings::{element_at_point, element_box, viewport_scroll};
 pub(crate) use bridge::js_number;
 pub(crate) use runtime::FrameRuntime;
 pub use runtime::Stop;
@@ -518,6 +520,66 @@ impl JsRealm {
                 decode_value(&ctx, value)
             })
         })
+    }
+
+    /// The node a runtime handle wraps, or `None` when the handle names
+    /// anything else.
+    pub(crate) fn node_for_handle(
+        &self,
+        object_id: &str,
+    ) -> Result<Option<crate::dom::tree::NodeId>, JsError> {
+        self.context
+            .with(
+                |ctx| -> rquickjs::Result<Option<crate::dom::tree::NodeId>> {
+                    let host = bridge::object(&ctx)?;
+                    let handles: Object = host.get("__tb_handles")?;
+                    let value: Value = handles.get(object_id)?;
+                    Ok(bindings::host_node_id(&ctx, &value))
+                },
+            )
+            .map_err(JsError::engine)
+    }
+
+    /// Interns `node` as a runtime handle, the `DOM.resolveNode` shape: the
+    /// wrapper is minted in Rust and stored in the bridge's private handle
+    /// table, so `Runtime.callFunctionOn` can use the returned id.
+    pub(crate) fn intern_node(
+        &self,
+        node: crate::dom::tree::NodeId,
+    ) -> Result<crate::DomRemoteNode, JsError> {
+        self.context
+            .with(|ctx| -> rquickjs::Result<crate::DomRemoteNode> {
+                let host = bridge::object(&ctx)?;
+                let value = bindings::wrap_node(&ctx, node)?;
+                // A stable key per node: repeated `DOM.resolveNode` calls
+                // overwrite one entry instead of growing the handle table
+                // (<https://chromedevtools.github.io/devtools-protocol/tot/DOM/#method-resolveNode>).
+                let object_id = {
+                    let remote = self.world.borrow_mut().remote_id(node);
+                    format!("dom-{remote}")
+                };
+                let handles: Object = host.get("__tb_handles")?;
+                handles.set(object_id.as_str(), value)?;
+                // Read the shape from the tree, not from wrapper properties a
+                // page can redefine: `resolveNode` must not run page script.
+                let description = {
+                    let world = self.world.borrow();
+                    world.document(node).map_or_else(String::new, |parsed| {
+                        crate::dom::tree::node_name(
+                            &parsed.document.base,
+                            node.node,
+                            parsed.content_type == "text/html",
+                        )
+                        .unwrap_or_default()
+                    })
+                };
+                Ok(crate::DomRemoteNode {
+                    object_id,
+                    class_name: "Node".to_owned(),
+                    description,
+                })
+            })
+            .map_err(JsError::engine)
     }
 
     pub(crate) fn fire_timer(&self, js_id: PageTimerId) -> Result<(), JsError> {

@@ -1,7 +1,7 @@
 //! Document predicates and URL helpers.
 
 use super::{world, world_for_node};
-use crate::dom::tree::{NodeId, attr, html_namespace};
+use crate::dom::tree::NodeId;
 
 use rquickjs::Ctx;
 
@@ -36,16 +36,7 @@ pub(crate) fn document_url_string(ctx: &Ctx<'_>, id: NodeId) -> String {
     let Ok(owner) = world_for_node(ctx, id) else {
         return "about:blank".to_owned();
     };
-    let world = owner.borrow();
-    // Script-created documents carry their own URL (a DOMParser result takes
-    // the realm's URL); everything else falls back to the world's document.
-    if let Some(url) = world.document(id).and_then(|parsed| parsed.url.clone()) {
-        return url;
-    }
-    if world.is_main_document(id) {
-        return world.document_url.as_str().to_owned();
-    }
-    "about:blank".to_owned()
+    owner.borrow().document_url_of(id)
 }
 
 /// The document's own referrer for `document.referrer`. Only the frame's
@@ -71,48 +62,10 @@ pub(crate) fn document_referrer_string(ctx: &Ctx<'_>, id: NodeId) -> String {
 /// against the fallback base URL, or the fallback itself
 /// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#document-base-url>).
 pub(crate) fn document_base_url_string(ctx: &Ctx<'_>, id: NodeId) -> String {
-    let fallback = document_url_string(ctx, id);
     let Ok(owner) = world_for_node(ctx, id) else {
-        return fallback;
+        return document_url_string(ctx, id);
     };
-    let world = owner.borrow();
-    let Some(parsed) = world.document(id) else {
-        return fallback;
-    };
-    let base = &parsed.document.base;
-    // Frozen base URL: the first `base` element *with* an `href`, in tree
-    // order (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#document-base-url>).
-    // A pre-order walk visits nodes in tree order, so the first match wins.
-    let mut stack = vec![base.root_node().id];
-    let mut href: Option<String> = None;
-    while let Some(current) = stack.pop() {
-        let Some(node) = base.get_node(current) else {
-            continue;
-        };
-        if node.data.downcast_element().is_some_and(|element| {
-            element.name.ns == html_namespace() && element.name.local.as_str() == "base"
-        }) && let Some(value) = attr(base, current, "href")
-        {
-            href = Some(value.to_owned());
-            break;
-        }
-        stack.extend(node.children.iter().rev().copied());
-    }
-    // An `about:srcdoc` document's fallback base URL is the creator's base
-    // URL; its own URL cannot be a base
-    // (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#fallback-base-url>).
-    let fallback = world
-        .base_url
-        .as_ref()
-        .map(std::string::ToString::to_string)
-        .unwrap_or(fallback);
-    let Some(href) = href else {
-        return fallback;
-    };
-    url::Url::parse(&fallback)
-        .ok()
-        .and_then(|url| url.join(&href).ok())
-        .map_or(fallback, |url| url.to_string())
+    owner.borrow().document_base_url_of(id)
 }
 /// Whether the document that owns `id` is an HTML document
 /// (`text/html` or `application/xhtml+xml`).

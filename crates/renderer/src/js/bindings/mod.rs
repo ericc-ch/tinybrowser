@@ -41,6 +41,7 @@ pub(super) use mutation::*;
 pub(super) use node::*;
 pub(super) use parsing::*;
 pub(super) use range::*;
+pub(crate) use webidl::selector_matching_elements;
 pub(super) use webidl::*;
 pub(super) use window::*;
 
@@ -734,13 +735,11 @@ pub(super) fn webdriver_element(ctx: Ctx<'_>, remote_id: f64) -> Result<Value<'_
 }
 
 /// Every element's border box from the Blitz layout, in tree order.
-pub(super) fn layout_boxes(ctx: &Ctx<'_>, document: NodeId) -> Result<Vec<crate::render::NodeBox>> {
+pub(crate) fn layout_boxes(world: &World, document: NodeId) -> Vec<crate::render::NodeBox> {
     use style::computed_values::visibility::T as Visibility;
 
-    let world = world_for_node(ctx, document)?;
-    let world_ref = world.borrow();
-    let Some(mut parsed) = world_ref.document_mut(document) else {
-        return Ok(Vec::new());
+    let Some(mut parsed) = world.document_mut(document) else {
+        return Vec::new();
     };
     let base = &mut parsed.document.base;
     base.resolve(0.0);
@@ -770,14 +769,13 @@ pub(super) fn layout_boxes(ctx: &Ctx<'_>, document: NodeId) -> Result<Vec<crate:
         }
         stack.extend(node.children.iter().rev().copied());
     }
-    Ok(boxes)
+    boxes
 }
 
 /// `node`'s border box `(left, top, width, height)` from the current layout,
 /// if it has one.
-pub(super) fn element_box(ctx: &Ctx<'_>, node: NodeId) -> Result<Option<(f64, f64, f64, f64)>> {
-    let boxes = layout_boxes(ctx, node)?;
-    Ok(boxes
+pub(crate) fn element_box(world: &World, node: NodeId) -> Option<(f64, f64, f64, f64)> {
+    layout_boxes(world, node)
         .into_iter()
         .find(|item| item.node == node)
         .map(|item| {
@@ -787,34 +785,32 @@ pub(super) fn element_box(ctx: &Ctx<'_>, node: NodeId) -> Result<Option<(f64, f6
                 f64::from(item.width),
                 f64::from(item.height),
             )
-        }))
+        })
+}
+
+/// [`element_box`] for a JS binding's context.
+pub(super) fn element_box_ctx(ctx: &Ctx<'_>, node: NodeId) -> Result<Option<(f64, f64, f64, f64)>> {
+    let world = world_for_node(ctx, node)?;
+    Ok(element_box(&world.borrow(), node))
 }
 
 /// Current viewport offset from the document's scrolling element.
 /// <https://drafts.csswg.org/cssom-view/#scrolling-viewport>
-fn viewport_scroll(ctx: &Ctx<'_>, node: NodeId) -> Result<(f64, f64)> {
-    let world = world_for_node(ctx, node)?;
-    let world = world.borrow();
+pub(crate) fn viewport_scroll(world: &World, node: NodeId) -> (f64, f64) {
     let Some(parsed) = world.document(node) else {
-        return Ok((0.0, 0.0));
+        return (0.0, 0.0);
     };
     let scroll = parsed.document.base.viewport_scroll();
-    Ok((scroll.x, scroll.y))
+    (scroll.x, scroll.y)
 }
 
 /// The deepest element whose laid-out border box contains the point, if any.
-pub(super) fn element_at_point(
-    ctx: &Ctx<'_>,
-    document: NodeId,
-    x: f64,
-    y: f64,
-) -> Result<Option<NodeId>> {
-    let (scroll_x, scroll_y) = viewport_scroll(ctx, document)?;
+pub(crate) fn element_at_point(world: &World, document: NodeId, x: f64, y: f64) -> Option<NodeId> {
+    let (scroll_x, scroll_y) = viewport_scroll(world, document);
     let x = x + scroll_x;
     let y = y + scroll_y;
-    let boxes = layout_boxes(ctx, document)?;
     let mut best = None;
-    for item in boxes {
+    for item in layout_boxes(world, document) {
         let node = item.node;
         // Hidden boxes keep their geometry but never win hit testing; the
         // flat pre-order walk still reaches visible descendants.
@@ -831,7 +827,18 @@ pub(super) fn element_at_point(
             best = Some(node);
         }
     }
-    Ok(best)
+    best
+}
+
+/// [`element_at_point`] for a JS binding's context.
+pub(super) fn element_at_point_ctx(
+    ctx: &Ctx<'_>,
+    document: NodeId,
+    x: f64,
+    y: f64,
+) -> Result<Option<NodeId>> {
+    let world = world_for_node(ctx, document)?;
+    Ok(element_at_point(&world.borrow(), document, x, y))
 }
 
 pub(super) fn rect_object<'js>(

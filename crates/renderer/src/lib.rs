@@ -42,13 +42,14 @@ pub use js::{Stop, TURN_SCRIPT_BUDGET};
 pub use protocol::{
     BodyDelivery, BrowserEvent, BrowserServices, BrowsingContextHost, ContextName, CorsMode,
     CorsRequest, DialCancellation, DialCompletion, DialFailure, DialKind, DialOutcome, DialRequest,
-    FrameId, HistoryHandling, HistorySnapshot, HttpHead, MAX_RESPONSE_BODY_BYTES, MessagingHost,
-    Mount, NameChange, NavigationSource, NetworkHost, OpenerPolicy, PolicyContainer, PostedMessage,
-    ReferrerRequest, RendererEvent, RequestCache, RequestPolicy, ResourceLimit, ResponseBody,
-    ResponseHead, ResponseSource, STORAGE_QUOTA_BYTES, SandboxFlags, ScreenshotClip,
-    ScreenshotRequest, ScriptFailure, ScriptSource, SerializedOrigin, StorageChange, StorageError,
-    StorageHost, StorageKey, StorageKind, StreamId, TabError, TabState, TargetName, TargetOrigin,
-    TimerId, WindowId,
+    DomBoxModel, DomNode, DomRemoteNode, DomReply, DomRequest, FrameId, HistoryHandling,
+    HistorySnapshot, HttpHead, MAX_RESPONSE_BODY_BYTES, MessagingHost, Mount, NameChange,
+    NavigationSource, NetworkHost, OpenerPolicy, PolicyContainer, PostedMessage, ReferrerRequest,
+    RendererEvent, RequestCache, RequestPolicy, ResourceLimit, ResponseBody, ResponseHead,
+    ResponseSource, STORAGE_QUOTA_BYTES, SandboxFlags, ScreenshotClip, ScreenshotRequest,
+    ScriptFailure, ScriptSource, SerializedOrigin, StorageChange, StorageError, StorageHost,
+    StorageKey, StorageKind, StreamId, TabError, TabState, TargetName, TargetOrigin, TimerId,
+    WindowId,
 };
 pub use remote::RemoteValue;
 pub use storage::PendingStorageEvent;

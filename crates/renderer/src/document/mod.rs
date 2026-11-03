@@ -34,6 +34,7 @@ use self::load::{LoadDelay, LoadDelayGuard};
 
 pub(crate) mod dial;
 mod dials;
+pub(crate) mod dom;
 mod drain;
 
 mod intern;

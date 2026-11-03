@@ -85,7 +85,7 @@ pub(crate) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
 /// realm only stores the value under the id it receives.
 static NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
 
-fn mint_handle() -> String {
+pub(crate) fn mint_handle() -> String {
     let id = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
     format!("h{id}")
 }

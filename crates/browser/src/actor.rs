@@ -139,6 +139,11 @@ enum Command {
         frame: FrameId,
         reply: ReplySender<(f32, f32)>,
     },
+    Dom {
+        frame: FrameId,
+        request: renderer::DomRequest,
+        reply: ReplySender<renderer::DomReply>,
+    },
     Screenshot {
         frame: FrameId,
         request: renderer::ScreenshotRequest,
@@ -385,6 +390,22 @@ impl TabHandle {
     pub async fn content_size(&self) -> Result<(f32, f32), TabError> {
         self.ask(|reply| Command::ContentSize {
             frame: FrameId::MAIN,
+            reply,
+        })
+        .await
+    }
+
+    /// Answers one typed devtools DOM request from the main frame's live
+    /// tree.
+    ///
+    /// # Errors
+    ///
+    /// [`TabError::ActorStopped`], [`TabError::UnknownFrame`], or
+    /// [`TabError::Dom`] when the tree cannot answer the request.
+    pub async fn dom(&self, request: renderer::DomRequest) -> Result<renderer::DomReply, TabError> {
+        self.ask(|reply| Command::Dom {
+            frame: FrameId::MAIN,
+            request,
             reply,
         })
         .await
@@ -1755,6 +1776,7 @@ impl Command {
             }
             Command::ViewportSize { reply } => reply.is_closed(),
             Command::ContentSize { reply, .. } => reply.is_closed(),
+            Command::Dom { reply, .. } => reply.is_closed(),
             Command::Screenshot { reply, .. } => reply.is_closed(),
             Command::RunUntilLoadTimeout { reply, .. } | Command::RunUntilJsTrue { reply, .. } => {
                 reply.is_closed()
@@ -1771,9 +1793,7 @@ impl Command {
     async fn serve(self, ctx: ServeContext<'_>) -> TabOutcome {
         let ServeContext { tab, waiters, id } = ctx;
         match self {
-            Command::LoadHtml { html, reply } => {
-                let _result = reply.send(tab.load_html(&html).await);
-            }
+            Command::LoadHtml { html, reply } => answer(reply, tab.load_html(&html).await),
             Command::Goto { request, reply } => {
                 let _result = reply.send(tab.goto(&request.url, request.initiator));
             }
@@ -1817,6 +1837,11 @@ impl Command {
                     .and_then(reply_content_size);
                 let _result = reply.send(result);
             }
+            Command::Dom {
+                frame,
+                request,
+                reply,
+            } => serve_dom(tab, frame, request, reply).await,
             Command::Screenshot {
                 frame,
                 request,
@@ -1943,6 +1968,20 @@ async fn screenshot_frame(
 ) -> Result<Vec<u8>, TabError> {
     tab.renderer_request_bytes(RendererCommand::Screenshot { frame, request })
         .await
+}
+
+/// Answers one typed DOM request from a frame's live tree.
+async fn serve_dom(
+    tab: &mut Tab,
+    frame: FrameId,
+    request: renderer::DomRequest,
+    reply: ReplySender<renderer::DomReply>,
+) {
+    let result = tab
+        .renderer_request(RendererCommand::Dom { frame, request })
+        .await
+        .and_then(reply_dom);
+    let _result = reply.send(result);
 }
 
 /// Registers one JS-truth waiter in the renderer and retains the browser-side
@@ -2141,6 +2180,11 @@ fn renderer_unavailable(message: &str) -> TabError {
     }
 }
 
+/// Sends one finished operation to its typed caller.
+fn answer<T>(reply: ReplySender<T>, result: Result<T, TabError>) {
+    let _result = reply.send(result);
+}
+
 fn reply_unit(reply: Reply) -> Result<(), TabError> {
     match reply {
         Reply::Unit(result) => result,
@@ -2158,6 +2202,13 @@ fn reply_value(reply: Reply) -> Result<RemoteValue, TabError> {
 fn reply_content_size(reply: Reply) -> Result<(f32, f32), TabError> {
     match reply {
         Reply::ContentSize(result) => result,
+        _ => Err(TabError::ActorStopped),
+    }
+}
+
+fn reply_dom(reply: Reply) -> Result<renderer::DomReply, TabError> {
+    match reply {
+        Reply::Dom(result) => result.map(|reply| *reply),
         _ => Err(TabError::ActorStopped),
     }
 }

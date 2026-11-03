@@ -672,3 +672,74 @@ fn dom_attributes_require_an_element_and_an_identifier() {
         "{unknown}"
     );
 }
+
+#[test]
+fn dom_resolve_node_returns_an_object_id_runtime_can_use() {
+    let (_fixture, mut client) = start();
+    let server = TestServer::start(
+        vec![(
+            "/",
+            ok(
+                "text/html",
+                b"<!doctype html><html><body><p id=\"x\">hi</p></body></html>",
+            ),
+        )],
+        None,
+    );
+    let server_addr = server.address();
+    let session = crate::fixture::load_page(
+        &mut client,
+        &format!("http://{server_addr}/"),
+        Duration::from_secs(10),
+    );
+
+    let document = client
+        .call("DOM.getDocument", &json!({}), Some(&session))
+        .expect("document");
+    let root = document["root"]["nodeId"].as_u64().expect("root id");
+    let found = client
+        .call(
+            "DOM.querySelector",
+            &json!({"nodeId": root, "selector": "p"}),
+            Some(&session),
+        )
+        .expect("query");
+    let paragraph = found["nodeId"].as_u64().expect("paragraph id");
+
+    let resolved = client
+        .call(
+            "DOM.resolveNode",
+            &json!({"nodeId": paragraph}),
+            Some(&session),
+        )
+        .expect("resolve");
+    assert_eq!(resolved["object"]["subtype"], json!("node"));
+    assert_eq!(resolved["object"]["description"], json!("P"));
+    let object_id = resolved["object"]["objectId"]
+        .as_str()
+        .expect("object id")
+        .to_owned();
+
+    let evaluated = client
+        .call(
+            "Runtime.callFunctionOn",
+            &json!({
+                "objectId": object_id,
+                "functionDeclaration": "function() { return this.tagName; }",
+                "returnByValue": true,
+            }),
+            Some(&session),
+        )
+        .expect("call");
+    assert_eq!(evaluated["result"]["value"], json!("P"));
+
+    // A second resolve reuses the node's handle instead of growing the table.
+    let again = client
+        .call(
+            "DOM.resolveNode",
+            &json!({"nodeId": paragraph}),
+            Some(&session),
+        )
+        .expect("resolve again");
+    assert_eq!(again["object"]["objectId"], resolved["object"]["objectId"]);
+}

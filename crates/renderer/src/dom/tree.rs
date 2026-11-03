@@ -339,6 +339,44 @@ pub(crate) fn element_node_name(name: &markup5ever::QualName, uppercase: bool) -
     }
 }
 
+/// `Node.nodeType` for `data`, or `None` for an internal node that script
+/// cannot observe
+/// (<https://dom.spec.whatwg.org/#dom-node-nodetype>).
+pub(crate) fn node_type(data: Option<&NodeData>) -> Option<u16> {
+    match data {
+        Some(NodeData::Element(_)) => Some(1),
+        Some(NodeData::Text(_)) => Some(3),
+        Some(NodeData::ProcessingInstruction { .. }) => Some(7),
+        Some(NodeData::Comment { .. }) => Some(8),
+        Some(NodeData::Document(_)) => Some(9),
+        Some(NodeData::Doctype { .. }) => Some(10),
+        Some(NodeData::CDataSection { .. }) => Some(4),
+        Some(NodeData::Fragment { .. } | NodeData::ShadowRoot { .. }) => Some(11),
+        Some(NodeData::AnonymousBlock(_)) | None => None,
+    }
+}
+
+/// `Node.nodeName` for `base`'s `id`
+/// (<https://dom.spec.whatwg.org/#dom-node-nodename>,
+/// <https://dom.spec.whatwg.org/#concept-element-html-uppercased-qualified-name>).
+/// `html` selects the HTML-uppercased element name of an HTML document.
+pub(crate) fn node_name(base: &blitz_dom::BaseDocument, id: BlitzId, html: bool) -> Option<String> {
+    let data = base.get_node(id).map(|node| &node.data);
+    match data {
+        Some(NodeData::Element(element)) => Some(element_node_name(&element.name, html)),
+        Some(NodeData::Text(_)) => Some("#text".into()),
+        Some(NodeData::CDataSection { .. }) => Some("#cdata-section".into()),
+        Some(NodeData::ProcessingInstruction { target, .. }) => Some(target.clone()),
+        Some(NodeData::Comment { .. }) => Some("#comment".into()),
+        Some(NodeData::Doctype { name, .. }) => Some(name.clone()),
+        Some(NodeData::Fragment { .. } | NodeData::ShadowRoot { .. }) => {
+            Some("#document-fragment".into())
+        }
+        Some(NodeData::Document(_)) => Some("#document".into()),
+        Some(NodeData::AnonymousBlock(_)) | None => None,
+    }
+}
+
 /// The previous (`forward == false`) or next sibling of `id` in its parent.
 pub(crate) fn sibling(
     base: &blitz_dom::BaseDocument,

@@ -29,8 +29,8 @@ use crate::dom::insertion::{
     replace_all_journaled, replace_all_with_node, replace_parsed, unlink_journaled,
 };
 use crate::dom::tree::{
-    BlitzId, NodeId, ancestor_chain, child_ids, element_node_name, is_connected, is_element,
-    is_html_element, root_of, sibling, tree_order,
+    BlitzId, NodeId, ancestor_chain, child_ids, is_connected, is_element, is_html_element, root_of,
+    sibling, tree_order,
 };
 
 use crate::documents::JournalEntry;
@@ -931,18 +931,9 @@ impl<'js> From<child_node_generated::DOMStringOrNode<'js>> for NodeOrString<'js>
 impl JsNode {
     pub(super) fn node_type(&self, ctx: &Ctx<'_>) -> Result<u16> {
         // https://dom.spec.whatwg.org/#dom-node-nodetype
-        with_node_data(ctx, self.handle.0, |data| match data {
-            Some(NodeData::Element(_)) => Ok(1),
-            Some(NodeData::Text(_)) => Ok(3),
-            Some(NodeData::ProcessingInstruction { .. }) => Ok(7),
-            Some(NodeData::Comment { .. }) => Ok(8),
-            Some(NodeData::Document(_)) => Ok(9),
-            Some(NodeData::Doctype { .. }) => Ok(10),
-            Some(NodeData::CDataSection { .. }) => Ok(4),
-            Some(NodeData::Fragment { .. } | NodeData::ShadowRoot { .. }) => Ok(11),
-            Some(NodeData::AnonymousBlock(_)) | None => {
-                Err(Exception::throw_type(ctx, "stale node"))
-            }
+        with_node_data(ctx, self.handle.0, |data| {
+            crate::dom::tree::node_type(data)
+                .ok_or_else(|| Exception::throw_type(ctx, "stale node"))
         })?
     }
 
@@ -950,22 +941,14 @@ impl JsNode {
     // https://dom.spec.whatwg.org/#concept-element-html-uppercased-qualified-name
     pub(super) fn node_name<'js>(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
         let uppercase = document_is_html_content(ctx, self.handle.0);
-        let name = with_node_data(ctx, self.handle.0, |data| match data {
-            Some(NodeData::Element(element)) => Ok(element_node_name(&element.name, uppercase)),
-            Some(NodeData::Text(_)) => Ok("#text".into()),
-            Some(NodeData::CDataSection { .. }) => Ok("#cdata-section".into()),
-            Some(NodeData::ProcessingInstruction { target, .. }) => Ok(target.clone()),
-            Some(NodeData::Comment { .. }) => Ok("#comment".into()),
-            Some(NodeData::Doctype { name, .. }) => Ok(name.clone()),
-            Some(NodeData::Fragment { .. } | NodeData::ShadowRoot { .. }) => {
-                Ok("#document-fragment".into())
-            }
-            Some(NodeData::Document(_)) => Ok("#document".into()),
-            Some(NodeData::AnonymousBlock(_)) | None => {
-                Err(Exception::throw_type(ctx, "stale node"))
-            }
-        })?;
-        let name = name?;
+        let world = world_for_node(ctx, self.handle.0)?;
+        let borrowed = world.borrow();
+        let Some(parsed) = borrowed.document(self.handle.0) else {
+            return Err(Exception::throw_type(ctx, "stale node"));
+        };
+        let name =
+            crate::dom::tree::node_name(&parsed.document.base, self.handle.0.node, uppercase)
+                .ok_or_else(|| Exception::throw_type(ctx, "stale node"))?;
         rquickjs::String::from_str(ctx.clone(), &name)
     }
 

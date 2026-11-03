@@ -549,6 +549,20 @@ impl Engine {
         Ok(self.frame_mut(frame)?.content_size())
     }
 
+    /// Answers one typed devtools DOM request from `frame`'s live tree.
+    ///
+    /// # Errors
+    ///
+    /// [`TabError::UnknownFrame`] when the engine does not host `frame`, or
+    /// [`TabError::Dom`] when the tree cannot answer the request.
+    pub fn dom(
+        &mut self,
+        frame: FrameId,
+        request: &crate::DomRequest,
+    ) -> Result<crate::DomReply, TabError> {
+        self.frame_mut(frame)?.dom(request)
+    }
+
     /// Renders one frame to a PNG.
     ///
     /// The document's `<style>` sheets are applied. The viewport and crop

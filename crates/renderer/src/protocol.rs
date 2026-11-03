@@ -177,6 +177,12 @@ pub enum TabError {
         /// Diagnostics from style, layout, or paint.
         message: String,
     },
+    /// A typed devtools DOM request named a node or operation the tree cannot
+    /// answer.
+    Dom {
+        /// The CDP-shaped message.
+        message: String,
+    },
 }
 
 impl fmt::Display for TabError {
@@ -192,6 +198,7 @@ impl fmt::Display for TabError {
             }
             Self::ResourceLimit { resource } => write!(f, "resource limit reached: {resource}"),
             Self::Render { message } => write!(f, "render: {message}"),
+            Self::Dom { message } => write!(f, "dom: {message}"),
         }
     }
 }
@@ -1008,6 +1015,184 @@ pub struct ScreenshotClip {
     pub width: f32,
     /// Height in CSS pixels.
     pub height: f32,
+}
+
+/// One typed devtools DOM request, keyed by the renderer's node ids. The CDP
+/// layer owns the wire protocol; these are the operations it needs answered
+/// over the live tree instead of by evaluating page script
+/// (<https://chromedevtools.github.io/devtools-protocol/tot/DOM/>).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum DomRequest {
+    /// Serialize the tree under the document node.
+    GetDocument,
+    /// The first element matching a selector under `node`.
+    QuerySelector {
+        /// Backend node id to query under.
+        node: u64,
+        /// CSS selector.
+        selector: String,
+    },
+    /// Every element matching a selector under `node`.
+    QuerySelectorAll {
+        /// Backend node id to query under.
+        node: u64,
+        /// CSS selector.
+        selector: String,
+    },
+    /// One node's shape, without children.
+    DescribeNode {
+        /// Backend node id.
+        node: u64,
+    },
+    /// Serialize one node as HTML.
+    GetOuterHtml {
+        /// Backend node id.
+        node: u64,
+    },
+    /// The node's attributes, flattened as name/value pairs.
+    GetAttributes {
+        /// Backend node id.
+        node: u64,
+    },
+    /// Intern one node as a JS handle.
+    ResolveNode {
+        /// Backend node id.
+        node: u64,
+    },
+    /// The node a runtime handle wraps, or `0` when the handle is not a node.
+    ResolveObject {
+        /// Opaque handle id from the realm's handle table.
+        object_id: String,
+    },
+    /// The deepest visible element containing a viewport point.
+    GetNodeForLocation {
+        /// Viewport x in CSS pixels.
+        x: f64,
+        /// Viewport y in CSS pixels.
+        y: f64,
+    },
+    /// The border box as content/padding/border/margin quads.
+    GetBoxModel {
+        /// Backend node id.
+        node: u64,
+    },
+    /// One quad per client rect.
+    GetContentQuads {
+        /// Backend node id.
+        node: u64,
+    },
+}
+
+/// One serialized DOM node in the CDP `Node` shape.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DomNode {
+    /// Session-facing node id.
+    pub node_id: u64,
+    /// Backend node id.
+    pub backend_node_id: u64,
+    /// DOM node type.
+    pub node_type: u16,
+    /// Node name.
+    pub node_name: String,
+    /// Element local name.
+    pub local_name: Option<String>,
+    /// Character-data value, or empty for elements and documents.
+    pub node_value: String,
+    /// Element attributes, flattened as name/value pairs.
+    pub attributes: Vec<String>,
+    /// Serialized children.
+    pub children: Vec<DomNode>,
+    /// Number of children.
+    pub child_node_count: u32,
+    /// Document URL.
+    pub document_url: Option<String>,
+    /// Document base URL.
+    pub base_url: Option<String>,
+    /// Document compatibility mode.
+    pub compatibility_mode: Option<String>,
+}
+
+/// A node interned as a remote object handle.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DomRemoteNode {
+    /// Opaque object id in the runtime handle table.
+    pub object_id: String,
+    /// Wrapper class name.
+    pub class_name: String,
+    /// `nodeName` description.
+    pub description: String,
+}
+
+/// The border box of one node, repeated for each CDP box.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DomBoxModel {
+    /// Content quad as `x1, y1, x2, y2, x3, y3, x4, y4`.
+    pub content: [f64; 8],
+    /// Padding quad.
+    pub padding: [f64; 8],
+    /// Border quad.
+    pub border: [f64; 8],
+    /// Margin quad.
+    pub margin: [f64; 8],
+    /// Rounded box width.
+    pub width: i64,
+    /// Rounded box height.
+    pub height: i64,
+}
+
+/// One typed devtools DOM reply.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum DomReply {
+    /// The serialized document.
+    Document {
+        /// Document root.
+        root: DomNode,
+    },
+    /// One matching element, or `0`.
+    NodeId {
+        /// Backend node id.
+        node_id: u64,
+    },
+    /// Every matching element.
+    NodeIds {
+        /// Backend node ids.
+        node_ids: Vec<u64>,
+    },
+    /// One node's shape.
+    Described {
+        /// The node, when it exists.
+        node: Option<DomNode>,
+    },
+    /// One node's HTML.
+    OuterHtml {
+        /// Serialized markup.
+        outer_html: String,
+    },
+    /// One element's attributes.
+    Attributes {
+        /// Flattened name/value pairs.
+        attributes: Vec<String>,
+    },
+    /// One interned node.
+    Resolved {
+        /// The remote object, when the node exists.
+        object: Option<DomRemoteNode>,
+    },
+    /// The element at a point, or `0`.
+    NodeForLocation {
+        /// Backend node id.
+        node_id: u64,
+    },
+    /// One node's border box.
+    BoxModel {
+        /// The model, when the node has a box.
+        model: Option<DomBoxModel>,
+    },
+    /// One quad per client rect.
+    ContentQuads {
+        /// Each quad as `x1, y1, x2, y2, x3, y3, x4, y4`.
+        quads: Vec<[f64; 8]>,
+    },
 }
 
 /// What the renderer knows about a request's referrer source before the

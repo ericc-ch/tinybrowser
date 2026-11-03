@@ -233,6 +233,7 @@ fn handle_request(
             Command::Screenshot { .. } => Reply::Screenshot {
                 result: Err(stream_error("unknown assignment")),
             },
+            Command::Dom { .. } => Reply::Dom(Err(stream_error("unknown assignment"))),
             Command::AddInitScript { .. }
             | Command::RemoveInitScript { .. }
             | Command::SetViewport { .. }
@@ -634,6 +635,9 @@ fn handle_command(engine: &mut Engine, command: Command) -> Handled {
         } => Handled::Reply(Reply::Unit(engine.set_viewport(frame, width, height))),
         Command::ContentSize { frame } => {
             Handled::Reply(Reply::ContentSize(engine.content_size(frame)))
+        }
+        Command::Dom { frame, request } => {
+            Handled::Reply(Reply::Dom(engine.dom(frame, &request).map(Box::new)))
         }
         Command::WaitForJs { id, frame, source } => {
             engine.add_js_waiter(id, frame, source);

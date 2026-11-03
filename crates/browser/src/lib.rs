@@ -35,8 +35,9 @@ pub use net::{
 };
 pub use profile::{Profile, ProfileError, ProfileName, default_data_home};
 pub use renderer::{
-    DEFAULT_VIEWPORT, FrameId, RemoteValue, ResourceLimit, ScreenshotClip, ScreenshotRequest,
-    ScriptFailure, ScriptSource, TabError,
+    DEFAULT_VIEWPORT, DomBoxModel, DomNode, DomRemoteNode, DomReply, DomRequest, FrameId,
+    RemoteValue, ResourceLimit, ScreenshotClip, ScreenshotRequest, ScriptFailure, ScriptSource,
+    TabError,
 };
 
 /// Dark `Sec-CH-Prefers-Color-Scheme`, kept in lockstep with Stylo and `matchMedia`

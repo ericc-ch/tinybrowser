@@ -295,6 +295,20 @@ pub(crate) fn serialize_html_outer(
     output.finish()
 }
 
+/// Inserts `children` before the final start of a closing tag. A migrated
+/// template's outer markup is the host element's tags plus the inert contents
+/// (<https://html.spec.whatwg.org/multipage/parsing.html#serialising-html-fragments>).
+pub(crate) fn splice_before_close_tag(shell: DomString, children: &DomString) -> DomString {
+    let units = shell.units();
+    let Some(end) = units.iter().rposition(|unit| *unit == u16::from(b'<')) else {
+        return shell;
+    };
+    let mut merged = units[..end].to_vec();
+    merged.extend(children.units().iter().copied());
+    merged.extend_from_slice(&units[end..]);
+    DomString::from_utf16(merged)
+}
+
 fn push_escaped_xml_text(output: &mut HtmlOutput, text: &str) {
     for unit in text.encode_utf16() {
         match unit {

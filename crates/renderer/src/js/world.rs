@@ -2333,6 +2333,67 @@ impl World {
         })
     }
 
+    /// The URL `document.URL` reports for `id`
+    /// (<https://dom.spec.whatwg.org/#dom-document-url>).
+    ///
+    /// Script-created documents carry their own URL (a `DOMParser` result
+    /// takes the realm's URL); everything else falls back to the world's
+    /// document.
+    pub(crate) fn document_url_of(&self, id: NodeId) -> String {
+        if let Some(url) = self.document(id).and_then(|parsed| parsed.url.clone()) {
+            return url;
+        }
+        if self.is_main_document(id) {
+            return self.document_url.as_str().to_owned();
+        }
+        "about:blank".to_owned()
+    }
+
+    /// The document's base URL: the first `base` element's `href` resolved
+    /// against the fallback base URL, or the fallback itself
+    /// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#document-base-url>).
+    pub(crate) fn document_base_url_of(&self, id: NodeId) -> String {
+        let fallback = self.document_url_of(id);
+        let Some(parsed) = self.document(id) else {
+            return fallback;
+        };
+        let base = &parsed.document.base;
+        // Frozen base URL: the first `base` element *with* an `href`, in tree
+        // order (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#document-base-url>).
+        // A pre-order walk visits nodes in tree order, so the first match wins.
+        let mut stack = vec![base.root_node().id];
+        let mut href: Option<String> = None;
+        while let Some(current) = stack.pop() {
+            let Some(node) = base.get_node(current) else {
+                continue;
+            };
+            if node.data.downcast_element().is_some_and(|element| {
+                element.name.ns == crate::dom::tree::html_namespace()
+                    && element.name.local.as_str() == "base"
+            }) && let Some(value) = crate::dom::tree::attr(base, current, "href")
+            {
+                href = Some(value.to_owned());
+                break;
+            }
+            stack.extend(node.children.iter().rev().copied());
+        }
+        // An `about:srcdoc` document's fallback base URL is the creator's base
+        // URL; its own URL cannot be a base
+        // (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#fallback-base-url>).
+        let fallback = self
+            .base_url
+            .as_ref()
+            .map(std::string::ToString::to_string)
+            .unwrap_or(fallback);
+        let Some(href) = href else {
+            return fallback;
+        };
+        url::Url::parse(&fallback)
+            .ok()
+            .and_then(|url| url.join(&href).ok())
+            .map_or(fallback, |url| url.to_string())
+    }
+
     pub(crate) fn queue_frame_navigation(&mut self, navigation: FrameNavigation) {
         self.state.frame_navigations.push(navigation);
     }

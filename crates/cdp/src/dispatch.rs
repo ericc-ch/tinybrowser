@@ -9,8 +9,8 @@ use std::time::Duration;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use browser::{
-    BrowserHandle, DEFAULT_VIEWPORT, FrameId, RemoteValue, ScreenshotRequest, TabError, TabEvent,
-    TabHandle, TabId,
+    BrowserHandle, DEFAULT_VIEWPORT, DomNode, DomReply, DomRequest, FrameId, RemoteValue,
+    ScreenshotRequest, TabError, TabEvent, TabHandle, TabId,
 };
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -983,41 +983,14 @@ async fn storage_key(tab: &TabHandle) -> Result<Value, DispatchError> {
     Ok(json!({"storageKey": key}))
 }
 
-/// `DOM.getDocument`: serialize the live tree, remembering each node so later
-/// DOM calls can look it up by `nodeId`.
+/// `DOM.getDocument`: serialize the live tree from the renderer's typed node
+/// map.
 pub(crate) async fn dom_get_document(tab: &TabHandle) -> Result<Value, DispatchError> {
-    const SCRIPT: &str = r#"(function(){
-      host.__tbDomRegister = undefined;
-      host.__tb_dom_nodes = host.array();
-      host.__tb_dom_by_node = undefined;
-      const register = __REGISTER__;
-      const walk = node => {
-        const id = register(node);
-        const entry = { __proto__: null, nodeId: id, backendNodeId: id, nodeType: node.nodeType, nodeName: node.nodeName };
-        if (node.nodeType === 1) { entry.localName = node.localName; entry.nodeValue = ""; entry.attributes = host.array(); }
-        else if (node.nodeType === 9) {
-          entry.nodeValue = ""; entry.documentURL = node.URL; entry.baseURL = node.baseURI;
-          entry.compatibilityMode = "NoQuirks";
-        } else { entry.nodeValue = node.nodeValue || ""; }
-        const children = host.array();
-        for (let child = node.firstChild; child; child = child.nextSibling) host.push(children, walk(child));
-        if (children.length) entry.children = children;
-        entry.childNodeCount = children.length;
-        return entry;
-      };
-      const root = walk(document);
-      return host.stringify(root);
-    })()"#;
-    let value = tab
-        .execute_browser_script(SCRIPT.replace("__REGISTER__", REGISTER_PRELUDE).as_str())
-        .await
-        .map_err(|error| DispatchError::Failed(error.to_string()))?;
-    let RemoteValue::String(text) = value else {
+    let reply = dom_request(tab, DomRequest::GetDocument).await?;
+    let DomReply::Document { root } = reply else {
         return Err(DispatchError::BadHelperReply("DOM.getDocument"));
     };
-    let root: Value =
-        serde_json::from_str(&text).map_err(|error| DispatchError::Failed(error.to_string()))?;
-    Ok(json!({"root": root}))
+    Ok(json!({"root": document_node(&root)}))
 }
 
 /// `Input.dispatchMouseEvent`: one pointer step through the page-side
@@ -1155,90 +1128,127 @@ async fn run_actions(tab: &TabHandle, actions: &Value) -> Result<Value, Dispatch
     Ok(json!({}))
 }
 
-/// Runs a DOM helper script that returns a JSON string and parses the reply.
-async fn dom_eval(tab: &TabHandle, script: &str) -> Result<Value, DispatchError> {
-    let value = tab
-        .execute_browser_script(script)
+/// Sends one typed DOM request to the tab's main frame.
+async fn dom_request(tab: &TabHandle, request: DomRequest) -> Result<DomReply, DispatchError> {
+    tab.dom(request)
         .await
-        .map_err(|error| DispatchError::Failed(error.to_string()))?;
-    let RemoteValue::String(text) = value else {
-        return Err(DispatchError::BadHelperReply("DOM"));
-    };
-    serde_json::from_str(&text).map_err(|error| DispatchError::Failed(error.to_string()))
+        .map_err(|error| DispatchError::Failed(error.to_string()))
 }
 
-/// The `nodeId` a DOM method targets, defaulting to the document node.
-fn requested_node(node: &crate::params::NodeTarget) -> u64 {
-    node.node.unwrap_or(1)
+/// The node a DOM method targets, from any of `objectId` (a runtime handle),
+/// `backendNodeId`, or `nodeId`.
+enum TargetNode {
+    /// No identifier: the method's document default.
+    Default,
+    /// A renderer node id.
+    Node(u64),
+    /// An `objectId` named a handle that does not wrap a node.
+    Missing,
 }
 
-/// A page-side expression resolving the node a DOM method requires, from any
-/// of `objectId` (a remote handle), `backendNodeId`, or `nodeId`.
-fn required_node_expression(node: &crate::params::NodeTarget) -> Result<String, DispatchError> {
-    if node.object.is_some() || node.backend.is_some() || node.node.is_some() {
-        Ok(requested_node_expression(node))
+/// Whether a CDP node target names any identifier.
+fn has_node_identifier(node: &crate::params::NodeTarget) -> bool {
+    node.object.is_some() || node.backend.is_some() || node.node.is_some()
+}
+
+/// Resolves a CDP node target against the renderer handle table and node map.
+async fn target_node(
+    tab: &TabHandle,
+    node: &crate::params::NodeTarget,
+) -> Result<TargetNode, DispatchError> {
+    if let Some(object_id) = &node.object {
+        let reply = dom_request(
+            tab,
+            DomRequest::ResolveObject {
+                object_id: object_id.clone(),
+            },
+        )
+        .await?;
+        let DomReply::NodeId { node_id } = reply else {
+            return Err(DispatchError::BadHelperReply("DOM"));
+        };
+        return Ok(if node_id == 0 {
+            TargetNode::Missing
+        } else {
+            TargetNode::Node(node_id)
+        });
+    }
+    match node.backend.or(node.node) {
+        Some(id) => Ok(TargetNode::Node(id)),
+        None => Ok(TargetNode::Default),
+    }
+}
+
+/// The error every required-node method answers when a handle names no node.
+fn missing_node() -> DispatchError {
+    DispatchError::Failed("Could not find node with given id".to_owned())
+}
+
+/// One `DOM.Node` reply from the renderer's typed node.
+fn document_node(node: &DomNode) -> Value {
+    let mut entry = serde_json::Map::new();
+    entry.insert("nodeId".to_owned(), json!(node.node_id));
+    entry.insert("backendNodeId".to_owned(), json!(node.backend_node_id));
+    entry.insert("nodeType".to_owned(), json!(node.node_type));
+    entry.insert("nodeName".to_owned(), json!(node.node_name));
+    if node.node_type == 1 {
+        entry.insert("localName".to_owned(), json!(node.local_name));
+        entry.insert("nodeValue".to_owned(), json!(""));
+        entry.insert("attributes".to_owned(), json!(node.attributes));
+    } else if node.node_type == 9 {
+        entry.insert("nodeValue".to_owned(), json!(""));
+        entry.insert("documentURL".to_owned(), json!(node.document_url));
+        entry.insert("baseURL".to_owned(), json!(node.base_url));
+        entry.insert(
+            "compatibilityMode".to_owned(),
+            json!(node.compatibility_mode),
+        );
     } else {
-        Err(DispatchError::InvalidParams(
-            "nodeId, backendNodeId, or objectId".to_owned(),
-        ))
+        entry.insert("nodeValue".to_owned(), json!(node.node_value));
     }
+    entry.insert("childNodeCount".to_owned(), json!(node.child_node_count));
+    if !node.children.is_empty() {
+        entry.insert(
+            "children".to_owned(),
+            json!(node.children.iter().map(document_node).collect::<Vec<_>>()),
+        );
+    }
+    Value::Object(entry)
 }
 
-/// A page-side expression resolving the node a DOM method targets, from any of
-/// `objectId` (a remote handle), `backendNodeId`, or `nodeId`.
-fn requested_node_expression(node: &crate::params::NodeTarget) -> String {
-    if let Some(id) = &node.object {
-        return format!("(host.__tb_handles || {{}})[{}]", json_string(id));
+/// One `DOM.describeNode` node: shape and child count, without children.
+fn described_node(node: &DomNode) -> Value {
+    let mut entry = serde_json::Map::new();
+    entry.insert("nodeId".to_owned(), json!(node.node_id));
+    entry.insert("backendNodeId".to_owned(), json!(node.backend_node_id));
+    entry.insert("nodeType".to_owned(), json!(node.node_type));
+    entry.insert("nodeName".to_owned(), json!(node.node_name));
+    entry.insert("childNodeCount".to_owned(), json!(node.child_node_count));
+    if node.node_type == 1 {
+        entry.insert("localName".to_owned(), json!(node.local_name));
+        entry.insert("attributes".to_owned(), json!(node.attributes));
     }
-    let id = node.backend.or(node.node).unwrap_or(1);
-    format!("(host.__tb_dom_nodes || [])[{id}]")
+    Value::Object(entry)
 }
-
-/// The page-side node registrar shared by every `DOM.*` method that answers
-/// with node ids. It installs itself once per realm; the `Map` is the
-/// node-to-id reverse lookup, so a `querySelectorAll` over N nodes registers in
-/// O(N) instead of scanning the table per match. `DOM.getDocument` drops it to
-/// restart the ids.
-const REGISTER_PRELUDE: &str = r"(function(){
-  if (host.__tbDomRegister === undefined) {
-    const nodes = host.array();
-    const byNode = new Map();
-    let next = 0;
-    host.__tb_dom_nodes = nodes;
-    host.__tb_dom_by_node = byNode;
-    host.__tb_dom_id = next;
-    host.__tbDomRegister = node => {
-      const known = byNode.get(node);
-      if (known !== undefined) return known;
-      const id = ++next;
-      host.__tb_dom_id = id;
-      nodes[id] = node;
-      byNode.set(node, id);
-      return id;
-    };
-  }
-  return host.__tbDomRegister;
-})()";
 
 /// `DOM.querySelector`: the first matching node's id.
 pub(crate) async fn dom_query_selector(
     tab: &TabHandle,
     params: &Value,
 ) -> Result<Value, DispatchError> {
-    const SCRIPT: &str = r"(function(){
-      const register = __REGISTER__;
-      const n = host.__tb_dom_nodes[__NODE__];
-      if (!n || !n.querySelector) return host.stringify({__proto__: null, nodeId: 0});
-      const found = n.querySelector(__SELECTOR__);
-      if (!found) return host.stringify({__proto__: null, nodeId: 0});
-      return host.stringify({__proto__: null, nodeId: register(found)});
-    })()";
     let params: crate::params::QuerySelector = crate::params::parse(params)?;
-    let script = SCRIPT
-        .replace("__REGISTER__", REGISTER_PRELUDE)
-        .replace("__NODE__", &params.node_id.to_string())
-        .replace("__SELECTOR__", &json_string(&params.selector));
-    dom_eval(tab, &script).await
+    let reply = dom_request(
+        tab,
+        DomRequest::QuerySelector {
+            node: params.node_id,
+            selector: params.selector,
+        },
+    )
+    .await?;
+    let DomReply::NodeId { node_id } = reply else {
+        return Err(DispatchError::BadHelperReply("DOM.querySelector"));
+    };
+    Ok(json!({"nodeId": node_id}))
 }
 
 /// `DOM.querySelectorAll`: every matching node's id.
@@ -1246,76 +1256,83 @@ pub(crate) async fn dom_query_selector_all(
     tab: &TabHandle,
     params: &Value,
 ) -> Result<Value, DispatchError> {
-    const SCRIPT: &str = r"(function(){
-      const register = __REGISTER__;
-      const n = host.__tb_dom_nodes[__NODE__];
-      if (!n || !n.querySelectorAll) return host.stringify({__proto__: null, nodeIds: []});
-      const nodeIds = host.array();
-      for (const found of n.querySelectorAll(__SELECTOR__)) host.push(nodeIds, register(found));
-      return host.stringify({__proto__: null, nodeIds: nodeIds});
-    })()";
     let params: crate::params::QuerySelector = crate::params::parse(params)?;
-    let script = SCRIPT
-        .replace("__REGISTER__", REGISTER_PRELUDE)
-        .replace("__NODE__", &params.node_id.to_string())
-        .replace("__SELECTOR__", &json_string(&params.selector));
-    dom_eval(tab, &script).await
+    let reply = dom_request(
+        tab,
+        DomRequest::QuerySelectorAll {
+            node: params.node_id,
+            selector: params.selector,
+        },
+    )
+    .await?;
+    let DomReply::NodeIds { node_ids } = reply else {
+        return Err(DispatchError::BadHelperReply("DOM.querySelectorAll"));
+    };
+    Ok(json!({"nodeIds": node_ids}))
 }
 
-/// `DOM.describeNode`: the stored node's shape, optionally with children.
+/// `DOM.describeNode`: the node's shape, optionally with children.
 pub(crate) async fn dom_describe_node(
     tab: &TabHandle,
     params: &Value,
 ) -> Result<Value, DispatchError> {
-    const TEMPLATE: &str = r"(function(){
-      const n = host.__tb_dom_nodes[__NODE__];
-      if (!n) return host.stringify({__proto__: null, node: null});
-      const entry = { __proto__: null,
-        nodeId: __NODE__, backendNodeId: __NODE__,
-        nodeType: n.nodeType, nodeName: n.nodeName,
-        childNodeCount: n.childNodes ? n.childNodes.length : 0,
-      };
-      if (n.nodeType === 1) { entry.localName = n.localName; entry.attributes = host.array(); }
-      return host.stringify({__proto__: null, node: entry});
-    })()";
-    let node: crate::params::NodeTarget = crate::params::parse(params)?;
-    let script = TEMPLATE.replace("__NODE__", &requested_node(&node).to_string());
-    dom_eval(tab, &script).await
+    let target: crate::params::NodeTarget = crate::params::parse(params)?;
+    let node = match target_node(tab, &target).await? {
+        TargetNode::Default => 0,
+        TargetNode::Node(id) => id,
+        TargetNode::Missing => return Ok(json!({"node": null})),
+    };
+    let reply = dom_request(tab, DomRequest::DescribeNode { node }).await?;
+    let DomReply::Described { node } = reply else {
+        return Err(DispatchError::BadHelperReply("DOM.describeNode"));
+    };
+    Ok(json!({
+        "node": node.as_ref().map(described_node),
+    }))
 }
 
+/// `DOM.getOuterHTML`: one node's serialized markup.
 pub(crate) async fn dom_outer_html(
     tab: &TabHandle,
     params: &Value,
 ) -> Result<Value, DispatchError> {
-    const TEMPLATE: &str = r"(function(){
-      const n = __NODE__;
-      if (!n) throw new Error('Could not find node with given id');
-      const html = n.nodeType === 9
-        ? (n.documentElement ? n.documentElement.outerHTML : '')
-        : n.outerHTML;
-      if (html === undefined) throw new Error('Node does not support outerHTML');
-      return host.stringify({__proto__: null, outerHTML: html});
-    })()";
-    let node: crate::params::NodeTarget = crate::params::parse(params)?;
-    let script = TEMPLATE.replace("__NODE__", &required_node_expression(&node)?);
-    dom_eval(tab, &script).await
+    let target: crate::params::NodeTarget = crate::params::parse(params)?;
+    if !has_node_identifier(&target) {
+        return Err(DispatchError::InvalidParams(
+            "nodeId, backendNodeId, or objectId".to_owned(),
+        ));
+    }
+    let node = match target_node(tab, &target).await? {
+        TargetNode::Node(id) => id,
+        TargetNode::Default | TargetNode::Missing => return Err(missing_node()),
+    };
+    let reply = dom_request(tab, DomRequest::GetOuterHtml { node }).await?;
+    let DomReply::OuterHtml { outer_html } = reply else {
+        return Err(DispatchError::BadHelperReply("DOM.getOuterHTML"));
+    };
+    Ok(json!({"outerHTML": outer_html}))
 }
 
+/// `DOM.getAttributes`: one element's flattened attribute pairs.
 pub(crate) async fn dom_attributes(
     tab: &TabHandle,
     params: &Value,
 ) -> Result<Value, DispatchError> {
-    const TEMPLATE: &str = r"(function(){
-      const n = __NODE__;
-      if (!n) throw new Error('Could not find node with given id');
-      if (n.nodeType !== 1) throw new Error('Node is not an Element');
-      const attributes = host.array();
-      for (const a of n.attributes) { host.push(attributes, a.name, a.value); }
-      return host.stringify({__proto__: null, attributes: attributes});
-    })()";
-    let node: crate::params::NodeTarget = crate::params::parse(params)?;
-    let script = TEMPLATE.replace("__NODE__", &required_node_expression(&node)?);
-    dom_eval(tab, &script).await
+    let target: crate::params::NodeTarget = crate::params::parse(params)?;
+    if !has_node_identifier(&target) {
+        return Err(DispatchError::InvalidParams(
+            "nodeId, backendNodeId, or objectId".to_owned(),
+        ));
+    }
+    let node = match target_node(tab, &target).await? {
+        TargetNode::Node(id) => id,
+        TargetNode::Default | TargetNode::Missing => return Err(missing_node()),
+    };
+    let reply = dom_request(tab, DomRequest::GetAttributes { node }).await?;
+    let DomReply::Attributes { attributes } = reply else {
+        return Err(DispatchError::BadHelperReply("DOM.getAttributes"));
+    };
+    Ok(json!({"attributes": attributes}))
 }
 
 /// `DOM.resolveNode`: intern the node in the runtime handle table.
@@ -1323,20 +1340,28 @@ pub(crate) async fn dom_resolve_node(
     tab: &TabHandle,
     params: &Value,
 ) -> Result<Value, DispatchError> {
-    const TEMPLATE: &str = r#"(function(){
-      const n = host.__tb_dom_nodes[__NODE__];
-      if (!n) return host.stringify({__proto__: null, object: {__proto__: null, type: "undefined"}});
-      const objectId = "dom-__NODE__";
-      host.__tb_handles[objectId] = n;
-      return host.stringify({__proto__: null, object: {__proto__: null,
-        type: "object", subtype: "node", objectId: objectId,
-        className: n.constructor ? n.constructor.name : "Node",
-        description: n.nodeName,
-      }});
-    })()"#;
-    let node: crate::params::NodeTarget = crate::params::parse(params)?;
-    let script = TEMPLATE.replace("__NODE__", &requested_node(&node).to_string());
-    dom_eval(tab, &script).await
+    let target: crate::params::NodeTarget = crate::params::parse(params)?;
+    let node = match target_node(tab, &target).await? {
+        TargetNode::Default => 0,
+        TargetNode::Node(id) => id,
+        TargetNode::Missing => return Ok(json!({"object": {"type": "undefined"}})),
+    };
+    let reply = dom_request(tab, DomRequest::ResolveNode { node }).await?;
+    let DomReply::Resolved { object } = reply else {
+        return Err(DispatchError::BadHelperReply("DOM.resolveNode"));
+    };
+    Ok(json!({
+        "object": object.map_or_else(
+            || json!({"type": "undefined"}),
+            |object| json!({
+                "type": "object",
+                "subtype": "node",
+                "objectId": object.object_id,
+                "className": object.class_name,
+                "description": object.description,
+            }),
+        ),
+    }))
 }
 
 /// `DOM.getNodeForLocation`: hit-test the viewport point.
@@ -1344,19 +1369,62 @@ pub(crate) async fn dom_node_for_location(
     tab: &TabHandle,
     params: &Value,
 ) -> Result<Value, DispatchError> {
-    const TEMPLATE: &str = r"(function(){
-      const register = __REGISTER__;
-      const x = __X__, y = __Y__;
-      const found = document.elementFromPoint ? document.elementFromPoint(x, y) : null;
-      if (!found) return host.stringify({__proto__: null, nodeId: 0});
-      return host.stringify({__proto__: null, nodeId: register(found)});
-    })()";
     let params: crate::params::NodeForLocation = crate::params::parse(params)?;
-    let script = TEMPLATE
-        .replace("__REGISTER__", REGISTER_PRELUDE)
-        .replace("__X__", &params.x.to_string())
-        .replace("__Y__", &params.y.to_string());
-    dom_eval(tab, &script).await
+    let reply = dom_request(
+        tab,
+        DomRequest::GetNodeForLocation {
+            x: params.x,
+            y: params.y,
+        },
+    )
+    .await?;
+    let DomReply::NodeForLocation { node_id } = reply else {
+        return Err(DispatchError::BadHelperReply("DOM.getNodeForLocation"));
+    };
+    Ok(json!({"nodeId": node_id}))
+}
+
+/// `DOM.getBoxModel`: the node's border box as content/padding/border/margin
+/// quads (the engine has no separate boxes, so all four are the border box).
+pub(crate) async fn dom_box_model(tab: &TabHandle, params: &Value) -> Result<Value, DispatchError> {
+    let target: crate::params::NodeTarget = crate::params::parse(params)?;
+    let node = match target_node(tab, &target).await? {
+        TargetNode::Default => 0,
+        TargetNode::Node(id) => id,
+        TargetNode::Missing => return Ok(json!({"model": null})),
+    };
+    let reply = dom_request(tab, DomRequest::GetBoxModel { node }).await?;
+    let DomReply::BoxModel { model } = reply else {
+        return Err(DispatchError::BadHelperReply("DOM.getBoxModel"));
+    };
+    Ok(json!({
+        "model": model.map(|model| json!({
+            "content": model.content,
+            "padding": model.padding,
+            "border": model.border,
+            "margin": model.margin,
+            "width": model.width,
+            "height": model.height,
+        })),
+    }))
+}
+
+/// `DOM.getContentQuads`: one quad per client rect of the node.
+pub(crate) async fn dom_content_quads(
+    tab: &TabHandle,
+    params: &Value,
+) -> Result<Value, DispatchError> {
+    let target: crate::params::NodeTarget = crate::params::parse(params)?;
+    let node = match target_node(tab, &target).await? {
+        TargetNode::Default => 0,
+        TargetNode::Node(id) => id,
+        TargetNode::Missing => return Ok(json!({"quads": []})),
+    };
+    let reply = dom_request(tab, DomRequest::GetContentQuads { node }).await?;
+    let DomReply::ContentQuads { quads } = reply else {
+        return Err(DispatchError::BadHelperReply("DOM.getContentQuads"));
+    };
+    Ok(json!({"quads": quads}))
 }
 
 /// `CSS.enable`: one `CSS.styleSheetAdded` per document stylesheet.
@@ -1379,45 +1447,8 @@ pub(crate) async fn css_stylesheets(tab: &TabHandle) -> Result<Vec<Value>, Dispa
       }
       return host.stringify(out);
     })()"#;
-    let value = dom_eval(tab, SCRIPT).await?;
+    let value = browser_json(tab, SCRIPT).await?;
     Ok(value.as_array().cloned().unwrap_or_default())
-}
-
-/// `DOM.getBoxModel`: the node's border box as content/padding/border/margin
-/// quads (the engine has no separate boxes, so all four are the border box).
-pub(crate) async fn dom_box_model(tab: &TabHandle, params: &Value) -> Result<Value, DispatchError> {
-    const TEMPLATE: &str = r"(function(){
-      const n = (__NODE__);
-      if (!n || !n.getBoundingClientRect) return host.stringify({__proto__: null, model: null});
-      const r = n.getBoundingClientRect();
-      const quad = [r.left, r.top, r.right, r.top, r.right, r.bottom, r.left, r.bottom];
-      return host.stringify({__proto__: null, model: {__proto__: null,
-        content: quad, padding: quad, border: quad, margin: quad,
-        width: Math.round(r.width), height: Math.round(r.height),
-      }});
-    })()";
-    let node: crate::params::NodeTarget = crate::params::parse(params)?;
-    let script = TEMPLATE.replace("__NODE__", &requested_node_expression(&node));
-    dom_eval(tab, &script).await
-}
-
-/// `DOM.getContentQuads`: one quad per client rect of the node.
-pub(crate) async fn dom_content_quads(
-    tab: &TabHandle,
-    params: &Value,
-) -> Result<Value, DispatchError> {
-    const TEMPLATE: &str = r"(function(){
-      const n = (__NODE__);
-      if (!n || !n.getClientRects) return host.stringify({__proto__: null, quads: []});
-      const quads = host.array();
-      for (const r of n.getClientRects()) {
-        host.push(quads, [r.left, r.top, r.right, r.top, r.right, r.bottom, r.left, r.bottom]);
-      }
-      return host.stringify({__proto__: null, quads: quads});
-    })()";
-    let node: crate::params::NodeTarget = crate::params::parse(params)?;
-    let script = TEMPLATE.replace("__NODE__", &requested_node_expression(&node));
-    dom_eval(tab, &script).await
 }
 
 /// `CSS.getComputedStyleForNode`: the resolved style as name/value pairs.
@@ -1426,7 +1457,7 @@ pub(crate) async fn css_computed_style(
     params: &Value,
 ) -> Result<Value, DispatchError> {
     const TEMPLATE: &str = r"(function(){
-      const n = host.__tb_dom_nodes[__NODE__];
+      const n = host.__tb_handles[__OBJECT__];
       if (!n || !globalThis.getComputedStyle) return host.stringify({__proto__: null, computedStyle: []});
       const style = globalThis.getComputedStyle(n);
       const computedStyle = host.array();
@@ -1437,8 +1468,34 @@ pub(crate) async fn css_computed_style(
       return host.stringify({__proto__: null, computedStyle: computedStyle});
     })()";
     let params: crate::params::ComputedStyleForNode = crate::params::parse(params)?;
-    let script = TEMPLATE.replace("__NODE__", &params.node_id.to_string());
-    dom_eval(tab, &script).await
+    let reply = dom_request(
+        tab,
+        DomRequest::ResolveNode {
+            node: params.node_id,
+        },
+    )
+    .await?;
+    let DomReply::Resolved {
+        object: Some(object),
+    } = reply
+    else {
+        return Ok(json!({"computedStyle": []}));
+    };
+    let script = TEMPLATE.replace("__OBJECT__", &json_string(&object.object_id));
+    browser_json(tab, &script).await
+}
+
+/// Evaluates a browser-owned expression that returns a JSON string and parses
+/// the reply. No DOM node lookup goes through page script.
+async fn browser_json(tab: &TabHandle, script: &str) -> Result<Value, DispatchError> {
+    let value = tab
+        .execute_browser_script(script)
+        .await
+        .map_err(|error| DispatchError::Failed(error.to_string()))?;
+    let RemoteValue::String(text) = value else {
+        return Err(DispatchError::BadHelperReply("browser helper"));
+    };
+    serde_json::from_str(&text).map_err(|error| DispatchError::Failed(error.to_string()))
 }
 
 /// One viewport rectangle for `Page.getLayoutMetrics`.

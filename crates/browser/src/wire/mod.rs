@@ -112,6 +112,13 @@ pub enum Command {
         /// Frame to measure.
         frame: FrameId,
     },
+    /// Answers one typed devtools DOM request from a frame's live tree.
+    Dom {
+        /// Frame whose tree answers.
+        frame: FrameId,
+        /// The typed request.
+        request: renderer::DomRequest,
+    },
 }
 
 /// Renderer reply to one [`Command`].
@@ -129,6 +136,9 @@ pub enum Reply {
     },
     /// A frame's scrollable content size in CSS pixels.
     ContentSize(Result<(f32, f32), TabError>),
+    /// A typed devtools DOM answer. Boxed: the document reply carries a whole
+    /// node tree, and the other replies are a header of that size.
+    Dom(Result<Box<renderer::DomReply>, TabError>),
 }
 
 /// One browser-originated renderer call.

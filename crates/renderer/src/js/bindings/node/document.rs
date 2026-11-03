@@ -4,7 +4,7 @@
 use super::super::{
     CollectionKind, JsImplementation, LegacyNullString, NodeContext, OptString, WebIdlCodeUnits,
     WebIdlString, attr_wrapper, child_value, deref_weak, document_base_url_string,
-    document_is_html, document_is_html_content, document_url_string, element_at_point,
+    document_is_html, document_is_html_content, document_url_string, element_at_point_ctx,
     elements_by_tag, find_element_by_id, fixup_focus_after_removal, host, host_node_id,
     import_attr, is_main_document, live_collection, make_weak, new_detached_attr,
     node_is_shadow_root, required_node, schedule_mutation_delivery, set_attribute_sync, throw_dom,
@@ -694,7 +694,7 @@ impl JsNode {
         x: f64,
         y: f64,
     ) -> Result<Value<'js>> {
-        let Some(node) = element_at_point(&ctx, self.handle.0, x, y)? else {
+        let Some(node) = element_at_point_ctx(&ctx, self.handle.0, x, y)? else {
             return Ok(Value::new_null(ctx));
         };
         wrap_node(&ctx, node)
@@ -709,7 +709,7 @@ impl JsNode {
         y: f64,
     ) -> Result<Vec<Value<'js>>> {
         let mut elements = Vec::new();
-        let Some(node) = element_at_point(&ctx, self.handle.0, x, y)? else {
+        let Some(node) = element_at_point_ctx(&ctx, self.handle.0, x, y)? else {
             return Ok(elements);
         };
         // The hit-test stack: the element and its ancestors, topmost first.

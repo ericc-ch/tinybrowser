@@ -5,10 +5,10 @@ use super::super::{
     AttrArgument, CollectionKind, JsNamedNodeMap, JsTokenList, LegacyNullString, NodeContext,
     NodeOrString, OptString, WebIdlString, after_attribute_change, attached_attr_id, attr_owner,
     attr_state, attr_wrapper, attribute_local_name, attribute_value, blur_node, deref_weak,
-    document_is_html_content, dom_string, element_box, element_click, fixup_focus_after_removal,
-    focus_node, host, host_node_id, is_focusable, js_string_to_utf8, live_collection, make_weak,
-    rect_object, remove_attribute_sync, schedule_mutation_delivery, set_attribute_node,
-    set_attribute_sync, string_value, throw_dom, throw_dom_error, touch_attr,
+    document_is_html_content, dom_string, element_box_ctx, element_click,
+    fixup_focus_after_removal, focus_node, host, host_node_id, is_focusable, js_string_to_utf8,
+    live_collection, make_weak, rect_object, remove_attribute_sync, schedule_mutation_delivery,
+    set_attribute_node, set_attribute_sync, string_value, throw_dom, throw_dom_error, touch_attr,
     valid_attribute_local_name, validate_and_extract, with_node_data, world, world_for_node,
     wrap_node,
 };
@@ -1261,7 +1261,7 @@ impl JsNode {
     // The element's border box from the render pipeline's layout; zero when
     // the element generates no box (for example `display: none`).
     pub(super) fn get_bounding_client_rect<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        match element_box(&ctx, self.handle.0)? {
+        match element_box_ctx(&ctx, self.handle.0)? {
             Some((left, top, width, height)) => {
                 let (scroll_x, scroll_y) = viewport_offset(&ctx, self.handle.0)?;
                 Ok(rect_object(&ctx, left - scroll_x, top - scroll_y, width, height)?.into_value())
@@ -1272,7 +1272,7 @@ impl JsNode {
 
     pub(super) fn get_client_rects<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
         let array = Array::new(ctx.clone())?;
-        if let Some((left, top, width, height)) = element_box(&ctx, self.handle.0)? {
+        if let Some((left, top, width, height)) = element_box_ctx(&ctx, self.handle.0)? {
             let (scroll_x, scroll_y) = viewport_offset(&ctx, self.handle.0)?;
             array.set(
                 0,
@@ -1285,7 +1285,7 @@ impl JsNode {
     /// Scrolls the viewport so this element's border box is visible.
     /// <https://drafts.csswg.org/cssom-view/#dom-element-scrollintoview>
     pub(super) fn scroll_into_view(&self, ctx: Ctx<'_>) -> Result<()> {
-        let Some((left, top, width, _height)) = element_box(&ctx, self.handle.0)? else {
+        let Some((left, top, width, _height)) = element_box_ctx(&ctx, self.handle.0)? else {
             return Ok(());
         };
         let world = world_for_node(&ctx, self.handle.0)?;
@@ -2055,61 +2055,11 @@ impl JsNode {
     // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-element-outerhtml
     pub(super) fn outer_html<'js>(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
         let world = world(ctx)?;
-        let (contents, html, markup) = {
-            let borrowed = world.borrow();
-            let Some(parsed) = borrowed.document(self.handle.0) else {
-                return Err(Exception::throw_type(ctx, "no document"));
-            };
-            let base = &parsed.document.base;
-            let Some(element) = base
-                .get_node(self.handle.0.node)
-                .and_then(|node| node.data.downcast_element())
-            else {
-                return Err(Exception::throw_type(ctx, "outerHTML requires an element"));
-            };
-            let name = element.name.clone();
-            let attributes = element.attrs.iter().cloned().collect::<Vec<_>>();
-            let contents = parsed.document.template_owner(self.handle.0.node);
-            let html = parsed.content_type == "text/html";
-            let markup = if html {
-                serialization::serialize_html_outer(
-                    &parsed.document,
-                    self.handle.0.node,
-                    &name,
-                    &attributes,
-                )
-            } else {
-                let mut output = serialization::HtmlOutput::default();
-                serialization::serialize_xml_element(
-                    &parsed.document,
-                    self.handle.0.node,
-                    &name,
-                    &attributes,
-                    &mut output,
-                );
-                output.finish()
-            };
-            (contents, html, markup)
-        };
-        let markup = if let Some((document, fragment)) = contents {
-            let contents_id = NodeId {
-                document,
-                node: fragment,
-            };
-            let children = world
-                .borrow()
-                .with_document(contents_id, |parsed| {
-                    if html {
-                        serialization::serialize_html_children(&parsed.document, fragment)
-                    } else {
-                        serialization::serialize_xml_children(&parsed.document, fragment)
-                    }
-                })
-                .unwrap_or_default();
-            splice_before_close_tag(markup, &children)
-        } else {
-            markup
-        };
+        if world.borrow().document(self.handle.0).is_none() {
+            return Err(Exception::throw_type(ctx, "no document"));
+        }
+        let markup = crate::document::dom::element_outer_html(&world.borrow(), self.handle.0)
+            .ok_or_else(|| Exception::throw_type(ctx, "outerHTML requires an element"))?;
         dom_string(ctx, &markup)
     }
 
@@ -2838,24 +2788,6 @@ pub(super) fn viewport_offset(ctx: &Ctx<'_>, id: NodeId) -> Result<(f64, f64)> {
     };
     let scroll = parsed.document.base.viewport_scroll();
     Ok((scroll.x, scroll.y))
-}
-
-/// Inserts `children` before the final start of a closing tag. A migrated
-/// template's outer markup is the host element's tags plus the inert
-/// contents
-/// (<https://html.spec.whatwg.org/multipage/parsing.html#serialising-html-fragments>).
-fn splice_before_close_tag(
-    shell: crate::dom_string::DomString,
-    children: &crate::dom_string::DomString,
-) -> crate::dom_string::DomString {
-    let units = shell.units();
-    let Some(end) = units.iter().rposition(|unit| *unit == u16::from(b'<')) else {
-        return shell;
-    };
-    let mut merged = units[..end].to_vec();
-    merged.extend(children.units().iter().copied());
-    merged.extend_from_slice(&units[end..]);
-    crate::dom_string::DomString::from_utf16(merged)
 }
 
 /// The node whose children are a template's contents: the inert fragment
