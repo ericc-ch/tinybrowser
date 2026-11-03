@@ -22,8 +22,6 @@ use tiny_skia::{
     Transform,
 };
 
-use super::text::TextMetricsRecord;
-
 /// One canvas rendering context.
 pub(crate) struct Canvas2D {
     pub(crate) width: u32,
@@ -37,9 +35,6 @@ pub(crate) struct Canvas2D {
     gradients: HashMap<u32, Gradient>,
     patterns: HashMap<u32, Pattern>,
     next_resource: u32,
-    /// Measured strings, keyed by the id stamped on the `TextMetrics` object.
-    metrics: HashMap<u32, TextMetricsRecord>,
-    next_metrics: u32,
     /// Whether every image painted into this canvas was same-origin. A
     /// cross-origin image clears the flag, and `getImageData` then throws
     /// `SecurityError`
@@ -338,6 +333,33 @@ pub(crate) enum TextBaseline {
     Bottom,
 }
 
+impl TextBaseline {
+    /// Parses the `CanvasTextBaseline` enum value the setters accept.
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "top" => Self::Top,
+            "hanging" => Self::Hanging,
+            "middle" => Self::Middle,
+            "alphabetic" => Self::Alphabetic,
+            "ideographic" => Self::Ideographic,
+            "bottom" => Self::Bottom,
+            _ => return None,
+        })
+    }
+
+    /// The IDL enum value, as `ctx.textBaseline` reports it.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Top => "top",
+            Self::Hanging => "hanging",
+            Self::Middle => "middle",
+            Self::Alphabetic => "alphabetic",
+            Self::Ideographic => "ideographic",
+            Self::Bottom => "bottom",
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Direction {
     Inherit,
@@ -492,10 +514,6 @@ impl Canvas2D {
         let gradients = std::mem::take(&mut self.gradients);
         let patterns = std::mem::take(&mut self.patterns);
         let next_resource = self.next_resource;
-        // A measured string is a snapshot independent of the drawing state, so
-        // its metrics survive a resize just like a gradient object does.
-        let metrics = std::mem::take(&mut self.metrics);
-        let next_metrics = self.next_metrics;
         // Resizing clears the bitmap and state, not the taint: a canvas that
         // painted a cross-origin image stays unreadable.
         let origin_clean = self.origin_clean;
@@ -503,8 +521,6 @@ impl Canvas2D {
         self.gradients = gradients;
         self.patterns = patterns;
         self.next_resource = next_resource;
-        self.metrics = metrics;
-        self.next_metrics = next_metrics;
         self.origin_clean = origin_clean;
     }
 
@@ -521,25 +537,9 @@ impl Canvas2D {
             gradients: HashMap::new(),
             patterns: HashMap::new(),
             next_resource: 1,
-            metrics: HashMap::new(),
-            next_metrics: 1,
             origin_clean: true,
             layers: Vec::new(),
         }
-    }
-
-    /// Stores one measured string and returns the id the `TextMetrics` object
-    /// carries. The shaping belongs to the context, so a read never shapes the
-    /// string again.
-    pub(crate) fn store_text_metrics(&mut self, metrics: TextMetricsRecord) -> u32 {
-        let id = self.next_metrics;
-        self.next_metrics += 1;
-        self.metrics.insert(id, metrics);
-        id
-    }
-
-    pub(crate) fn text_metrics(&self, id: u32) -> Option<&TextMetricsRecord> {
-        self.metrics.get(&id)
     }
 
     pub(crate) fn origin_clean(&self) -> bool {
@@ -1119,26 +1119,13 @@ impl Canvas2D {
     }
 
     pub(crate) fn text_baseline(&self) -> &'static str {
-        match self.state.text_baseline {
-            TextBaseline::Top => "top",
-            TextBaseline::Hanging => "hanging",
-            TextBaseline::Middle => "middle",
-            TextBaseline::Alphabetic => "alphabetic",
-            TextBaseline::Ideographic => "ideographic",
-            TextBaseline::Bottom => "bottom",
-        }
+        self.state.text_baseline.as_str()
     }
 
     pub(crate) fn set_text_baseline(&mut self, value: &str) {
-        self.state.text_baseline = match value {
-            "top" => TextBaseline::Top,
-            "hanging" => TextBaseline::Hanging,
-            "middle" => TextBaseline::Middle,
-            "alphabetic" => TextBaseline::Alphabetic,
-            "ideographic" => TextBaseline::Ideographic,
-            "bottom" => TextBaseline::Bottom,
-            _ => return,
-        };
+        if let Some(baseline) = TextBaseline::parse(value) {
+            self.state.text_baseline = baseline;
+        }
     }
 
     pub(crate) fn direction(&self) -> &'static str {

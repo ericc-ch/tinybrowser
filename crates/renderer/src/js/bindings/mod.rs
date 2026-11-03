@@ -1860,6 +1860,63 @@ mod realm_tests {
     }
 
     #[test]
+    fn canvas_measure_text_freezes_alignment_and_rejects_foreign_clusters() {
+        let services: Arc<dyn BrowserServices> = Arc::new(NullServices);
+        let shared = SharedJsRuntime::default();
+        let stop = Arc::new(Stop::new());
+        let documents = Rc::new(RefCell::new(crate::documents::DocumentStore::default()));
+        let registry = Rc::new(RefCell::new(crate::js::RealmRegistry::default()));
+        let world = world_with_document(
+            &shared,
+            &services,
+            &documents,
+            &registry,
+            "https://a.test/",
+            "<!doctype html><canvas id=c width=100 height=100></canvas>",
+        );
+        let realm = JsRealm::new(&shared.handle(), world, stop).expect("realm");
+        let outcome = realm
+            .eval(
+                r"
+                var ctx = document.getElementById('c').getContext('2d');
+                ctx.font = '40px serif';
+                ctx.textAlign = 'center';
+                var tm = ctx.measureText('E');
+                var width = tm.width;
+                var frozen = tm.getTextClusters()[0].x;
+                ctx.textAlign = 'left';
+                var later = tm.getTextClusters()[0].x;
+
+                // A getter re-entering the canvas must not abort the renderer.
+                var reentered = true;
+                try {
+                  tm.getTextClusters({ get align() { ctx.fillRect(0, 0, 1, 1); return 'left'; } });
+                } catch (e) { reentered = false; }
+
+                // A plain object is not a TextCluster.
+                var rejected = false;
+                try { ctx.fillTextCluster({start: 0, end: 1, x: 0, y: 0}, 0, 0); }
+                catch (e) { rejected = e instanceof TypeError; }
+
+                [
+                  Math.abs(frozen - width / 2) < 0.5,
+                  frozen === later,
+                  reentered,
+                  rejected,
+                  typeof TextCluster === 'function',
+                  typeof TextMetrics === 'function',
+                  tm instanceof TextMetrics,
+                  tm.getTextClusters()[0] instanceof TextCluster,
+                  TextCluster.prototype.hasOwnProperty('begin'),
+                  TextCluster.prototype.hasOwnProperty('align'),
+                ].join(',');
+                ",
+            )
+            .expect("canvas metrics");
+        assert_eq!(outcome, "true,true,true,true,true,true,true,true,true,true");
+    }
+
+    #[test]
     fn replacing_with_a_foreign_fragment_adopts_each_child() {
         let services: Arc<dyn BrowserServices> = Arc::new(NullServices);
         let shared = SharedJsRuntime::default();

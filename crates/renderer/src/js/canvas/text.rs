@@ -17,27 +17,35 @@ use skrifa::raw::{FontRead as _, TableProvider as _};
 use skrifa::{FontRef, GlyphId, MetadataProvider};
 use tiny_skia::{Path, PathBuilder, Transform};
 
+use super::state::TextBaseline;
+
 /// One shaping cluster in text space. This follows Parley's shaping
 /// boundaries, so a ligature such as `fi` is one cluster spanning two
 /// graphemes; `getTextClusters` exposes these positions, not grapheme split
 /// points.
 pub(crate) struct TextCluster {
-    pub(crate) byte_start: usize,
-    pub(crate) byte_end: usize,
-    pub(crate) utf16_start: usize,
-    pub(crate) utf16_end: usize,
+    /// The cluster's text, kept so `TextCluster.text` never re-slices the
+    /// original string through a byte map.
+    pub(crate) text: String,
+    pub(crate) utf16_start: u32,
+    pub(crate) utf16_end: u32,
+    /// Visual offset from the text origin, in unscaled text space.
     pub(crate) offset: f32,
     pub(crate) advance: f32,
-    /// Glyph ink bounds for this cluster, in text space relative to the
-    /// baseline, squeezed by `maxWidth` when one applies. A cluster with no
-    /// glyphs (a ligature continuation) has `None`.
+    /// The cluster's glyph outlines, in unscaled text space with the cluster's
+    /// own origin at `x = 0`. Drawing translates by the cluster's position, so
+    /// `fillTextCluster` paints exactly these outlines rather than re-shaping
+    /// the cluster's text. A cluster with no glyphs (a ligature continuation)
+    /// has `None`.
+    pub(crate) path: Option<Path>,
+    /// Glyph ink bounds for this cluster, relative to the text origin and the
+    /// alphabetic baseline, squeezed by `maxWidth` when one applies.
     pub(crate) ink: Option<ClusterInk>,
 }
 
-/// The ink bounds of one cluster, relative to the alphabetic baseline and the
-/// text origin. `ascent` and `descent` are positive; `min_x` and `max_x` keep
-/// their sign so a glyph that overhangs left of the origin reports it in
-/// `min_x`.
+/// Ink bounds relative to the text origin and the alphabetic baseline.
+/// `ascent` and `descent` are positive; `min_x` and `max_x` keep their sign so
+/// a glyph that overhangs left of the origin reports it in `min_x`.
 #[derive(Clone, Copy)]
 pub(crate) struct ClusterInk {
     pub(crate) min_x: f32,
@@ -46,39 +54,83 @@ pub(crate) struct ClusterInk {
     pub(crate) descent: f32,
 }
 
-/// One measured string, owned by the canvas context for as long as a
-/// `TextMetrics` object can ask questions about it.
+impl ClusterInk {
+    /// The union of two ink boxes. `None` on either side means the other side.
+    pub(crate) fn union(self, other: Self) -> Self {
+        Self {
+            min_x: self.min_x.min(other.min_x),
+            max_x: self.max_x.max(other.max_x),
+            ascent: self.ascent.max(other.ascent),
+            descent: self.descent.max(other.descent),
+        }
+    }
+}
+
+/// One measured string. The `TextMetrics` object and every `TextCluster` it
+/// returns hold an `Rc` to this record, so the shaping is freed when the last
+/// script-visible object dies instead of accumulating on the context.
 pub(crate) struct TextMetricsRecord {
     pub(crate) text: String,
     pub(crate) shaped: ShapedText,
+    /// The `width` member, corrected in f64 for `word-spacing`, so the scalar
+    /// and the bounding-box members agree.
+    pub(crate) width: f64,
     /// The resolved `textAlign` at measure time, so a read never re-resolves
     /// against a later context state.
-    pub(crate) align: &'static str,
-    pub(crate) baseline: String,
+    pub(crate) align: ResolvedAlign,
+    pub(crate) baseline: TextBaseline,
     /// Whether the context's direction resolved to right-to-left, so an
     /// `align` option on `getTextClusters` resolves without the context.
     pub(crate) rtl: bool,
+}
+
+/// `textAlign` resolved against the paragraph direction. `start`/`end` have no
+/// meaning once the direction is known, so the record never stores them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResolvedAlign {
+    Left,
+    Right,
+    Center,
+}
+
+impl ResolvedAlign {
+    /// The IDL value `TextCluster.align` reports.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Left => "left",
+            Self::Right => "right",
+            Self::Center => "center",
+        }
+    }
+}
+
+/// What a shaping pass produces. A drawing pass needs one combined glyph path;
+/// a measurement needs per-cluster paths and ink; the width-only pass that
+/// corrects `word-spacing` needs neither.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Shaping {
+    Glyphs,
+    Clusters,
+    Width,
 }
 
 /// One shaped string. `glyph_path` shifts the outlines so the top of the em
 /// box is at `y = 0` and the alphabetic baseline is at `y = ascent`; callers
 /// subtract that to anchor at the requested baseline.
 pub(crate) struct ShapedText {
+    /// The combined glyph path, present only for [`Shaping::Glyphs`].
     pub(crate) path: Option<Path>,
     pub(crate) width: f32,
     pub(crate) ascent: f32,
     pub(crate) descent: f32,
     /// Horizontal squeeze applied by `fillText`'s `maxWidth`.
     pub(crate) scale_x: f32,
-    /// Shaped clusters, in visual order. These follow shaping boundaries, so a
-    /// ligature such as `fi` is one cluster even though it spans two graphemes.
+    /// Shaped clusters, in visual order, present only for [`Shaping::Clusters`].
     pub(crate) clusters: Vec<TextCluster>,
-    /// Glyph ink bounds relative to the alignment point and baseline
+    /// The union of every cluster's ink, relative to the text origin and the
+    /// alphabetic baseline, squeezed by `maxWidth`
     /// (<https://html.spec.whatwg.org/multipage/canvas.html#textmetrics>).
-    pub(crate) ink_min_x: f32,
-    pub(crate) ink_max_x: f32,
-    pub(crate) actual_ascent: f32,
-    pub(crate) actual_descent: f32,
+    pub(crate) ink: Option<ClusterInk>,
     /// Font-level metrics in css pixels, for `TextMetrics`.
     pub(crate) em_ascent: f32,
     pub(crate) em_descent: f32,
@@ -94,7 +146,9 @@ pub(crate) struct ShapedText {
 #[expect(
     clippy::too_many_arguments,
     clippy::too_many_lines,
-    reason = "shaping consumes the full canvas text state in one pass"
+    clippy::cast_possible_truncation,
+    reason = "shaping consumes the full canvas text state in one pass, and a \
+              UTF-16 offset beyond u32::MAX cannot fit in a JavaScript string"
 )]
 pub(crate) fn shape(
     text: &str,
@@ -105,7 +159,7 @@ pub(crate) fn shape(
     language: Option<&str>,
     kerning: &str,
     font_ctx: &mut FontContext,
-    want_clusters: bool,
+    shaping: Shaping,
 ) -> ShapedText {
     // Canvas text preparation replaces ASCII whitespace with U+0020 and
     // shapes one line; newlines are not mandatory breaks
@@ -123,11 +177,11 @@ pub(crate) fn shape(
     let parsed = parse_font(font);
     // Canvas replaces every collapsible whitespace with U+0020 and does not
     // collapse runs (<https://html.spec.whatwg.org/multipage/canvas.html#text-preparation-algorithm>).
-    // U+0000 has zero advance, so it never reaches the shaper. Keep a byte map
-    // back to the original string: cluster ranges stay valid for
-    // `fillTextCluster`/`getSelectionRects`, which slice the original text.
+    // U+0000 has zero advance, so it never reaches the shaper. A measurement
+    // keeps a byte map back to the original string so a cluster's UTF-16 range
+    // and text refer to the string the page measured.
     let mut prepared = String::with_capacity(text.len());
-    let mut byte_map = want_clusters.then(|| Vec::with_capacity(text.len() + 1));
+    let mut byte_map = (shaping == Shaping::Clusters).then(|| Vec::with_capacity(text.len() + 1));
     for (byte, ch) in text.char_indices() {
         if ch == '\0' {
             continue;
@@ -152,10 +206,7 @@ pub(crate) fn shape(
             descent: parsed.size * 0.25,
             scale_x: 1.0,
             clusters: Vec::new(),
-            ink_min_x: 0.0,
-            ink_max_x: 0.0,
-            actual_ascent: 0.0,
-            actual_descent: 0.0,
+            ink: None,
             em_ascent: parsed.size,
             em_descent: 0.0,
             font_ascent: parsed.size,
@@ -211,7 +262,7 @@ pub(crate) fn shape(
     let scale_x = max_width
         .filter(|max| *max > 0.0 && width > *max)
         .map_or(1.0, |max| max / width);
-    let utf16_offsets = if want_clusters {
+    let utf16_offsets = if shaping == Shaping::Clusters {
         cluster_utf16_offsets(&text)
     } else {
         Vec::new()
@@ -227,13 +278,20 @@ pub(crate) fn shape(
                     let range = cluster.text_range();
                     let byte_start = byte_map[range.start];
                     let byte_end = byte_map[range.end];
+                    // The byte map is monotonic and lands on character
+                    // boundaries: every normalization is one byte to one byte
+                    // and U+0000 is dropped from both sides. A slice that is
+                    // not on a boundary would abort the renderer, so prove the
+                    // invariant here instead of trusting it at the call site.
+                    debug_assert!(text.is_char_boundary(byte_start));
+                    debug_assert!(text.is_char_boundary(byte_end));
                     clusters.push(TextCluster {
-                        byte_start,
-                        byte_end,
-                        utf16_start: utf16_offsets[byte_start],
-                        utf16_end: utf16_offsets[byte_end],
+                        text: text[byte_start..byte_end].to_owned(),
+                        utf16_start: utf16_offsets[byte_start] as u32,
+                        utf16_end: utf16_offsets[byte_end] as u32,
                         offset: cluster.visual_offset().unwrap_or(0.0),
                         advance: cluster.advance(),
+                        path: None,
                         ink: None,
                     });
                 }
@@ -241,32 +299,38 @@ pub(crate) fn shape(
         }
     }
     let font_metrics = layout_font_metrics(&layout, parsed.size);
-    // The glyph path stays in text space; the drawing transform applies the
-    // maxWidth squeeze. Metrics need their own squeezed copy. A measurement
-    // also needs each cluster's own ink bounds, so a range query answers from
-    // this one shaping instead of shaping the range again.
-    let path = if clusters.is_empty() {
-        glyph_path(&layout, None)
-    } else {
-        glyph_path(&layout, Some((&mut clusters, scale_x, ascent)))
+    // A drawing pass keeps one combined glyph path; a measurement keeps one
+    // path per cluster plus the ink each glyph contributes, so every query
+    // answers from this single shaping pass.
+    let path = match shaping {
+        Shaping::Glyphs => glyph_path(&layout, None),
+        Shaping::Clusters => {
+            glyph_path(&layout, Some((&mut clusters, scale_x, ascent)));
+            None
+        }
+        Shaping::Width => None,
     };
-    let (ink_min_x, ink_max_x, actual_ascent, actual_descent) = path
-        .as_ref()
-        .and_then(|path| {
-            path.clone().transform(
-                Transform::from_scale(scale_x, 1.0)
-                    .pre_concat(Transform::from_translate(0.0, -ascent)),
-            )
-        })
-        .map(|path| path.bounds())
-        .map_or((0.0, 0.0, 0.0, 0.0), |bounds| {
-            (
-                bounds.left(),
-                bounds.right(),
-                (-bounds.top()).max(0.0),
-                bounds.bottom().max(0.0),
-            )
-        });
+    let ink = if shaping == Shaping::Clusters {
+        clusters
+            .iter()
+            .filter_map(|cluster| cluster.ink)
+            .reduce(ClusterInk::union)
+    } else {
+        path.as_ref()
+            .and_then(|path| {
+                path.clone().transform(
+                    Transform::from_scale(scale_x, 1.0)
+                        .pre_concat(Transform::from_translate(0.0, -ascent)),
+                )
+            })
+            .map(|path| path.bounds())
+            .map(|bounds| ClusterInk {
+                min_x: bounds.left(),
+                max_x: bounds.right(),
+                ascent: (-bounds.top()).max(0.0),
+                descent: bounds.bottom().max(0.0),
+            })
+    };
     ShapedText {
         path,
         width,
@@ -274,10 +338,7 @@ pub(crate) fn shape(
         descent,
         scale_x,
         clusters,
-        ink_min_x,
-        ink_max_x,
-        actual_ascent,
-        actual_descent,
+        ink,
         em_ascent: font_metrics.em_ascent,
         em_descent: font_metrics.em_descent,
         font_ascent: font_metrics.font_ascent,
@@ -399,25 +460,32 @@ fn layout_font_metrics(layout: &parley::Layout<[u8; 4]>, size: f32) -> FontMetri
     }
 }
 
-/// The cluster whose visual extent contains `x`, chosen from `order`, which
-/// sorts cluster indexes by their left edge. A glyph that starts a ligature
-/// belongs to the first cluster of that ligature, which is exactly the cluster
-/// whose offset is at or before the glyph.
+/// The cluster that owns a glyph at `x`, chosen from `order`, which sorts
+/// cluster indexes by their left edge. `partition_point` returns the last
+/// cluster whose offset is at or before `x`, so a glyph that starts a ligature
+/// lands on the cluster where that ligature begins, not on a later
+/// continuation cluster. Parley's `visual_offset` and `PositionedGlyph::x`
+/// share an origin and are monotonic, which is what makes the comparison
+/// meaningful.
 fn cluster_at(order: &[usize], clusters: &[TextCluster], x: f32) -> Option<usize> {
     let position = order.partition_point(|index| clusters[*index].offset <= x);
     order.get(position.saturating_sub(1)).copied()
 }
 
-/// Builds the glyph path in text space. When `ink` is present, the same glyph
-/// pass also unions each glyph's ink bounds into its cluster, so
-/// `getActualBoundingBox(start, end)` can answer without shaping the range
-/// again.
+/// Builds the glyph outlines in text space. When `ink` is present, the same
+/// glyph pass also records each cluster's own path and unions its ink bounds,
+/// so `fillTextCluster` paints the measured shaping and
+/// `getActualBoundingBox(start, end)` answers without shaping the range again.
 fn glyph_path(
     layout: &parley::Layout<[u8; 4]>,
     mut ink: Option<(&mut [TextCluster], f32, f32)>,
 ) -> Option<Path> {
     let mut builder = PathBuilder::new();
     let mut placed_any = false;
+    let mut cluster_builders: Vec<PathBuilder> = match ink.as_ref() {
+        Some((clusters, _, _)) => (0..clusters.len()).map(|_| PathBuilder::new()).collect(),
+        None => Vec::new(),
+    };
     let root_ascent = layout
         .root_span_metrics()
         .map_or(0.0, |metrics| metrics.ascent);
@@ -464,7 +532,8 @@ fn glyph_path(
                 };
                 if let Some((clusters, scale_x, ascent)) = ink.as_mut()
                     && let Some(index) = cluster_at(&cluster_order, clusters, glyph.x)
-                    && let Some(bounds) = path
+                {
+                    if let Some(bounds) = path
                         .clone()
                         .transform(
                             Transform::from_scale(*scale_x, 1.0)
@@ -472,28 +541,41 @@ fn glyph_path(
                         )
                         .as_ref()
                         .map(Path::bounds)
-                {
-                    let glyph_ink = ClusterInk {
-                        min_x: bounds.left(),
-                        max_x: bounds.right(),
-                        ascent: (-bounds.top()).max(0.0),
-                        descent: bounds.bottom().max(0.0),
-                    };
-                    let slot = &mut clusters[index].ink;
-                    *slot = Some(match *slot {
-                        None => glyph_ink,
-                        Some(current) => ClusterInk {
-                            min_x: current.min_x.min(glyph_ink.min_x),
-                            max_x: current.max_x.max(glyph_ink.max_x),
-                            ascent: current.ascent.max(glyph_ink.ascent),
-                            descent: current.descent.max(glyph_ink.descent),
-                        },
-                    });
+                    {
+                        let glyph_ink = ClusterInk {
+                            min_x: bounds.left(),
+                            max_x: bounds.right(),
+                            ascent: (-bounds.top()).max(0.0),
+                            descent: bounds.bottom().max(0.0),
+                        };
+                        let slot = &mut clusters[index].ink;
+                        *slot = Some(match *slot {
+                            None => glyph_ink,
+                            Some(current) => current.union(glyph_ink),
+                        });
+                    }
+                    // The cluster path is stored with the cluster's own origin
+                    // at zero, so drawing it translates by the cluster's
+                    // position instead of carrying the whole line's offset.
+                    let origin = clusters[index].offset;
+                    if let Some(local) = path
+                        .clone()
+                        .transform(Transform::from_translate(-origin, 0.0))
+                    {
+                        cluster_builders[index].push_path(&local);
+                    }
+                } else {
+                    builder.push_path(&path);
+                    placed_any = true;
                 }
-                builder.push_path(&path);
-                placed_any = true;
             }
         }
+    }
+    if let Some((clusters, _, _)) = ink {
+        for (cluster, builder) in clusters.iter_mut().zip(cluster_builders) {
+            cluster.path = builder.finish();
+        }
+        return None;
     }
     placed_any.then(|| builder.finish()).flatten()
 }
