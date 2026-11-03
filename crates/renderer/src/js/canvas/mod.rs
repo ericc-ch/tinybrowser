@@ -38,6 +38,30 @@ impl std::ops::Deref for DomString {
     }
 }
 
+/// One measured glyph cluster. A native class, not a plain object, so
+/// `fillTextCluster` can tell a cluster this engine produced from an object a
+/// page made up; the brand is the class itself
+/// (<https://github.com/whatwg/html/issues/10677>).
+#[derive(rquickjs::JsLifetime)]
+#[rquickjs::class(rename = "TextCluster")]
+pub(crate) struct JsTextCluster {
+    #[qjs(get)]
+    pub(crate) start: u32,
+    #[qjs(get)]
+    pub(crate) end: u32,
+    /// The anchor delta from the measured text's alignment point.
+    #[qjs(get, set)]
+    pub(crate) x: f64,
+    #[qjs(get, set)]
+    pub(crate) y: f64,
+    #[qjs(get)]
+    pub(crate) text: std::string::String,
+}
+
+impl<'js> rquickjs::class::Trace<'js> for JsTextCluster {
+    fn trace<'a>(&self, _tracer: rquickjs::class::Tracer<'a, 'js>) {}
+}
+
 impl<'js> FromJs<'js> for DomString {
     fn from_js(ctx: &Ctx<'js>, value: Value<'js>) -> Result<Self> {
         Ok(Self(
@@ -2843,7 +2867,7 @@ fn stroke_text(
 
 fn fill_text_cluster<'js>(
     this: This<Object<'js>>,
-    cluster: Value<'js>,
+    cluster: Class<'js, JsTextCluster>,
     x: Coerced<f64>,
     y: Coerced<f64>,
     options: Opt<Value<'js>>,
@@ -2853,7 +2877,7 @@ fn fill_text_cluster<'js>(
 
 fn stroke_text_cluster<'js>(
     this: This<Object<'js>>,
-    cluster: Value<'js>,
+    cluster: Class<'js, JsTextCluster>,
     x: Coerced<f64>,
     y: Coerced<f64>,
     options: Opt<Value<'js>>,
@@ -2863,22 +2887,16 @@ fn stroke_text_cluster<'js>(
 
 fn draw_text_cluster<'js>(
     this: This<Object<'js>>,
-    cluster: Value<'js>,
+    cluster: Class<'js, JsTextCluster>,
     x: f64,
     y: f64,
     options: Opt<Value<'js>>,
     stroke: bool,
 ) -> Result<()> {
-    let ctx = this.0.ctx();
-    let Some(cluster) = cluster.as_object() else {
-        return Err(Exception::throw_type(
-            ctx,
-            "fillTextCluster needs a cluster",
-        ));
+    let (text, cluster_x, cluster_y) = {
+        let cluster = cluster.borrow();
+        (cluster.text.clone(), f32_of(cluster.x), f32_of(cluster.y))
     };
-    let text: String = cluster.get("text")?;
-    let cluster_x: f32 = cluster.get("x")?;
-    let cluster_y: f32 = cluster.get("y")?;
     let mut align = None;
     let mut baseline = None;
     let mut dx = 0.0;
@@ -3079,75 +3097,65 @@ fn text_range<'js>(
     Ok((start, end))
 }
 
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "TextMetrics UTF-16 offsets fit in unsigned long"
-)]
+/// Runs `query` against the shaping stored by `measureText`. The record lives
+/// on the canvas context, so the receiver needs its canvas identity
+/// (`__tbDoc`/`__tbNode`) plus the metrics id the measurement stamped on it.
+fn with_metrics<R>(
+    ctx: &Ctx<'_>,
+    object: &Object<'_>,
+    query: impl FnOnce(&text::TextMetricsRecord) -> Result<R>,
+) -> Result<R> {
+    let id: u32 = object.get("__tbMetrics")?;
+    with_canvas(ctx, object, |canvas| {
+        let Some(record) = canvas.text_metrics(id) else {
+            return Err(crate::js::bindings::throw_dom(
+                ctx,
+                "InvalidStateError",
+                "the text metrics record is gone",
+            ));
+        };
+        query(record)
+    })?
+}
+
 fn get_text_clusters<'js>(
     this: This<Object<'js>>,
     args: rquickjs::function::Rest<Value<'js>>,
 ) -> Result<Array<'js>> {
     let ctx = this.0.ctx();
-    let text: String = this.0.get("__tbText")?;
-    let (start, end) = text_range(ctx, &text, &args.0, true, true, false)?;
-    let font: String = this.0.get("__tbFont")?;
-    let letter: f32 = this.0.get("__tbLetterSpacing").unwrap_or(0.0);
-    let word: f32 = this.0.get("__tbWordSpacing").unwrap_or(0.0);
-    let lang: String = this
-        .0
-        .get("__tbLang")
-        .unwrap_or_else(|_| "inherit".to_owned());
-    let kerning: String = this
-        .0
-        .get("__tbKerning")
-        .unwrap_or_else(|_| "auto".to_owned());
-    let language = resolved_language(ctx, &this.0, &lang);
-    let mut font_ctx = document_font_context(ctx, &this.0)?;
-    let shaped = text::shape(
-        &text,
-        &font,
-        None,
-        letter,
-        word,
-        language.as_deref(),
-        &kerning,
-        &mut font_ctx,
-        true,
-    );
-    let mut align: String = this.0.get("__tbAlign")?;
-    let mut baseline: String = this.0.get("__tbBaseline").unwrap_or_default();
-    if let Some(options) = args.0.first().and_then(Value::as_object) {
-        if let Ok(value) = options.get::<_, String>("align") {
-            align = value;
+    with_metrics(ctx, &this.0, |record| {
+        let (start, end) = text_range(ctx, &record.text, &args.0, true, true, false)?;
+        let mut align = record.align;
+        let mut baseline = record.baseline.clone();
+        if let Some(options) = args.0.first().and_then(Value::as_object) {
+            if let Ok(value) = options.get::<_, String>("align") {
+                align = resolve_alignment(&value, record.rtl);
+            }
+            if let Ok(value) = options.get::<_, String>("baseline") {
+                baseline = value;
+            }
         }
-        if let Ok(value) = options.get::<_, String>("baseline") {
-            baseline = value;
+        let x = alignment_offset(&record.shaped, align);
+        let y = baseline_offset(&record.shaped, &baseline);
+        let array = Array::new(ctx.clone())?;
+        for cluster in &record.shaped.clusters {
+            if cluster.utf16_start < start || cluster.utf16_end > end {
+                continue;
+            }
+            // The cluster position is measured from the alignment point back
+            // to the cluster, so `fillTextCluster` can subtract it
+            // (<https://html.spec.whatwg.org/multipage/canvas.html#dom-textmetrics-gettextclusters>).
+            let object = JsTextCluster {
+                start: u32::try_from(cluster.utf16_start).unwrap_or(u32::MAX),
+                end: u32::try_from(cluster.utf16_end).unwrap_or(u32::MAX),
+                x: f64::from(-(x + cluster.offset * record.shaped.scale_x)),
+                y: f64::from(-y),
+                text: record.text[cluster.byte_start..cluster.byte_end].to_owned(),
+            };
+            array.set(array.len(), Class::instance(ctx.clone(), object)?)?;
         }
-    }
-    let direction: String = this
-        .0
-        .get("__tbDirection")
-        .unwrap_or_else(|_| "inherit".to_owned());
-    let resolved = resolved_alignment(ctx, &this.0, &align, &direction);
-    let x = alignment_offset(&shaped, resolved);
-    let y = baseline_offset(&shaped, &baseline);
-    let array = Array::new(ctx.clone())?;
-    for cluster in &shaped.clusters {
-        if cluster.utf16_start < start || cluster.utf16_end > end {
-            continue;
-        }
-        let object = Object::new(ctx.clone())?;
-        object.set("start", cluster.utf16_start as u32)?;
-        object.set("end", cluster.utf16_end as u32)?;
-        // The cluster position is measured from the alignment point back to
-        // the cluster, so `fillTextCluster` can subtract it
-        // (<https://html.spec.whatwg.org/multipage/canvas.html#dom-textmetrics-gettextclusters>).
-        object.set("x", -(x + cluster.offset * shaped.scale_x))?;
-        object.set("y", -y)?;
-        object.set("text", &text[cluster.byte_start..cluster.byte_end])?;
-        array.set(array.len(), object)?;
-    }
-    Ok(array)
+        Ok(array)
+    })
 }
 
 fn get_actual_bounding_box<'js>(
@@ -3155,82 +3163,54 @@ fn get_actual_bounding_box<'js>(
     args: rquickjs::function::Rest<Value<'js>>,
 ) -> Result<Object<'js>> {
     let ctx = this.0.ctx();
-    let text: String = this.0.get("__tbText")?;
-    let (start, end) = text_range(ctx, &text, &args.0, false, false, false)?;
-    let padded: String = {
-        let mut padded = String::with_capacity(text.len());
-        let mut offset = 0usize;
-        for ch in text.chars() {
-            let length = ch.len_utf16();
-            if offset >= start && offset + length <= end {
-                padded.push(ch);
-            } else {
-                for _ in 0..length {
-                    padded.push(' ');
-                }
+    with_metrics(ctx, &this.0, |record| {
+        let (start, end) = text_range(ctx, &record.text, &args.0, false, false, false)?;
+        let mut ink: Option<text::ClusterInk> = None;
+        for cluster in &record.shaped.clusters {
+            if cluster.utf16_start < start || cluster.utf16_end > end {
+                continue;
             }
-            offset += length;
+            let Some(cluster_ink) = cluster.ink else {
+                continue;
+            };
+            ink = Some(match ink {
+                None => cluster_ink,
+                Some(current) => text::ClusterInk {
+                    min_x: current.min_x.min(cluster_ink.min_x),
+                    max_x: current.max_x.max(cluster_ink.max_x),
+                    ascent: current.ascent.max(cluster_ink.ascent),
+                    descent: current.descent.max(cluster_ink.descent),
+                },
+            });
         }
-        padded
-    };
-    let font: String = this.0.get("__tbFont")?;
-    let letter: f32 = this.0.get("__tbLetterSpacing").unwrap_or(0.0);
-    let word: f32 = this.0.get("__tbWordSpacing").unwrap_or(0.0);
-    let lang: String = this
-        .0
-        .get("__tbLang")
-        .unwrap_or_else(|_| "inherit".to_owned());
-    let language = resolved_language(ctx, &this.0, &lang);
-    let kerning: String = this
-        .0
-        .get("__tbKerning")
-        .unwrap_or_else(|_| "auto".to_owned());
-    let mut font_ctx = document_font_context(ctx, &this.0)?;
-    let shaped = text::shape(
-        &padded,
-        &font,
-        None,
-        letter,
-        word,
-        language.as_deref(),
-        &kerning,
-        &mut font_ctx,
-        false,
-    );
-    let align: String = this
-        .0
-        .get("__tbAlign")
-        .unwrap_or_else(|_| "left".to_owned());
-    let direction: String = this
-        .0
-        .get("__tbDirection")
-        .unwrap_or_else(|_| "inherit".to_owned());
-    let resolved = resolved_alignment(ctx, &this.0, &align, &direction);
-    let (left, right) = match resolved {
-        "right" | "end" => (
-            shaped.width - shaped.ink_min_x,
-            shaped.ink_max_x - shaped.width,
-        ),
-        "center" => (
-            shaped.width / 2.0 - shaped.ink_min_x,
-            shaped.ink_max_x - shaped.width / 2.0,
-        ),
-        _ => (-shaped.ink_min_x, shaped.ink_max_x),
-    };
-    let baseline: String = this
-        .0
-        .get("__tbBaseline")
-        .unwrap_or_else(|_| "alphabetic".to_owned());
-    let dy = baseline_offset(&shaped, &baseline);
-    let shift = -shaped.ascent - dy;
-    let ascent = shaped.actual_ascent + shift;
-    let descent = shaped.actual_descent - shift;
-    let object = Object::new(ctx.clone())?;
-    object.set("x", -left)?;
-    object.set("y", -ascent)?;
-    object.set("width", left + right)?;
-    object.set("height", ascent + descent)?;
-    Ok(object)
+        let ink = ink.unwrap_or(text::ClusterInk {
+            min_x: 0.0,
+            max_x: 0.0,
+            ascent: 0.0,
+            descent: 0.0,
+        });
+        let (left, right) = match record.align {
+            "right" => (
+                record.shaped.width - ink.min_x,
+                ink.max_x - record.shaped.width,
+            ),
+            "center" => (
+                record.shaped.width / 2.0 - ink.min_x,
+                ink.max_x - record.shaped.width / 2.0,
+            ),
+            _ => (-ink.min_x, ink.max_x),
+        };
+        let dy = baseline_offset(&record.shaped, &record.baseline);
+        let shift = -record.shaped.ascent - dy;
+        let ascent = ink.ascent + shift;
+        let descent = ink.descent - shift;
+        let object = Object::new(ctx.clone())?;
+        object.set("x", f64::from(-left))?;
+        object.set("y", f64::from(-ascent))?;
+        object.set("width", f64::from(left + right))?;
+        object.set("height", f64::from(ascent + descent))?;
+        Ok(object)
+    })
 }
 
 fn get_selection_rects<'js>(
@@ -3238,84 +3218,55 @@ fn get_selection_rects<'js>(
     args: rquickjs::function::Rest<Value<'js>>,
 ) -> Result<Array<'js>> {
     let ctx = this.0.ctx();
-    let text: String = this.0.get("__tbText")?;
-    let (start, end) = text_range(ctx, &text, &args.0, false, false, true)?;
-    // A reversed or empty range has no selection.
-    if start >= end {
-        return Array::new(ctx.clone());
-    }
-    let font: String = this.0.get("__tbFont")?;
-    let letter: f32 = this.0.get("__tbLetterSpacing").unwrap_or(0.0);
-    let word: f32 = this.0.get("__tbWordSpacing").unwrap_or(0.0);
-    let lang: String = this
-        .0
-        .get("__tbLang")
-        .unwrap_or_else(|_| "inherit".to_owned());
-    let kerning: String = this
-        .0
-        .get("__tbKerning")
-        .unwrap_or_else(|_| "auto".to_owned());
-    let language = resolved_language(ctx, &this.0, &lang);
-    let mut font_ctx = document_font_context(ctx, &this.0)?;
-    let shaped = text::shape(
-        &text,
-        &font,
-        None,
-        letter,
-        word,
-        language.as_deref(),
-        &kerning,
-        &mut font_ctx,
-        true,
-    );
-    let align: String = this.0.get("__tbAlign")?;
-    let baseline: String = this.0.get("__tbBaseline").unwrap_or_default();
-    let direction: String = this
-        .0
-        .get("__tbDirection")
-        .unwrap_or_else(|_| "inherit".to_owned());
-    let resolved = resolved_alignment(ctx, &this.0, &align, &direction);
-    let align_dx = alignment_offset(&shaped, resolved);
-    let baseline_dy = baseline_offset(&shaped, &baseline);
-    let mut selected: Vec<(f32, f32)> = shaped
-        .clusters
-        .iter()
-        .filter(|cluster| cluster.utf16_start >= start && cluster.utf16_end <= end)
-        .map(|cluster| {
-            (
-                cluster.offset * shaped.scale_x,
-                (cluster.offset + cluster.advance) * shaped.scale_x,
-            )
-        })
-        .collect();
-    selected.sort_by(|left, right| left.0.total_cmp(&right.0));
-    let mut runs: Vec<(f32, f32)> = Vec::new();
-    for (left, right) in selected {
-        if let Some(last) = runs.last_mut()
-            && (left - last.1).abs() <= 0.01
-        {
-            last.1 = last.1.max(right);
-        } else {
-            runs.push((left, right));
+    with_metrics(ctx, &this.0, |record| {
+        let (start, end) = text_range(ctx, &record.text, &args.0, false, false, true)?;
+        // A reversed or empty range has no selection.
+        if start >= end {
+            return Array::new(ctx.clone());
         }
-    }
-    let shift = -shaped.ascent - baseline_dy;
-    let top = -shaped.font_ascent - shift;
-    let bottom = shaped.font_descent - shift;
-    let array = Array::new(ctx.clone())?;
-    for (left, right) in runs {
-        let x = align_dx + left;
-        let width = right - left;
-        let rect = crate::js::bindings::geometry::dom_rect(
-            ctx,
-            f64::from(x),
-            f64::from(top),
-            f64::from(width),
-            f64::from(bottom - top),
-        )?;
-        array.set(array.len(), rect)?;
-    }
-    Ok(array)
+        let shaped = &record.shaped;
+        let align_dx = alignment_offset(shaped, record.align);
+        let baseline_dy = baseline_offset(shaped, &record.baseline);
+        let mut selected: Vec<(f32, f32)> = shaped
+            .clusters
+            .iter()
+            .filter(|cluster| cluster.utf16_start >= start && cluster.utf16_end <= end)
+            .map(|cluster| {
+                (
+                    cluster.offset * shaped.scale_x,
+                    (cluster.offset + cluster.advance) * shaped.scale_x,
+                )
+            })
+            .collect();
+        selected.sort_by(|left, right| left.0.total_cmp(&right.0));
+        let mut runs: Vec<(f32, f32)> = Vec::new();
+        for (left, right) in selected {
+            if let Some(last) = runs.last_mut()
+                && (left - last.1).abs() <= 0.01
+            {
+                last.1 = last.1.max(right);
+            } else {
+                runs.push((left, right));
+            }
+        }
+        let shift = -shaped.ascent - baseline_dy;
+        let top = -shaped.font_ascent - shift;
+        let bottom = shaped.font_descent - shift;
+        let array = Array::new(ctx.clone())?;
+        for (left, right) in runs {
+            let x = align_dx + left;
+            let width = right - left;
+            let rect = crate::js::bindings::geometry::dom_rect(
+                ctx,
+                f64::from(x),
+                f64::from(top),
+                f64::from(width),
+                f64::from(bottom - top),
+            )?;
+            array.set(array.len(), rect)?;
+        }
+        Ok(array)
+    })
 }
 
 /// Nearest cluster boundary to a horizontal offset.
@@ -3325,58 +3276,31 @@ fn get_selection_rects<'js>(
 )]
 fn get_index_from_offset(this: This<Object<'_>>, offset: Coerced<f64>) -> Result<u32> {
     let ctx = this.0.ctx();
-    let text: String = this.0.get("__tbText")?;
-    let font: String = this.0.get("__tbFont")?;
-    let letter: f32 = this.0.get("__tbLetterSpacing").unwrap_or(0.0);
-    let word: f32 = this.0.get("__tbWordSpacing").unwrap_or(0.0);
-    let lang: String = this
-        .0
-        .get("__tbLang")
-        .unwrap_or_else(|_| "inherit".to_owned());
-    let kerning: String = this
-        .0
-        .get("__tbKerning")
-        .unwrap_or_else(|_| "auto".to_owned());
-    let language = resolved_language(ctx, &this.0, &lang);
-    let mut font_ctx = document_font_context(ctx, &this.0)?;
-    let shaped = text::shape(
-        &text,
-        &font,
-        None,
-        letter,
-        word,
-        language.as_deref(),
-        &kerning,
-        &mut font_ctx,
-        true,
-    );
-    let align: String = this.0.get("__tbAlign")?;
-    let direction: String = this
-        .0
-        .get("__tbDirection")
-        .unwrap_or_else(|_| "inherit".to_owned());
-    let resolved = resolved_alignment(ctx, &this.0, &align, &direction);
-    let width = shaped.width * shaped.scale_x;
-    if width <= 0.0 {
-        return Ok(0);
-    }
-    // The offset is measured from the alignment point, so undo the alignment
-    // shift before comparing against left-to-right cluster positions.
-    let target = (f32_of(*offset) - alignment_offset(&shaped, resolved)).clamp(0.0, width);
-    let mut best = 0_u32;
-    let mut best_distance = f32::MAX;
-    for cluster in &shaped.clusters {
-        let start = cluster.offset * shaped.scale_x;
-        let end = start + cluster.advance * shaped.scale_x;
-        for (boundary, position) in [(cluster.utf16_start, start), (cluster.utf16_end, end)] {
-            let distance = (position - target).abs();
-            if distance < best_distance {
-                best_distance = distance;
-                best = boundary as u32;
+    with_metrics(ctx, &this.0, |record| {
+        let shaped = &record.shaped;
+        let width = shaped.width * shaped.scale_x;
+        if width <= 0.0 {
+            return Ok(0);
+        }
+        // The offset is measured from the alignment point, so undo the
+        // alignment shift before comparing against left-to-right cluster
+        // positions.
+        let target = (f32_of(*offset) - alignment_offset(shaped, record.align)).clamp(0.0, width);
+        let mut best = 0_u32;
+        let mut best_distance = f32::MAX;
+        for cluster in &shaped.clusters {
+            let start = cluster.offset * shaped.scale_x;
+            let end = start + cluster.advance * shaped.scale_x;
+            for (boundary, position) in [(cluster.utf16_start, start), (cluster.utf16_end, end)] {
+                let distance = (position - target).abs();
+                if distance < best_distance {
+                    best_distance = distance;
+                    best = boundary as u32;
+                }
             }
         }
-    }
-    Ok(best)
+        Ok(best)
+    })
 }
 
 fn measure_text(this: This<Object<'_>>, text: DomString) -> Result<Object<'_>> {
@@ -3438,9 +3362,32 @@ fn measure_text(this: This<Object<'_>>, text: DomString) -> Result<Object<'_>> {
     };
     // Keep positive zero so `TextMetrics` does not expose `-0`.
     let width = if width == 0.0 { 0.0 } else { width };
-    let resolved = resolved_alignment(ctx, &this.0, &align, &direction);
-    let (actual_left, actual_right) = match resolved {
-        "right" | "end" => (
+    // Freeze the two anchor values at measure time, so a later context change
+    // cannot alter what this snapshot reports.
+    let rtl = resolved_direction(ctx, &this.0, &direction);
+    let align = resolve_alignment(&align, rtl);
+    text_metrics_object(ctx, &this.0, &text, shaped, align, baseline, rtl, width)
+}
+
+/// Computes the metric values, stores the shaping on the canvas context, and
+/// builds the `TextMetrics` snapshot object. The object carries only the
+/// canvas identity and the record id; every later query reads the shaping.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one measured string and its frozen anchor values"
+)]
+fn text_metrics_object<'js>(
+    ctx: &Ctx<'js>,
+    receiver: &Object<'js>,
+    text: &str,
+    shaped: text::ShapedText,
+    align: &'static str,
+    baseline: String,
+    rtl: bool,
+    width: f64,
+) -> Result<Object<'js>> {
+    let (actual_left, actual_right) = match align {
+        "right" => (
             shaped.width - shaped.ink_min_x,
             shaped.ink_max_x - shaped.width,
         ),
@@ -3455,18 +3402,26 @@ fn measure_text(this: This<Object<'_>>, text: DomString) -> Result<Object<'_>> {
     // above it).
     let dy = baseline_offset(&shaped, &baseline);
     let shift = -shaped.ascent - dy;
+    let actual_ascent = shaped.actual_ascent + shift;
+    let actual_descent = shaped.actual_descent - shift;
+    let font_ascent = shaped.font_ascent + shift;
+    let font_descent = shaped.font_descent - shift;
+    let em_ascent = shaped.em_ascent + shift;
+    let em_descent = shaped.em_descent - shift;
+    let hanging_baseline = shaped.hanging_baseline + shift;
+    let ideographic_baseline = shaped.ideographic_baseline + shift;
+    let record = text::TextMetricsRecord {
+        text: text.to_owned(),
+        shaped,
+        align,
+        baseline,
+        rtl,
+    };
+    let id = with_canvas(ctx, receiver, |canvas| canvas.store_text_metrics(record))?;
     let object = Object::new(ctx.clone())?;
-    object.set("__tbText", text.to_string())?;
-    object.set("__tbFont", font)?;
-    object.set("__tbAlign", align)?;
-    object.set("__tbBaseline", baseline)?;
-    object.set("__tbDirection", direction)?;
-    object.set("__tbLetterSpacing", letter_spacing)?;
-    object.set("__tbWordSpacing", word_spacing)?;
-    object.set("__tbLang", lang)?;
-    object.set("__tbKerning", kerning)?;
-    object.set("__tbDoc", this.0.get::<_, u32>("__tbDoc")?)?;
-    object.set("__tbNode", this.0.get::<_, u64>("__tbNode")?)?;
+    object.set("__tbMetrics", id)?;
+    object.set("__tbDoc", receiver.get::<_, u32>("__tbDoc")?)?;
+    object.set("__tbNode", receiver.get::<_, u64>("__tbNode")?)?;
     object.set("getTextClusters", Func::from(get_text_clusters))?;
     object.set("getActualBoundingBox", Func::from(get_actual_bounding_box))?;
     object.set("getSelectionRects", Func::from(get_selection_rects))?;
@@ -3474,15 +3429,15 @@ fn measure_text(this: This<Object<'_>>, text: DomString) -> Result<Object<'_>> {
     object.set("width", width)?;
     object.set("actualBoundingBoxLeft", actual_left)?;
     object.set("actualBoundingBoxRight", actual_right)?;
-    object.set("actualBoundingBoxAscent", shaped.actual_ascent + shift)?;
-    object.set("actualBoundingBoxDescent", shaped.actual_descent - shift)?;
-    object.set("fontBoundingBoxAscent", shaped.font_ascent + shift)?;
-    object.set("fontBoundingBoxDescent", shaped.font_descent - shift)?;
-    object.set("emHeightAscent", shaped.em_ascent + shift)?;
-    object.set("emHeightDescent", shaped.em_descent - shift)?;
-    object.set("hangingBaseline", shaped.hanging_baseline + shift)?;
+    object.set("actualBoundingBoxAscent", actual_ascent)?;
+    object.set("actualBoundingBoxDescent", actual_descent)?;
+    object.set("fontBoundingBoxAscent", font_ascent)?;
+    object.set("fontBoundingBoxDescent", font_descent)?;
+    object.set("emHeightAscent", em_ascent)?;
+    object.set("emHeightDescent", em_descent)?;
+    object.set("hangingBaseline", hanging_baseline)?;
     object.set("alphabeticBaseline", shift)?;
-    object.set("ideographicBaseline", shaped.ideographic_baseline + shift)?;
+    object.set("ideographicBaseline", ideographic_baseline)?;
     Ok(object)
 }
 
@@ -3953,20 +3908,21 @@ fn resolved_language(ctx: &Ctx<'_>, object: &Object<'_>, lang: &str) -> Option<S
 /// Resolves `start`/`end` using the context direction, then the canvas
 /// element's `dir` attribute
 /// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-textalign>).
-fn resolved_alignment(
-    ctx: &Ctx<'_>,
-    object: &Object<'_>,
-    align: &str,
-    direction: &str,
-) -> &'static str {
-    let rtl = match direction {
+fn resolved_direction(ctx: &Ctx<'_>, object: &Object<'_>, direction: &str) -> bool {
+    match direction {
         "rtl" => true,
         "ltr" => false,
         _ => canvas_id(object)
             .ok()
             .and_then(|id| attribute_value(ctx, id, "dir").ok())
             .is_some_and(|dir| dir.trim().eq_ignore_ascii_case("rtl")),
-    };
+    }
+}
+
+/// Resolves `start`/`end` against a direction. The metrics record stores the
+/// resolved answer, so a `TextMetrics` read never re-resolves against the
+/// canvas element's current `dir`.
+fn resolve_alignment(align: &str, rtl: bool) -> &'static str {
     match align {
         "start" => {
             if rtl {
@@ -3986,6 +3942,15 @@ fn resolved_alignment(
         "right" => "right",
         _ => "left",
     }
+}
+
+fn resolved_alignment(
+    ctx: &Ctx<'_>,
+    object: &Object<'_>,
+    align: &str,
+    direction: &str,
+) -> &'static str {
+    resolve_alignment(align, resolved_direction(ctx, object, direction))
 }
 
 fn canvas_object(this: This<Object<'_>>) -> Result<Value<'_>> {

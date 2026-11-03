@@ -28,6 +28,36 @@ pub(crate) struct TextCluster {
     pub(crate) utf16_end: usize,
     pub(crate) offset: f32,
     pub(crate) advance: f32,
+    /// Glyph ink bounds for this cluster, in text space relative to the
+    /// baseline, squeezed by `maxWidth` when one applies. A cluster with no
+    /// glyphs (a ligature continuation) has `None`.
+    pub(crate) ink: Option<ClusterInk>,
+}
+
+/// The ink bounds of one cluster, relative to the alphabetic baseline and the
+/// text origin. `ascent` and `descent` are positive; `min_x` and `max_x` keep
+/// their sign so a glyph that overhangs left of the origin reports it in
+/// `min_x`.
+#[derive(Clone, Copy)]
+pub(crate) struct ClusterInk {
+    pub(crate) min_x: f32,
+    pub(crate) max_x: f32,
+    pub(crate) ascent: f32,
+    pub(crate) descent: f32,
+}
+
+/// One measured string, owned by the canvas context for as long as a
+/// `TextMetrics` object can ask questions about it.
+pub(crate) struct TextMetricsRecord {
+    pub(crate) text: String,
+    pub(crate) shaped: ShapedText,
+    /// The resolved `textAlign` at measure time, so a read never re-resolves
+    /// against a later context state.
+    pub(crate) align: &'static str,
+    pub(crate) baseline: String,
+    /// Whether the context's direction resolved to right-to-left, so an
+    /// `align` option on `getTextClusters` resolves without the context.
+    pub(crate) rtl: bool,
 }
 
 /// One shaped string. `glyph_path` shifts the outlines so the top of the em
@@ -204,6 +234,7 @@ pub(crate) fn shape(
                         utf16_end: utf16_offsets[byte_end],
                         offset: cluster.visual_offset().unwrap_or(0.0),
                         advance: cluster.advance(),
+                        ink: None,
                     });
                 }
             }
@@ -211,8 +242,14 @@ pub(crate) fn shape(
     }
     let font_metrics = layout_font_metrics(&layout, parsed.size);
     // The glyph path stays in text space; the drawing transform applies the
-    // maxWidth squeeze. Metrics need their own squeezed copy.
-    let path = glyph_path(&layout);
+    // maxWidth squeeze. Metrics need their own squeezed copy. A measurement
+    // also needs each cluster's own ink bounds, so a range query answers from
+    // this one shaping instead of shaping the range again.
+    let path = if clusters.is_empty() {
+        glyph_path(&layout, None)
+    } else {
+        glyph_path(&layout, Some((&mut clusters, scale_x, ascent)))
+    };
     let (ink_min_x, ink_max_x, actual_ascent, actual_descent) = path
         .as_ref()
         .and_then(|path| {
@@ -362,12 +399,36 @@ fn layout_font_metrics(layout: &parley::Layout<[u8; 4]>, size: f32) -> FontMetri
     }
 }
 
-fn glyph_path(layout: &parley::Layout<[u8; 4]>) -> Option<Path> {
+/// The cluster whose visual extent contains `x`, chosen from `order`, which
+/// sorts cluster indexes by their left edge. A glyph that starts a ligature
+/// belongs to the first cluster of that ligature, which is exactly the cluster
+/// whose offset is at or before the glyph.
+fn cluster_at(order: &[usize], clusters: &[TextCluster], x: f32) -> Option<usize> {
+    let position = order.partition_point(|index| clusters[*index].offset <= x);
+    order.get(position.saturating_sub(1)).copied()
+}
+
+/// Builds the glyph path in text space. When `ink` is present, the same glyph
+/// pass also unions each glyph's ink bounds into its cluster, so
+/// `getActualBoundingBox(start, end)` can answer without shaping the range
+/// again.
+fn glyph_path(
+    layout: &parley::Layout<[u8; 4]>,
+    mut ink: Option<(&mut [TextCluster], f32, f32)>,
+) -> Option<Path> {
     let mut builder = PathBuilder::new();
     let mut placed_any = false;
     let root_ascent = layout
         .root_span_metrics()
         .map_or(0.0, |metrics| metrics.ascent);
+    let cluster_order: Vec<usize> = match ink.as_ref() {
+        Some((clusters, _, _)) => {
+            let mut order: Vec<usize> = (0..clusters.len()).collect();
+            order.sort_by(|left, right| clusters[*left].offset.total_cmp(&clusters[*right].offset));
+            order
+        }
+        None => Vec::new(),
+    };
     for line in layout.lines() {
         // Parley places glyphs on the CSS line box; canvas text baselines are
         // defined by the font's em metrics, so drop the half-leading.
@@ -401,6 +462,34 @@ fn glyph_path(layout: &parley::Layout<[u8; 4]>) -> Option<Path> {
                 let Some(path) = path.transform(placement) else {
                     continue;
                 };
+                if let Some((clusters, scale_x, ascent)) = ink.as_mut()
+                    && let Some(index) = cluster_at(&cluster_order, clusters, glyph.x)
+                    && let Some(bounds) = path
+                        .clone()
+                        .transform(
+                            Transform::from_scale(*scale_x, 1.0)
+                                .pre_concat(Transform::from_translate(0.0, -*ascent)),
+                        )
+                        .as_ref()
+                        .map(Path::bounds)
+                {
+                    let glyph_ink = ClusterInk {
+                        min_x: bounds.left(),
+                        max_x: bounds.right(),
+                        ascent: (-bounds.top()).max(0.0),
+                        descent: bounds.bottom().max(0.0),
+                    };
+                    let slot = &mut clusters[index].ink;
+                    *slot = Some(match *slot {
+                        None => glyph_ink,
+                        Some(current) => ClusterInk {
+                            min_x: current.min_x.min(glyph_ink.min_x),
+                            max_x: current.max_x.max(glyph_ink.max_x),
+                            ascent: current.ascent.max(glyph_ink.ascent),
+                            descent: current.descent.max(glyph_ink.descent),
+                        },
+                    });
+                }
                 builder.push_path(&path);
                 placed_any = true;
             }

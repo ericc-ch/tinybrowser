@@ -22,6 +22,8 @@ use tiny_skia::{
     Transform,
 };
 
+use super::text::TextMetricsRecord;
+
 /// One canvas rendering context.
 pub(crate) struct Canvas2D {
     pub(crate) width: u32,
@@ -35,6 +37,9 @@ pub(crate) struct Canvas2D {
     gradients: HashMap<u32, Gradient>,
     patterns: HashMap<u32, Pattern>,
     next_resource: u32,
+    /// Measured strings, keyed by the id stamped on the `TextMetrics` object.
+    metrics: HashMap<u32, TextMetricsRecord>,
+    next_metrics: u32,
     /// Whether every image painted into this canvas was same-origin. A
     /// cross-origin image clears the flag, and `getImageData` then throws
     /// `SecurityError`
@@ -487,6 +492,10 @@ impl Canvas2D {
         let gradients = std::mem::take(&mut self.gradients);
         let patterns = std::mem::take(&mut self.patterns);
         let next_resource = self.next_resource;
+        // A measured string is a snapshot independent of the drawing state, so
+        // its metrics survive a resize just like a gradient object does.
+        let metrics = std::mem::take(&mut self.metrics);
+        let next_metrics = self.next_metrics;
         // Resizing clears the bitmap and state, not the taint: a canvas that
         // painted a cross-origin image stays unreadable.
         let origin_clean = self.origin_clean;
@@ -494,6 +503,8 @@ impl Canvas2D {
         self.gradients = gradients;
         self.patterns = patterns;
         self.next_resource = next_resource;
+        self.metrics = metrics;
+        self.next_metrics = next_metrics;
         self.origin_clean = origin_clean;
     }
 
@@ -510,9 +521,25 @@ impl Canvas2D {
             gradients: HashMap::new(),
             patterns: HashMap::new(),
             next_resource: 1,
+            metrics: HashMap::new(),
+            next_metrics: 1,
             origin_clean: true,
             layers: Vec::new(),
         }
+    }
+
+    /// Stores one measured string and returns the id the `TextMetrics` object
+    /// carries. The shaping belongs to the context, so a read never shapes the
+    /// string again.
+    pub(crate) fn store_text_metrics(&mut self, metrics: TextMetricsRecord) -> u32 {
+        let id = self.next_metrics;
+        self.next_metrics += 1;
+        self.metrics.insert(id, metrics);
+        id
+    }
+
+    pub(crate) fn text_metrics(&self, id: u32) -> Option<&TextMetricsRecord> {
+        self.metrics.get(&id)
     }
 
     pub(crate) fn origin_clean(&self) -> bool {
