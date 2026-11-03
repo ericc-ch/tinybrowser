@@ -308,6 +308,7 @@ impl BrowsingContextHost for FsServices {
         _opener: OpenerPolicy,
         _source: &renderer::NavigationSource,
         _allow_popups: bool,
+        _sandbox: renderer::SandboxFlags,
     ) -> Option<WindowId> {
         None
     }
@@ -327,6 +328,10 @@ impl BrowsingContextHost for FsServices {
     }
 
     fn window_close(&self, _window: WindowId) {}
+
+    /// A target name only matters to a browser that keeps a cross-tab table.
+    /// This host has one tab, so the name has nowhere to go.
+    fn set_window_name(&self, _name: &str) {}
 
     fn window_opener(&self) -> Option<WindowId> {
         None

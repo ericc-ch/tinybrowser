@@ -189,6 +189,10 @@ impl Session {
             .mount_bounded(
                 &Mount {
                     head,
+                    // No browser behind this carrier: no name, no opener, and
+                    // no popup sandbox. `window.open` returns null too, so a
+                    // file cannot open a context whose flags it would need.
+                    tab: renderer::TabState::default(),
                     body: case.source.clone(),
                 },
                 deadline.saturating_duration_since(Instant::now()),
