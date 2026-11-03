@@ -36,7 +36,9 @@ mod bindings {
 use bindings::exports::tinybrowser::browser::engine::{
     Event, FrameEvent, Guest, GuestTab, HistoryHandling as HostHistoryHandling,
 };
-use bindings::tinybrowser::browser::types::{FetchError, FetchKind, FetchRequest, FetchResponse};
+use bindings::tinybrowser::browser::types::{
+    FetchCredentials, FetchError, FetchKind, FetchMode, FetchRedirect, FetchRequest, FetchResponse,
+};
 
 /// Redirect hops a single dial may follow.
 ///
@@ -233,9 +235,8 @@ struct Chain {
     initiator: Option<Url>,
     kind: DialKind,
     /// The request's mode, credentials mode, and redirect mode. The host
-    /// transport carries only `kind` today, so the component applies what it
-    /// can itself: the credentials mode decides whether a cookie header is
-    /// computed at all.
+    /// applies them, and the component keeps them because the credentials
+    /// mode also decides whether a cookie header is computed at all.
     cors: net::cors::CorsParameters,
     /// Hops already followed.
     followed: u32,
@@ -319,6 +320,9 @@ fn start_hop(owner: u64, chain: Chain, completion: DialCompletion) {
             .as_ref()
             .map(Url::to_string)
             .unwrap_or_default(),
+        mode: host_mode(chain.cors.mode),
+        credentials: host_credentials(chain.cors.credentials),
+        redirect: host_redirect(chain.cors.redirect),
         max_body_bytes: u64::try_from(MAX_RESPONSE_BODY_BYTES).unwrap_or(u64::MAX),
         cookie: cookie_header(&chain),
     };
@@ -335,6 +339,34 @@ fn start_hop(owner: u64, chain: Chain, completion: DialCompletion) {
         if let Some(completion) = pending.and_then(|pending| pending.completion) {
             completion(Err(DialFailure::Connect));
         }
+    }
+}
+
+/// The host-visible name for a request mode.
+fn host_mode(mode: net::cors::RequestMode) -> FetchMode {
+    match mode {
+        net::cors::RequestMode::Cors => FetchMode::Cors,
+        net::cors::RequestMode::NoCors => FetchMode::NoCors,
+        net::cors::RequestMode::SameOrigin => FetchMode::SameOrigin,
+        net::cors::RequestMode::Navigate => FetchMode::Navigate,
+    }
+}
+
+/// The host-visible name for a credentials mode.
+fn host_credentials(credentials: net::cors::CredentialsMode) -> FetchCredentials {
+    match credentials {
+        net::cors::CredentialsMode::Omit => FetchCredentials::Omit,
+        net::cors::CredentialsMode::SameOrigin => FetchCredentials::SameOrigin,
+        net::cors::CredentialsMode::Include => FetchCredentials::Include,
+    }
+}
+
+/// The host-visible name for a redirect mode.
+fn host_redirect(redirect: net::cors::RedirectMode) -> FetchRedirect {
+    match redirect {
+        net::cors::RedirectMode::Follow => FetchRedirect::Follow,
+        net::cors::RedirectMode::Error => FetchRedirect::Error,
+        net::cors::RedirectMode::Manual => FetchRedirect::Manual,
     }
 }
 
@@ -734,6 +766,33 @@ impl Drop for WasmServices {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_host_contract_names_every_fetch_policy() {
+        use net::cors::{CredentialsMode, RedirectMode, RequestMode};
+        for (mode, expected) in [
+            (RequestMode::Cors, FetchMode::Cors),
+            (RequestMode::NoCors, FetchMode::NoCors),
+            (RequestMode::SameOrigin, FetchMode::SameOrigin),
+            (RequestMode::Navigate, FetchMode::Navigate),
+        ] {
+            assert_eq!(host_mode(mode), expected);
+        }
+        for (credentials, expected) in [
+            (CredentialsMode::Omit, FetchCredentials::Omit),
+            (CredentialsMode::SameOrigin, FetchCredentials::SameOrigin),
+            (CredentialsMode::Include, FetchCredentials::Include),
+        ] {
+            assert_eq!(host_credentials(credentials), expected);
+        }
+        for (redirect, expected) in [
+            (RedirectMode::Follow, FetchRedirect::Follow),
+            (RedirectMode::Error, FetchRedirect::Error),
+            (RedirectMode::Manual, FetchRedirect::Manual),
+        ] {
+            assert_eq!(host_redirect(redirect), expected);
+        }
+    }
 
     #[test]
     fn host_failures_keep_their_kind() {

@@ -5,7 +5,7 @@
 /// below is a host obligation. A host that cannot honor one must answer with a
 /// `fetch-error` rather than guess, because the component trusts these answers
 /// for cookie and origin decisions.
-package tinybrowser:browser@0.1.0;
+package tinybrowser:browser@0.2.0;
 
 interface types {
     enum fetch-kind {
@@ -25,6 +25,33 @@ interface types {
         frame-load,
     }
 
+    /// Fetch's request mode, as the component resolved it
+    /// (<https://fetch.spec.whatwg.org/#concept-request-mode>).
+    enum fetch-mode {
+        /// The response must pass the CORS check.
+        cors,
+        /// The response is opaque; a cross-origin body is not readable.
+        no-cors,
+        /// A cross-origin response is a network error.
+        same-origin,
+        /// Navigation mode: like `no-cors`, and used for a frame load.
+        navigate,
+    }
+
+    /// Fetch's credentials mode (<https://fetch.spec.whatwg.org/#concept-request-credentials-mode>).
+    enum fetch-credentials {
+        omit,
+        same-origin,
+        %include,
+    }
+
+    /// Fetch's redirect mode (<https://fetch.spec.whatwg.org/#concept-request-redirect-mode>).
+    enum fetch-redirect {
+        follow,
+        error,
+        manual,
+    }
+
     record fetch-request {
         /// Correlates this exchange with its completion. Unique within the
         /// component instance, and reused for nothing else.
@@ -34,6 +61,18 @@ interface types {
         /// runs and the host does not have the tab handle yet.
         owner: u64,
         kind: fetch-kind,
+        /// The mode the component resolved for this dial. A host that cannot
+        /// honor it answers `fetch-error`; it must not substitute its own
+        /// (a browser `fetch` defaults to `cors`, which changes whether a
+        /// cross-origin subresource loads at all).
+        mode: fetch-mode,
+        /// The credentials mode, so the host can apply the same cookie rules
+        /// the component's `cookie` header already reflects.
+        credentials: fetch-credentials,
+        /// The redirect mode. `error` must turn a 3xx into a failed exchange;
+        /// `manual` must report the 3xx unreduced so the component can project
+        /// an opaque redirect.
+        redirect: fetch-redirect,
         /// Absolute `http`/`https` URL of this exchange.
         url: string,
         /// Document URL the dial started from.
@@ -125,6 +164,12 @@ interface host {
     /// the response to `final-url`, and uses it. That fallback cannot carry
     /// cookies honestly, because such a host can neither set `Cookie` nor read
     /// `Set-Cookie`.
+    ///
+    /// The request's `mode`, `credentials`, and `redirect` are the component's
+    /// resolved values, not hints. A host must apply them (a browser
+    /// `fetch(..., {mode, credentials, redirect})` maps directly) or answer
+    /// `fetch-error`; substituting a default changes whether a cross-origin
+    /// resource loads and whether a redirect is followed at all.
     ///
     /// A `true` answer obligates the host to call `engine.complete-fetch`
     /// exactly once for this `id`, unless the component cancels it first. The
