@@ -696,63 +696,15 @@
     }
     return 'UTF-8';
   };
-  // windows-1252 maps its 0x80..0x9F range to these code points; the holes
-  // have no character. Unrepresentable characters become numeric character
-  // references, matching the Encoding Standard's `encode`.
-  const windows1252High = [
-    0x20AC, 0x0081, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021,
-    0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0x008D, 0x017D, 0x008F,
-    0x0090, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014,
-    0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x009D, 0x017E, 0x0178,
-  ];
-  const windows1252Byte = code => {
-    if (code <= 0x7F || (code >= 0xA0 && code <= 0xFF)) return code;
-    const index = windows1252High.indexOf(code);
-    return index === -1 ? null : 0x80 + index;
-  };
-  const windows1252Encode = text => {
-    const bytes = [];
-    for (const character of text) {
-      const code = character.codePointAt(0);
-      const byte = windows1252Byte(code);
-      if (byte !== null) {
-        bytes.push(byte);
-      } else {
-        for (const digit of `&#${code};`) bytes.push(digit.charCodeAt(0));
-      }
-    }
-    return new Uint8Array(bytes);
-  };
-  const charsetBytes = (text, label) => {
-    const normalized = toWellFormed(String(text));
-    const encoding = String(label).toLowerCase();
-    if (encoding === 'utf-8') return encoder.encode(normalized);
-    if (encoding === 'windows-1252') return windows1252Encode(normalized);
-    const encoded = host.__tbEncodeForm(normalized, label);
-    const bytes = new Uint8Array(encoded.length);
-    for (let index = 0; index < encoded.length; index++) {
-      bytes[index] = encoded.charCodeAt(index);
-    }
-    return bytes;
-  };
+  // Text crosses to the engine's one Encoding Standard implementation, which
+  // also turns an unrepresentable character into a numeric character reference
+  // (<https://encoding.spec.whatwg.org/#encode>).
+  const charsetBytes = (text, label) =>
+    host.__tbEncodeFormBytes(toWellFormed(String(text)), label);
   // Percent-encode already encoded bytes for application/x-www-form-urlencoded
   // (<https://url.spec.whatwg.org/#concept-urlencoded-byte-serializer>).
-  const urlEncodeBytes = bytes => {
-    let out = '';
-    for (const byte of bytes) {
-      if ((byte >= 0x30 && byte <= 0x39) || (byte >= 0x41 && byte <= 0x5A)
-          || (byte >= 0x61 && byte <= 0x7A)
-          || byte === 0x2A || byte === 0x2D || byte === 0x2E || byte === 0x5F) {
-        out += String.fromCharCode(byte);
-      } else if (byte === 0x20) {
-        out += '+';
-      } else {
-        out += `%${byte.toString(16).toUpperCase().padStart(2, '0')}`;
-      }
-    }
-    return out;
-  };
-  const urlEncodeByte = (text, label) => urlEncodeBytes(charsetBytes(text, label));
+  const urlEncodeByte = (text, label) =>
+    host.__tbUrlEncodeForm(toWellFormed(String(text)), label);
   // A JS string with a lone surrogate cannot cross to Rust as UTF-8; replace
   // lone surrogates with U+FFFD, the same replacement the Encoding Standard's
   // `encode` applies

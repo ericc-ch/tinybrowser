@@ -761,13 +761,11 @@ pub(crate) fn submission_encoding(label: &str) -> &'static encoding_rs::Encoding
         .unwrap_or(encoding_rs::UTF_8)
 }
 
-/// Encodes `text` in the form's submission encoding, returning a Latin-1
-/// string of the encoded bytes. A character the encoding cannot represent
-/// becomes a numeric character reference, per the Encoding Standard's
-/// `encode` (<https://encoding.spec.whatwg.org/#encode>).
-pub(crate) fn encode_form(text: &str, label: &str) -> String {
-    let (bytes, _, _) = submission_encoding(label).encode(text);
-    net::isomorphic_decode(&bytes)
+/// Encodes `text` in the form's submission encoding as raw bytes. The caller
+/// builds the multipart or text/plain framing around them
+/// (<https://encoding.spec.whatwg.org/#encode>).
+pub(crate) fn encode_form_bytes(text: &str, label: &str) -> Vec<u8> {
+    submission_encoding(label).encode(text).0.into_owned()
 }
 
 /// Percent-encodes `text` for form submission: Encoding Standard `encode`

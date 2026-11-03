@@ -12,7 +12,7 @@
 //! <https://html.spec.whatwg.org/multipage/form-elements.html#concept-option-selectedness>).
 
 use super::{focus, host_node_id, owning_world, world, world_for_node};
-use crate::dom::forms::{self, PendingEntry, encode_form, trim_label, urlencode_form};
+use crate::dom::forms::{self, PendingEntry, encode_form_bytes, trim_label, urlencode_form};
 use crate::dom::input::{
     InputType, NumberBufferState, number_buffer_state, step_mismatch, value_as_number,
     value_in_units,
@@ -50,8 +50,8 @@ pub(super) fn install(_ctx: &Ctx<'_>, globals: &Object<'_>) -> Result<()> {
         rquickjs::prelude::Func::from(set_input_files),
     )?;
     globals.set(
-        "__tbEncodeForm",
-        rquickjs::prelude::Func::from(|text: String, label: String| encode_form(&text, &label)),
+        "__tbEncodeFormBytes",
+        rquickjs::prelude::Func::from(encode_form_bytes_js),
     )?;
     globals.set(
         "__tbUrlEncodeForm",
@@ -296,6 +296,13 @@ fn set_output_default_value<'js>(ctx: Ctx<'js>, element: Value<'js>, value: rqui
     if let Some((node, world)) = control_of(&ctx, &element) {
         world.borrow_mut().control(node).output_default_value = Some(units);
     }
+}
+
+/// Encodes form text in the submission encoding, as the raw bytes the
+/// multipart and text/plain serializers frame
+/// (<https://encoding.spec.whatwg.org/#encode>).
+fn encode_form_bytes_js(ctx: Ctx<'_>, text: String, label: String) -> Result<TypedArray<'_, u8>> {
+    TypedArray::new(ctx, encode_form_bytes(&text, &label))
 }
 
 /// The floating-point grammar over an owned string, with `null` for a parse
