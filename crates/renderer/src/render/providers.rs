@@ -149,42 +149,9 @@ impl blitz_traits::shell::ShellProvider for TinyShell {
     }
 }
 
-/// Records navigations for the carrier to drain; screenshots never navigate.
-#[derive(Default)]
-pub(crate) struct TinyNav {
-    pending: std::sync::Mutex<Vec<url::Url>>,
-}
-
-impl TinyNav {
-    /// Builds an empty recorder.
-    pub(crate) fn new() -> Self {
-        Self::default()
-    }
-
-    /// Takes every recorded navigation, leaving the recorder empty.
-    pub(crate) fn drain(&self) -> Vec<url::Url> {
-        std::mem::take(
-            &mut self
-                .pending
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        )
-    }
-}
-
-impl blitz_traits::navigation::NavigationProvider for TinyNav {
-    fn navigate_to(&self, options: blitz_traits::navigation::NavigationOptions) {
-        self.pending
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(options.url);
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{CountingHandler, TinyNav, TinyNetProvider};
-    use blitz_traits::navigation::{NavigationOptions, NavigationProvider};
+    use super::{CountingHandler, TinyNetProvider};
     use blitz_traits::net::{NetHandler, NetProvider};
 
     struct VecHandler {
@@ -235,18 +202,5 @@ mod tests {
             blitz_traits::net::Bytes::from_static(b"x"),
         );
         assert_eq!(in_flight.load(std::sync::atomic::Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn nav_records_and_drains() {
-        let nav = TinyNav::new();
-        nav.navigate_to(NavigationOptions::new(
-            "https://example.com/".parse().expect("url"),
-            None,
-            1,
-        ));
-        let pending = nav.drain();
-        assert_eq!(pending.len(), 1);
-        assert_eq!(nav.drain(), Vec::new());
     }
 }

@@ -291,11 +291,9 @@ pub(crate) fn form_owner_of(
     document: u32,
     node: BlitzId,
 ) -> Option<NodeId> {
-    // Reset-the-form-owner: a present `form` attribute on a connected
-    // element is authoritative. A miss (unknown or empty ID) leaves the
-    // owner null — it does not fall through to the ancestor, and neither
-    // does Chromium nor WPT `form_attribute.html`
-    // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#reset-the-form-owner>).
+    // Blitz's `controls_to_form` map is only refreshed at insertion time, so
+    // an attribute write or a reparent can leave it stale. The getters and the
+    // entry list need the owner as it is now, so resolve it on read.
     if let Some(form_id) = attr(base, node, "form")
         && is_connected(base, node)
     {

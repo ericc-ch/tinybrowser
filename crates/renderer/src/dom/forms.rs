@@ -130,10 +130,20 @@ pub(crate) fn collect_pending_entries(
         if form_owner_of(base, document, current) != Some(form) {
             continue;
         }
-        let Some(control_name) = attr(base, current, "name") else {
-            continue;
-        };
-        if control_name.is_empty()
+        let control_name = attr(base, current, "name").unwrap_or("");
+        let is_submitter = submitter
+            == Some(NodeId {
+                document,
+                node: current,
+            });
+        // An image button contributes `x`/`y` even with no name; every other
+        // control needs a non-empty name
+        // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#constructing-form-data-set>).
+        let is_image_submitter = is_submitter
+            && local == "input"
+            && crate::dom::input::input_type(base, current)
+                == Some(crate::dom::input::InputType::Image);
+        if (control_name.is_empty() && !is_image_submitter)
             || is_disabled(base, current)
             || has_datalist_ancestor(base, current)
         {
@@ -177,7 +187,7 @@ pub(crate) fn collect_pending_entries(
 /// through an ancestor `fieldset` (outside its first `legend`) is a known gap
 /// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#concept-fe-disabled>).
 pub(crate) fn is_disabled(base: &BaseDocument, node: BlitzId) -> bool {
-    if attr(base, node, "disabled").is_some() {
+    if attr(base, node, "disabled").is_some() || base.disabled_by_fieldset(node) {
         return true;
     }
     if !is_html_element(base, node, "option") {
@@ -257,7 +267,25 @@ pub(crate) fn pending_entry(
             let kind = input_type(base, node).unwrap_or(InputType::Text);
             match kind {
                 InputType::Reset | InputType::Button => Vec::new(),
-                InputType::Submit | InputType::Image if !is_submitter => Vec::new(),
+                InputType::Submit if !is_submitter => Vec::new(),
+                InputType::Image => {
+                    if !is_submitter {
+                        return Vec::new();
+                    }
+                    // The image button's entries are `<name>.x` / `<name>.y`
+                    // (or bare `x` / `y` with no name). The selected
+                    // coordinate is (0, 0) when no activation point is
+                    // carried.
+                    let prefix = if control_name.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{control_name}.")
+                    };
+                    vec![
+                        PendingEntry::Text(format!("{prefix}x"), "0".to_owned()),
+                        PendingEntry::Text(format!("{prefix}y"), "0".to_owned()),
+                    ]
+                }
                 InputType::File => vec![PendingEntry::Files(control_name.to_owned(), id)],
                 InputType::Checkbox | InputType::Radio => {
                     // Checkable controls contribute only when checked; their

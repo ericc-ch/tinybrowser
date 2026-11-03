@@ -30,6 +30,7 @@ pub(super) fn install(_ctx: &Ctx<'_>, globals: &Object<'_>) -> Result<()> {
         "__tbFormNavigate",
         rquickjs::prelude::Func::from(form_navigate),
     )?;
+    globals.set("__tbFormPlan", rquickjs::prelude::Func::from(form_plan))?;
     globals.set(
         "__tbSetInputFiles",
         rquickjs::prelude::Func::from(set_input_files),
@@ -168,6 +169,46 @@ pub(super) fn form_entries<'js>(
         }
     }
     Ok(entries)
+}
+
+/// The resolved submission plan for a form and an optional submitter, as
+/// `[action, method, enctype, target]`, or `null` when the form cannot submit
+/// (no action that resolves, or `dialog`).
+///
+/// The renderer owns the event half (`submit`, `formdata`) and the encoders;
+/// the method/action/enctype/target resolution and their parsers are the
+/// engine's one copy
+/// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#form-submission-algorithm>).
+pub(super) fn form_plan<'js>(
+    ctx: Ctx<'js>,
+    form: Value<'js>,
+    submitter: Opt<Value<'js>>,
+) -> Result<Option<Array<'js>>> {
+    let Some(id) = host_node_id(&ctx, &form) else {
+        return Ok(None);
+    };
+    let world = world(&ctx)?;
+    let world = world.borrow();
+    let Some(parsed) = world.document(id) else {
+        return Ok(None);
+    };
+    let submitter = submitter.0.and_then(|value| host_node_id(&ctx, &value));
+    // A submitter from another document cannot override this form's attributes;
+    // the node id alone would address an unrelated element in this tree.
+    let submitter = submitter.filter(|submitter| submitter.document == id.document);
+    let Some(plan) = parsed
+        .document
+        .base
+        .plan_form_submission(id.node, submitter.map(|submitter| submitter.node))
+    else {
+        return Ok(None);
+    };
+    let array = Array::new(ctx)?;
+    array.set(0, plan.action.to_string())?;
+    array.set(1, plan.method.as_str())?;
+    array.set(2, plan.enctype.as_str())?;
+    array.set(3, plan.target.unwrap_or_default())?;
+    Ok(Some(array))
 }
 
 /// Appends one `[name, File]` pair per file a script assigned to a `type=file`

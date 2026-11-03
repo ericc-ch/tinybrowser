@@ -12,7 +12,7 @@ use rquickjs::{Ctx, Exception, Result, Value};
 
 use crate::dom::insertion::replace_all_journaled;
 use crate::dom::tree::{NodeId, attr, form_owner_of, html_namespace};
-use crate::js::bindings::enumerated::{Defaults, FormEnctype, FormMethod, reflect_enumerated};
+use std::str::FromStr;
 
 use super::JsNode;
 use super::element::{content_attr, reflect_ulong};
@@ -870,13 +870,14 @@ impl JsNode {
         // Enumerated without whitespace stripping: only an exact ASCII
         // case-insensitive keyword matches
         // (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#limited-to-only-known-values>).
-        reflect_enumerated::<FormMethod>(
-            content_attr(&ctx, self.handle.0, "formmethod").as_deref(),
-            Defaults {
-                missing: None,
-                invalid: Some(FormMethod::Get),
-            },
-        )
+        // The form-submission plan and this getter share the engine's parser,
+        // so they cannot disagree about a value such as `" post"`.
+        match content_attr(&ctx, self.handle.0, "formmethod") {
+            None => "",
+            Some(raw) => blitz_dom::form::FormMethod::from_str(&raw)
+                .unwrap_or(blitz_dom::form::FormMethod::Get)
+                .as_str(),
+        }
     }
 
     pub(super) fn set_form_method(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
@@ -887,13 +888,12 @@ impl JsNode {
     pub(super) fn form_enctype(&self, ctx: Ctx<'_>) -> &'static str {
         // Absent reads empty, like `formMethod`; no whitespace stripping
         // (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#limited-to-only-known-values>).
-        reflect_enumerated::<FormEnctype>(
-            content_attr(&ctx, self.handle.0, "formenctype").as_deref(),
-            Defaults {
-                missing: None,
-                invalid: Some(FormEnctype::UrlEncoded),
-            },
-        )
+        match content_attr(&ctx, self.handle.0, "formenctype") {
+            None => "",
+            Some(raw) => blitz_dom::form::RequestContentType::from_str(&raw)
+                .unwrap_or(blitz_dom::form::RequestContentType::FormUrlEncoded)
+                .as_str(),
+        }
     }
 
     pub(super) fn set_form_enctype(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {

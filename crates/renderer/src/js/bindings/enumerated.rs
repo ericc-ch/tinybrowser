@@ -119,23 +119,70 @@ enumerated! {
     }
 }
 
-enumerated! {
-    /// `method` and `formmethod`
-    /// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#attr-fs-method>).
-    pub(crate) FormMethod {
-        Get => "get",
-        Post => "post",
-        Dialog => "dialog",
+/// `method` and `formmethod`
+/// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#attr-fs-method>).
+///
+/// The parser is the engine's form-submission parser, so the reflection getter
+/// and the submission plan cannot disagree about a value such as `" post"`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FormMethod {
+    Get,
+    Post,
+    Dialog,
+}
+
+impl Enumerated for FormMethod {
+    const KEYWORDS: &'static [Self] = &[Self::Get, Self::Post, Self::Dialog];
+
+    fn keyword(self) -> &'static str {
+        let engine = match self {
+            Self::Get => blitz_dom::form::FormMethod::Get,
+            Self::Post => blitz_dom::form::FormMethod::Post,
+            Self::Dialog => blitz_dom::form::FormMethod::Dialog,
+        };
+        engine.as_str()
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        use std::str::FromStr;
+        Some(match blitz_dom::form::FormMethod::from_str(value).ok()? {
+            blitz_dom::form::FormMethod::Get => Self::Get,
+            blitz_dom::form::FormMethod::Post => Self::Post,
+            blitz_dom::form::FormMethod::Dialog => Self::Dialog,
+        })
     }
 }
 
-enumerated! {
-    /// `enctype` and `formenctype`
-    /// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#attr-fs-enctype>).
-    pub(crate) FormEnctype {
-        UrlEncoded => "application/x-www-form-urlencoded",
-        Multipart => "multipart/form-data",
-        TextPlain => "text/plain",
+/// `enctype` and `formenctype`
+/// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#attr-fs-enctype>).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FormEnctype {
+    UrlEncoded,
+    Multipart,
+    TextPlain,
+}
+
+impl Enumerated for FormEnctype {
+    const KEYWORDS: &'static [Self] = &[Self::UrlEncoded, Self::Multipart, Self::TextPlain];
+
+    fn keyword(self) -> &'static str {
+        let engine = match self {
+            Self::UrlEncoded => blitz_dom::form::RequestContentType::FormUrlEncoded,
+            Self::Multipart => blitz_dom::form::RequestContentType::MultipartFormData,
+            Self::TextPlain => blitz_dom::form::RequestContentType::TextPlain,
+        };
+        engine.as_str()
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        use std::str::FromStr;
+        Some(
+            match blitz_dom::form::RequestContentType::from_str(value).ok()? {
+                blitz_dom::form::RequestContentType::FormUrlEncoded => Self::UrlEncoded,
+                blitz_dom::form::RequestContentType::MultipartFormData => Self::Multipart,
+                blitz_dom::form::RequestContentType::TextPlain => Self::TextPlain,
+            },
+        )
     }
 }
 

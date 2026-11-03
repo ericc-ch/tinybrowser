@@ -513,10 +513,9 @@ pub(crate) struct Document {
     /// Blitz subresource fetches run through our agent on the carrier
     /// runtime; Blitz owns stylesheets and images once they land.
     net_provider: std::sync::Arc<crate::render::TinyNetProvider>,
-    /// Blitz link/form navigations, drained into frame navigations on tick.
-    blitz_nav: std::sync::Arc<crate::render::TinyNav>,
-    /// Blitz shell: a mutation that changes rendered output asks for a frame,
-    /// which is this document's cue to resolve style and layout.
+    /// Blitz link/form navigations are not routed: tinybrowser never calls
+    /// Blitz's event driver, and the renderer's own JS bindings perform the
+    /// navigations. A Blitz navigation target is therefore inert.
     blitz_shell: std::sync::Arc<crate::render::TinyShell>,
     /// Resolve passes run by [`Self::settle_blitz_layout`]. A test resets and
     /// reads it to prove that several mutations between two paints settle once.
@@ -847,14 +846,12 @@ impl Document {
         let (settle_tx, settle_rx) = std::sync::mpsc::channel();
         let net_provider =
             std::sync::Arc::new(crate::render::TinyNetProvider::new(blitz_tx, settle_tx));
-        let blitz_nav = std::sync::Arc::new(crate::render::TinyNav::new());
         Self {
             world,
             services: Arc::clone(&runtime.services),
             js_runtime: runtime.js_runtime.clone(),
             wake: Arc::clone(&runtime.wake),
             net_provider,
-            blitz_nav,
             blitz_shell: std::sync::Arc::new(crate::render::TinyShell::new()),
             #[cfg(test)]
             blitz_resolve_passes: 0,
@@ -1235,17 +1232,7 @@ impl Document {
     }
 
     pub(crate) fn take_frame_navigations(&mut self) -> Vec<FrameNavigation> {
-        let mut navigations = self.world.borrow_mut().take_frame_navigations();
-        // A click Blitz routes through its navigation provider names no target
-        // (`NavigationOptions` carries the URL alone), so the empty target
-        // leaves it navigating the frame it was clicked in.
-        navigations.extend(self.blitz_nav.drain().into_iter().map(|url| {
-            FrameNavigation::get(
-                crate::js::NavigationTarget::Target(crate::protocol::TargetName::Current),
-                url.as_str().to_owned(),
-            )
-        }));
-        navigations
+        self.world.borrow_mut().take_frame_navigations()
     }
 
     /// Takes the traversals of this frame's own session history.
@@ -2408,7 +2395,9 @@ impl Document {
         blitz_dom::DocumentConfig {
             net_provider: Some(std::sync::Arc::clone(&self.net_provider)
                 as std::sync::Arc<dyn blitz_traits::net::NetProvider>),
-            navigation_provider: Some(std::sync::Arc::clone(&self.blitz_nav)
+            navigation_provider: Some(std::sync::Arc::new(
+                blitz_traits::navigation::DummyNavigationProvider,
+            )
                 as std::sync::Arc<dyn blitz_traits::navigation::NavigationProvider>),
             shell_provider: Some(std::sync::Arc::clone(&self.blitz_shell)
                 as std::sync::Arc<dyn blitz_traits::shell::ShellProvider>),

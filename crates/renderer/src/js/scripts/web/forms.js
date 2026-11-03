@@ -1112,35 +1112,17 @@
     return concatBytes(chunks);
   };
 
-  const methodKeyword = raw => {
-    const value = __tbAsciiLower(asciiTrim(raw));
-    return (value === 'post' || value === 'dialog') ? value : 'get';
-  };
-  const enctypeKeyword = raw => {
-    const value = __tbAsciiLower(asciiTrim(raw));
-    if (value === 'multipart/form-data' || value === 'text/plain') return value;
-    return 'application/x-www-form-urlencoded';
-  };
   // A submit button overrides its form's action/method/enctype/target through
-  // its `form*` attributes
+  // its `form*` attributes; the engine resolves all four, including the
+  // submitter's state, so the form and the button cannot disagree
   // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#form-submission-algorithm>).
-  const submitterAttribute = (submitter, attribute) =>
-    submitter !== undefined && submitter !== null && submitter.hasAttribute(attribute)
-      ? submitter.getAttribute(attribute)
-      : null;
-
   const submitForm = (form, formData, submitter) => {
-    const methodAttr = submitterAttribute(submitter, 'formmethod');
-    const method = methodAttr !== null ? methodKeyword(methodAttr) : form.method;
-    if (method === 'dialog') return;
-    const actionAttr = submitterAttribute(submitter, 'formaction');
-    const action = actionAttr !== null
-      ? new globalThis.URL(actionAttr, globalThis.document.URL).href
-      : form.action;
-    const targetAttr = submitterAttribute(submitter, 'formtarget');
-    const target = targetAttr !== null ? targetAttr : form.target;
-    const enctypeAttr = submitterAttribute(submitter, 'formenctype');
-    const enctype = enctypeAttr !== null ? enctypeKeyword(enctypeAttr) : form.enctype;
+    const plan = host.__tbFormPlan(form, submitter === undefined ? null : submitter);
+    if (plan === null) return;
+    const action = plan[0];
+    const method = plan[1];
+    const enctype = plan[2];
+    const target = plan[3];
     const label = charsetLabel(form);
     // A `_charset_` control carries the submission encoding's name
     // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#attr-fe-name-charset>).
