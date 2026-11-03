@@ -295,7 +295,10 @@ pub(super) fn form_navigate<'js>(
     {
         return Ok(());
     }
-    let mut navigation = FrameNavigation::get(crate::js::NavigationTarget::Target(target), url);
+    let mut navigation = FrameNavigation::get(
+        crate::js::NavigationTarget::Target(crate::protocol::TargetName::parse(&target)),
+        url,
+    );
     navigation.method = method;
     navigation.body = body.to_vec();
     navigation.content_type = content_type;

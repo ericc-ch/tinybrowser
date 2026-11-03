@@ -25,6 +25,7 @@ members = [
     # testharness lane. Never a release dependency.
     "tools/wpt-fast",
     "tools/wpt-harness",
+    "tools/wpt-report",
 ]
 
 [workspace.package]
@@ -41,6 +42,7 @@ enumerated = { path = "crates/enumerated" }
 logging = { path = "crates/logging" }
 net = { path = "crates/net" }
 renderer = { path = "crates/renderer" }
+wpt-report = { path = "tools/wpt-report" }
 secure-context = { path = "crates/secure-context" }
 server = { path = "crates/server" }
 webdriver = { path = "crates/webdriver" }

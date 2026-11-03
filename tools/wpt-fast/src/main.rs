@@ -11,7 +11,6 @@
 
 mod meta;
 mod modules;
-mod report;
 mod runner;
 mod suite;
 
@@ -22,7 +21,8 @@ use std::time::Instant;
 
 use rquickjs::Runtime;
 
-use runner::{Harness, Outcome, Status, TestCase};
+use runner::{Harness, TestCase};
+use wpt_report::{Outcome, Status};
 
 /// Parsed command line.
 struct Options {
@@ -87,17 +87,17 @@ fn main() {
     let started = Instant::now();
     let outcomes = run_all(cases, &harness, options.jobs);
     let wall = started.elapsed();
-    summarize(&outcomes, wall, options.verbose);
+    wpt_report::summarize(&outcomes, wall, 0, options.verbose);
     if let Some(path) = &options.report
-        && let Err(error) = report::write_report(path, &outcomes)
+        && let Err(error) = wpt_report::write_report(path, &outcomes)
     {
         eprintln!("wpt-fast: cannot write {}: {error}", path.display());
         std::process::exit(2);
     }
     if let Some(baseline) = &options.baseline {
-        match report::compare(baseline, &outcomes) {
+        match wpt_report::compare(baseline, &outcomes) {
             Ok(comparison) => {
-                print_comparison(&comparison);
+                wpt_report::print_comparison(&comparison);
                 if comparison.failed() {
                     std::process::exit(1);
                 }
@@ -151,74 +151,24 @@ fn run_all(cases: &[TestCase], harness: &Harness, jobs: usize) -> Vec<Outcome> {
             .into_iter()
             .enumerate()
             .map(|(index, outcome)| {
-                outcome.unwrap_or_else(|| Outcome {
-                    id: cases[index].wpt_id(),
-                    status: Status::Skip,
-                    message: Some("worker stopped before this test".into()),
-                    duration: std::time::Duration::ZERO,
+                outcome.unwrap_or_else(|| {
+                    let message = Some("worker stopped before this test".into());
+                    Outcome {
+                        id: cases[index].wpt_id(),
+                        status: Status::Skip,
+                        subtests: vec![wpt_report::Subtest {
+                            name: "Test".to_owned(),
+                            status: Status::Skip.as_str().to_owned(),
+                            message: message.clone(),
+                        }],
+                        message,
+                        duration: std::time::Duration::ZERO,
+                        testharness: true,
+                    }
                 })
             })
             .collect()
     })
-}
-
-/// Prints counts and the slowest files.
-fn summarize(outcomes: &[Outcome], wall: std::time::Duration, verbose: bool) {
-    let mut pass = 0;
-    let mut fail = 0;
-    let mut skip = 0;
-    let mut failures = Vec::new();
-    let mut slowest: Vec<&Outcome> = outcomes.iter().collect();
-    for outcome in outcomes {
-        match outcome.status {
-            Status::Pass => pass += 1,
-            Status::Fail => {
-                fail += 1;
-                failures.push(outcome);
-            }
-            Status::Skip => skip += 1,
-        }
-    }
-    slowest.sort_by_key(|outcome| std::cmp::Reverse(outcome.duration));
-    let count = u32::try_from(outcomes.len()).unwrap_or(u32::MAX);
-    println!(
-        "{} tests in {:.1?} ({:.2} ms/test): {pass} pass, {fail} fail, {skip} skip",
-        outcomes.len(),
-        wall,
-        wall.as_secs_f64() * 1000.0 / f64::from(count)
-    );
-    if verbose {
-        for outcome in failures {
-            println!(
-                "FAIL {} :: {}",
-                outcome.id,
-                outcome.message.as_deref().unwrap_or("")
-            );
-        }
-        for outcome in slowest.iter().take(10) {
-            println!("SLOW {:>8.1?} {}", outcome.duration, outcome.id);
-        }
-    }
-}
-
-/// Prints what changed against the baseline.
-fn print_comparison(comparison: &report::Comparison) {
-    for test in &comparison.regressions {
-        println!("REGRESSION {test}");
-    }
-    for test in &comparison.new_failures {
-        println!("NEW-FAILURE {test}");
-    }
-    for test in &comparison.fixes {
-        println!("FIXED {test}");
-    }
-    println!(
-        "baseline diff: {} regressions, {} new failures, {} fixes, {} tests not selected",
-        comparison.regressions.len(),
-        comparison.new_failures.len(),
-        comparison.fixes.len(),
-        comparison.missing.len()
-    );
 }
 
 const HELP: &str = "\

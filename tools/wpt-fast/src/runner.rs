@@ -10,37 +10,16 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use rquickjs::{
     ArrayBuffer, CaughtError, Context, Ctx, Function, Module, Object, Runtime, Value,
     context::EvalOptions,
 };
 
+use wpt_report::{Outcome, Status, Subtest};
+
 use crate::meta::{Meta, Phase};
-
-/// The verdict for one file.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Status {
-    /// The test harness reported success.
-    Pass,
-    /// An assertion, expected error, or harness step failed.
-    Fail,
-    /// The runner cannot execute this test yet.
-    Skip,
-}
-
-impl Status {
-    /// The status spelling a wptreport uses.
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Pass => "PASS",
-            Self::Fail => "FAIL",
-            Self::Skip => "SKIP",
-        }
-    }
-}
 
 /// One file selected from the suite.
 #[derive(Clone, Debug)]
@@ -71,19 +50,6 @@ impl TestCase {
         };
         format!("/third_party/test262/{stem}{suffix}")
     }
-}
-
-/// The outcome of one file.
-#[derive(Clone, Debug)]
-pub struct Outcome {
-    /// wptreport test identifier.
-    pub id: String,
-    /// Harness verdict.
-    pub status: Status,
-    /// Failure or skip reason.
-    pub message: Option<String>,
-    /// Wall time spent in this file.
-    pub duration: Duration,
 }
 
 /// Sources every test can ask for, read once per process.
@@ -155,8 +121,14 @@ pub fn run(runtime: &Runtime, harness: &Harness, case: &TestCase) -> Outcome {
     Outcome {
         id: case.wpt_id(),
         status,
+        subtests: vec![Subtest {
+            name: "Test".to_owned(),
+            status: status.as_str().to_owned(),
+            message: message.clone(),
+        }],
         message,
         duration: started.elapsed(),
+        testharness: true,
     }
 }
 

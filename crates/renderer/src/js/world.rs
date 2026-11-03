@@ -580,10 +580,11 @@ pub(crate) enum NavigationTarget {
     /// The frame with this identity, chosen by `window.open` before the
     /// navigation was queued.
     Frame(FrameId),
-    /// The `target` of a link or form: the empty string, a keyword (`_self`,
-    /// `_parent`, `_top`, `_blank`), or a browsing context name. The engine
-    /// applies the rules for choosing a navigable once the script stops.
-    Target(String),
+    /// The `target` of a link or form, parsed once at the boundary. The
+    /// engine applies the rules for choosing a navigable once the script
+    /// stops, so a queued navigation never carries a second spelling of the
+    /// same choice.
+    Target(crate::protocol::TargetName),
 }
 
 /// Where a navigation's referrer comes from.

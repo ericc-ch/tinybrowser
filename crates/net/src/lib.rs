@@ -14,7 +14,9 @@ mod resolve;
 mod transport;
 
 pub use client::{Agent, AgentOptions, Body, Clock, Request, Response};
-pub use cookies::{CookieRecord, CookieSameSite, InitiatorKind, origins_same_site, site};
+pub use cookies::{
+    CookieRecord, CookieSameSite, InitiatorKind, origins_same_site, site, site_for_origin,
+};
 pub use error::{NetError, TimeoutKind, TransportError};
 pub use identity::{
     Brand, ClientHints, DEFAULT_USER_AGENT, Identity, InvalidIdentity, UserAgent, ValidIdentity,
@@ -28,6 +30,27 @@ pub use referrer::{Referrer, ReferrerClient, ReferrerPolicy, determine_referrer}
 pub use resolve::{InvalidResolveRule, ResolveRule};
 pub use transport::{InvalidCa, InvalidProxy, Proxy, TrustedCa};
 
+/// The URL a tuple origin serializes to; `None` for an opaque origin.
+///
+/// The serialization of a tuple origin is always a valid URL, so the `expect`
+/// lives here instead of at every reader: `SerializedOrigin::to_url`, redirect
+/// reporting, and the site lock all ask this one function.
+///
+/// # Panics
+///
+/// Never in practice: `url` serializes a tuple origin as an absolute URL. The
+/// panic exists so a future `url` change fails loudly instead of silently
+/// turning a tuple origin into an opaque one at three call sites.
+#[must_use]
+pub fn origin_url(origin: &url::Origin) -> Option<url::Url> {
+    let url::Origin::Tuple(..) = origin else {
+        return None;
+    };
+    Some(
+        url::Url::parse(&origin.ascii_serialization()).expect("a tuple origin serializes as a URL"),
+    )
+}
+
 /// The URL a browsing context starts on when it has no creator to inherit
 /// from.
 ///
@@ -39,4 +62,22 @@ pub fn about_blank() -> url::Url {
         url::Url::parse("about:blank").expect("about:blank is a valid URL")
     });
     ABOUT_BLANK.clone()
+}
+
+#[cfg(test)]
+mod tests {
+    use url::Url;
+
+    /// A tuple origin serializes to a URL; an opaque one has none.
+    #[test]
+    fn an_origin_produces_its_url_or_nothing() {
+        let page = Url::parse("https://a.test:8443/page").expect("URL");
+        assert_eq!(
+            super::origin_url(&page.origin())
+                .expect("tuple origin")
+                .as_str(),
+            "https://a.test:8443/"
+        );
+        assert!(super::origin_url(&url::Origin::new_opaque()).is_none());
+    }
 }

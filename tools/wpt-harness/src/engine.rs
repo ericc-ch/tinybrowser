@@ -36,34 +36,9 @@ fn budget(case: &TestCase) -> Duration {
 const POLL: &str =
     "String(globalThis.__tinybrowser_result === undefined ? '' : globalThis.__tinybrowser_result)";
 
-/// The verdict for one file.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Status {
-    /// The file's harness completed and every subtest passed.
-    Pass,
-    /// The file completed with at least one failure.
-    Fail,
-    /// The runner killed the file at the budget.
-    Timeout,
-    /// The engine or the runner could not execute the file.
-    Error,
-    /// The runner does not implement this kind yet.
-    Skip,
-}
-
-impl Status {
-    /// The status spelling a wptreport uses.
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Pass => "PASS",
-            Self::Fail => "FAIL",
-            Self::Timeout => "TIMEOUT",
-            Self::Error => "ERROR",
-            Self::Skip => "SKIP",
-        }
-    }
-}
+/// The verdict for one file, shared with the other fast lane so the report and
+/// the baseline rule cannot drift (#234).
+pub use wpt_report::Status;
 
 /// One testharness subtest.
 #[derive(Clone, Debug)]

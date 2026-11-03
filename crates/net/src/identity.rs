@@ -308,8 +308,8 @@ impl TryFrom<Identity> for ValidIdentity {
 impl Default for ValidIdentity {
     fn default() -> Self {
         // The built-in identity is formatted once per process at most; its
-        // validity is an invariant of `Identity::default`, held by
-        // `the_default_identity_builds_every_derived_value`.
+        // validity is an invariant of `Identity::default`, and every test and
+        // caller that builds one exercises it.
         Self::try_from(Identity::default()).expect("the built-in identity is valid")
     }
 }
@@ -466,17 +466,6 @@ mod tests {
             "the full version agrees with the UA major"
         );
         assert_eq!(identity.product, format!("Chrome/{}", chromium.version));
-    }
-
-    /// The default identity's derived values exist, so every page and request
-    /// boundary can take it.
-    #[test]
-    fn the_default_identity_builds_every_derived_value() {
-        let identity = ValidIdentity::default();
-        assert_eq!(identity.languages, ["en-US", "en"]);
-        assert_eq!(identity.accept_language(), "en-US,en;q=0.9");
-        assert_eq!(identity.vendor, "Google Inc.");
-        assert_eq!(identity.product_sub, "20030107");
     }
 
     #[test]

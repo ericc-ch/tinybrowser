@@ -64,7 +64,7 @@ one shard instead of the run; a shard that exits non-zero is bisected until
 the single crashing file is found, and that file is recorded as ERROR. The
 driver owns the window: a `--offset`/`--limit` on the command line slices the
 selection once and every shard's slice stays inside it, and the other runner
-flags (`--cache`, `--jobs`, `--deps`/`--changed`) pass through with their
+flags (`--cache`, `--jobs`) pass through with their
 values. Use it for directories where layout or paint can panic (html/
 currently does): a panic in-process bypasses the harness's per-file error
 framing, and unwinding a half-torn engine can abort outright. dom/ needs no
@@ -80,26 +80,6 @@ only splits when it dies: html/ warm is 1.2 s at 16 jobs (3 s through the
 driver) against those 7,206 s. A file that aborts the engine cannot record
 its own verdict, so the driver marks it with `--mark-crashed` and later runs
 read it as an ordinary cached ERROR instead of bisecting again.
-
-`--deps MAP --changed FILE` narrows a run to the tests that executed a
-changed repository file. `--changed` is one path per line, relative to the
-repository root; MAP is `{"version":1,"tests":{id:[source paths]}}` built by
-`tools/wpt/deps.py build` from an instrumented run. The rule is conservative
-in one place: a changed path the map never saw means the map cannot bound the
-blast radius, so every selected test runs. A file's own bytes are still an
-input through `--cache`, so editing a test reruns it even when the map is
-stale.
-
-Building a full map is a scheduled job, not a per-push step: `-C
-instrument-coverage` makes process setup cost ~19 s here (fontconfig through
-instrumented Rust) and each test ~0.2 s. `--batch N` pays that setup once per
-N tests and gives every test in the batch the union of what the batch
-executed, which over-selects and never under-selects. Measured: dom/nodes
-(374 tests) at `--batch 50 --jobs 4` took 1 m 47 s and yields a 50-test
-granularity floor; a change to `window_features.rs` selected 24 tests and ran
-in 1.5 s against 10.9 s for the directory, while a core file such as `xml.rs`
-selected all 374 and ran in 11.0 s. Larger `--batch` is cheaper to record and
-coarser to select.
 
 Known gap: an async listener that leaves a host object borrowed makes
 rquickjs panic with `AlreadyBorrowed` in `Class::borrow_mut`; rquickjs

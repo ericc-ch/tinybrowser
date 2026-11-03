@@ -1214,12 +1214,7 @@ fn watch_redirects(
 /// root is the URL the old seam carried too. An opaque origin has no URL, so
 /// reports get `about:blank`; the renderer keeps the real one.
 fn document_url(origin: &url::Origin) -> Url {
-    match origin {
-        url::Origin::Tuple(..) => {
-            Url::parse(&origin.ascii_serialization()).expect("a tuple origin serializes as a URL")
-        }
-        url::Origin::Opaque(_) => net::about_blank(),
-    }
+    net::origin_url(origin).unwrap_or_else(net::about_blank)
 }
 
 /// Builds the `net` request for one page dial: URL, method, CORS parameters,

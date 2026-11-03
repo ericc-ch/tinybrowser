@@ -1223,7 +1223,7 @@ impl Document {
         // leaves it navigating the frame it was clicked in.
         navigations.extend(self.blitz_nav.drain().into_iter().map(|url| {
             FrameNavigation::get(
-                crate::js::NavigationTarget::Target(String::new()),
+                crate::js::NavigationTarget::Target(crate::protocol::TargetName::Current),
                 url.as_str().to_owned(),
             )
         }));
@@ -3840,7 +3840,7 @@ impl Document {
             return;
         };
         let navigation = FrameNavigation::get(
-            crate::js::NavigationTarget::Target("_self".to_owned()),
+            crate::js::NavigationTarget::Target(crate::protocol::TargetName::Current),
             target.to_string(),
         );
         self.world.borrow_mut().queue_frame_navigation(navigation);

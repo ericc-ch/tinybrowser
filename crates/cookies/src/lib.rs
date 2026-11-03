@@ -840,6 +840,18 @@ pub fn site(url: &Url) -> Option<String> {
     Some(format!("{scheme}://{domain}"))
 }
 
+/// The site one tuple origin names, or `None` for an opaque or non-network
+/// origin.
+///
+/// This is the same rule as [`site`] without constructing a URL: the origin's
+/// tuple already carries the scheme and host the registrable-domain lookup
+/// needs.
+#[must_use]
+pub fn site_for_origin(origin: &Origin) -> Option<String> {
+    let (scheme, domain) = origin_site_tuple(origin)?;
+    Some(format!("{scheme}://{domain}"))
+}
+
 fn site_tuple(url: &Url) -> Option<(String, String)> {
     let scheme = site_scheme(url.scheme())?;
     Some((
@@ -1164,7 +1176,7 @@ mod tests {
 
     use super::{
         CookieJar, CookieOp, CookieRecord, CookieSameSite, InitiatorKind, RetrievalKind,
-        schemeful_same_site, site,
+        schemeful_same_site, site, site_for_origin,
     };
     /// 2026-10-12T00:00:00Z.
     const NOW: u64 = 1_791_763_200;
@@ -1172,6 +1184,19 @@ mod tests {
 
     fn url(raw: &str) -> Url {
         Url::parse(raw).expect("test URL parses")
+    }
+
+    /// The site of a tuple origin is the same rule as the site of the URL it
+    /// serializes to, without building the throwaway URL.
+    #[test]
+    fn an_origin_names_its_site() {
+        let address = url("https://ads.example.co.uk/page").origin();
+        assert_eq!(
+            site_for_origin(&address).as_deref(),
+            Some("https://example.co.uk")
+        );
+        assert!(site_for_origin(&url::Origin::new_opaque()).is_none());
+        assert!(site_for_origin(&url("data:text/plain,x").origin()).is_none());
     }
 
     fn at(secs: u64) -> SystemTime {

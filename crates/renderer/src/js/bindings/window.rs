@@ -122,7 +122,7 @@ impl Component {
 /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-location-href>).
 fn navigate_location(owner: &Rc<RefCell<World>>, spec: String, source: Option<FrameId>) {
     let mut navigation = crate::js::world::FrameNavigation::get(
-        crate::js::world::NavigationTarget::Target("_self".to_owned()),
+        crate::js::world::NavigationTarget::Target(crate::protocol::TargetName::Current),
         spec,
     );
     if let Some(source) = source {

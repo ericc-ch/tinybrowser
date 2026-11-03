@@ -893,9 +893,13 @@ fn follow_link(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
     };
     // The target picks the navigable at navigation time, so a frame inserted
     // between the click and the drain is still eligible.
-    let navigation =
-        FrameNavigation::get(NavigationTarget::Target(target.unwrap_or_default()), spec)
-            .with_referrer_policy(referrer_policy);
+    let navigation = FrameNavigation::get(
+        NavigationTarget::Target(crate::protocol::TargetName::parse(
+            target.as_deref().unwrap_or_default(),
+        )),
+        spec,
+    )
+    .with_referrer_policy(referrer_policy);
     world.borrow_mut().queue_frame_navigation(navigation);
     Ok(())
 }

@@ -1951,8 +1951,6 @@ def take_shard_size(argv: list[str]) -> tuple[int | None, list[str]]:
 HARNESS_VALUE_FLAGS = {
     "--wpt-root",
     "--jobs",
-    "--deps",
-    "--changed",
     "--mark-crashed",
 }
 
@@ -3095,8 +3093,8 @@ def _selftest() -> None:
         Path("c.json"),
     )
     # The driver owns the window and keeps every other flag's value attached:
-    # a forwarded `--deps` whose value was read as a test path would select
-    # tests the caller never asked for.
+    # a forwarded `--cache` whose value was read as a test path would run a
+    # different selection than the caller asked for.
     parsed = split_harness_args(
         [
             "/dom/nodes",
@@ -3106,15 +3104,13 @@ def _selftest() -> None:
             "10",
             "--limit",
             "5",
-            "--deps",
-            "d.json",
-            "--changed",
-            "f.txt",
+            "--cache",
+            "c.json",
         ]
     )
     assert parsed.paths == ["dom/nodes"]
     assert (parsed.offset, parsed.limit) == (10, 5)
-    assert parsed.forward == ["--deps", "d.json", "--changed", "f.txt"]
+    assert parsed.forward == ["--cache", "c.json"]
 
     _selftest_profile()
     _selftest_failures()

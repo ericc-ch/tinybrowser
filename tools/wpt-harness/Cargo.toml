@@ -15,6 +15,7 @@ name = "wpt-harness"
 path = "src/main.rs"
 
 [dependencies]
+wpt-report = { workspace = true }
 # The real page engine, hosted in this process instead of a renderer child.
 renderer = { workspace = true }
 net = { workspace = true }

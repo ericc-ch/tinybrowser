@@ -1852,7 +1852,7 @@ impl SerializedOrigin {
     pub fn to_url(&self) -> Option<Url> {
         match self {
             Self::Opaque => None,
-            Self::Tuple(origin) => Url::parse(&origin.ascii_serialization()).ok(),
+            Self::Tuple(origin) => net::origin_url(origin),
         }
     }
 }

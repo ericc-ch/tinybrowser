@@ -10,9 +10,7 @@
 //! completion payload the host polls.
 
 mod cache;
-mod deps;
 mod engine;
-mod report;
 mod services;
 mod suite;
 
@@ -23,7 +21,7 @@ use std::time::Instant;
 
 use cache::Cache;
 use engine::Outcome;
-use suite::TestCase;
+use suite::{Kind, TestCase};
 
 /// Parsed command line.
 struct Options {
@@ -33,8 +31,6 @@ struct Options {
     report: Option<PathBuf>,
     baseline: Option<PathBuf>,
     cache: Option<PathBuf>,
-    deps: Option<PathBuf>,
-    changed: Option<PathBuf>,
     verbose: bool,
     list: bool,
     limit: usize,
@@ -85,15 +81,13 @@ fn main() {
         }
         exit(0);
     }
-    let mut cases =
-        match suite::select(&options.root, &options.paths, options.offset, options.limit) {
-            Ok(cases) => cases,
-            Err(error) => {
-                eprintln!("wpt-harness: cannot read suite: {error}");
-                std::process::exit(2);
-            }
-        };
-    apply_selection(&options, &mut cases);
+    let cases = match suite::select(&options.root, &options.paths, options.offset, options.limit) {
+        Ok(cases) => cases,
+        Err(error) => {
+            eprintln!("wpt-harness: cannot read suite: {error}");
+            std::process::exit(2);
+        }
+    };
     if cases.is_empty() {
         eprintln!("wpt-harness: no tests selected");
         std::process::exit(2);
@@ -107,17 +101,18 @@ fn main() {
     let started = Instant::now();
     let (outcomes, cached) = run_selected(&options, &cases);
     let wall = started.elapsed();
-    summarize(&outcomes, wall, cached, options.verbose);
+    let reported: Vec<_> = outcomes.iter().map(reported).collect();
+    wpt_report::summarize(&reported, wall, cached, options.verbose);
     if let Some(path) = &options.report
-        && let Err(error) = report::write_report(path, &outcomes)
+        && let Err(error) = wpt_report::write_report(path, &reported)
     {
         eprintln!("wpt-harness: cannot write {}: {error}", path.display());
         std::process::exit(2);
     }
     if let Some(baseline) = &options.baseline {
-        match report::compare(baseline, &outcomes) {
+        match wpt_report::compare(baseline, &reported) {
             Ok(comparison) => {
-                print_comparison(&comparison);
+                wpt_report::print_comparison(&comparison);
                 if comparison.failed() {
                     exit(1);
                 }
@@ -144,60 +139,6 @@ fn exit(code: i32) -> ! {
     use std::io::Write as _;
     let _ = std::io::stdout().flush();
     std::process::exit(code)
-}
-
-/// Narrows `cases` to what the changed-file list selects, if a map is given.
-fn apply_selection(options: &Options, cases: &mut Vec<TestCase>) {
-    let (Some(map), Some(changed)) = (&options.deps, &options.changed) else {
-        if options.deps.is_some() || options.changed.is_some() {
-            eprintln!("wpt-harness: --deps and --changed go together");
-            std::process::exit(2);
-        }
-        return;
-    };
-    match select_changed(map, changed) {
-        Ok(Some(selected)) => {
-            cases.retain(|case| selected.contains(&case.id()));
-            eprintln!("wpt-harness: dependency map selected {} tests", cases.len());
-        }
-        Ok(None) => {
-            eprintln!("wpt-harness: a changed file has no recorded test; running everything");
-        }
-        Err(error) => {
-            eprintln!("wpt-harness: cannot select from the map: {error}");
-            std::process::exit(2);
-        }
-    }
-}
-
-/// The tests a changed-file list selects, or `None` for the whole suite.
-fn select_changed(
-    map: &std::path::Path,
-    changed: &std::path::Path,
-) -> std::io::Result<Option<std::collections::BTreeSet<String>>> {
-    let deps = deps::Deps::load(map)?;
-    let text = std::fs::read_to_string(changed)?;
-    let paths: Vec<String> = text
-        .split(['\n', ','])
-        .map(str::trim)
-        .filter(|path| !path.is_empty())
-        .map(|path| path.trim_start_matches("./").to_owned())
-        .collect();
-    let selection = deps.select(&paths);
-    match &selection {
-        Some(selected) => eprintln!(
-            "wpt-harness: {} changed files select {} tests (map knows {} files)",
-            paths.len(),
-            selected.len(),
-            deps.known().len()
-        ),
-        None => eprintln!(
-            "wpt-harness: {} changed files include one the map never saw (map knows {} files)",
-            paths.len(),
-            deps.known().len()
-        ),
-    }
-    Ok(selection)
 }
 
 /// Runs every case, reusing cached verdicts whose binary and inputs match.
@@ -360,67 +301,27 @@ fn run_all(
 }
 
 /// Prints counts and the slowest files.
-fn summarize(outcomes: &[Outcome], wall: std::time::Duration, cached: usize, verbose: bool) {
-    let mut pass = 0;
-    let mut fail = 0;
-    let mut timeout = 0;
-    let mut error = 0;
-    let mut skip = 0;
-    let mut failures = Vec::new();
-    let mut slowest: Vec<&Outcome> = outcomes.iter().collect();
-    for outcome in outcomes {
-        match outcome.status {
-            engine::Status::Pass => pass += 1,
-            engine::Status::Fail => {
-                fail += 1;
-                failures.push(outcome);
-            }
-            engine::Status::Timeout => timeout += 1,
-            engine::Status::Error => error += 1,
-            engine::Status::Skip => skip += 1,
-        }
+/// The shared report shape for one engine outcome.
+///
+/// The engine keeps its own `kind` (it drives the executor) and `inputs` (the
+/// result cache), which a wptreport has no field for.
+fn reported(outcome: &Outcome) -> wpt_report::Outcome {
+    wpt_report::Outcome {
+        id: outcome.id.clone(),
+        status: outcome.status,
+        message: outcome.message.clone(),
+        duration: outcome.duration,
+        subtests: outcome
+            .subtests
+            .iter()
+            .map(|subtest| wpt_report::Subtest {
+                name: subtest.name.clone(),
+                status: subtest.status.clone(),
+                message: subtest.message.clone(),
+            })
+            .collect(),
+        testharness: matches!(outcome.kind, Kind::Testharness),
     }
-    slowest.sort_by_key(|outcome| std::cmp::Reverse(outcome.duration));
-    let count = u32::try_from(outcomes.len()).unwrap_or(u32::MAX);
-    println!(
-        "{} tests in {:.1?} ({:.2} ms/test): {pass} pass, {fail} fail, {timeout} timeout, \
-         {error} error, {skip} skip, {cached} cached",
-        outcomes.len(),
-        wall,
-        wall.as_secs_f64() * 1000.0 / f64::from(count)
-    );
-    if verbose {
-        for outcome in failures {
-            println!(
-                "FAIL {} :: {}",
-                outcome.id,
-                outcome.message.as_deref().unwrap_or("")
-            );
-        }
-        for outcome in slowest.iter().take(10) {
-            println!("SLOW {:>8.1?} {}", outcome.duration, outcome.id);
-        }
-    }
-}
-
-/// Prints what changed against the baseline.
-fn print_comparison(comparison: &report::Comparison) {
-    for test in &comparison.regressions {
-        println!("REGRESSION {test}");
-    }
-    for test in &comparison.new_failures {
-        println!("NEW-FAILURE {test}");
-    }
-    for test in &comparison.fixes {
-        println!("FIXED {test}");
-    }
-    println!(
-        "baseline diff: {} regressions, {} new failures, {} fixes, {} tests not selected",
-        comparison.regressions.len(),
-        comparison.new_failures.len(),
-        comparison.fixes.len(),
-        comparison.missing.len()
-    );
 }
 
 const HELP: &str = "\
@@ -433,8 +334,6 @@ Runs WPT testharness and crashtest files in-process.
   --report PATH     write a wptreport JSON
   --baseline PATH   compare with an earlier --report and exit 1 on regressions
   --cache PATH      reuse unchanged verdicts from this cache file (and update it)
-  --deps PATH       test-to-source map for --changed
-  --changed PATH    one changed repository path per line (or comma separated)
   --limit N         stop after N selected files
   --offset N        skip the first N selected files (shards)
   --mark-crashed ID store an ERROR verdict for ID in --cache and exit
@@ -462,8 +361,6 @@ fn parse_args() -> Result<Options, String> {
         report: None,
         baseline: None,
         cache: None,
-        deps: None,
-        changed: None,
         verbose: false,
         list: false,
         limit: usize::MAX,
@@ -489,8 +386,6 @@ fn parse_args() -> Result<Options, String> {
             "--report" => options.report = Some(path_arg(&mut args, "--report")?),
             "--baseline" => options.baseline = Some(path_arg(&mut args, "--baseline")?),
             "--cache" => options.cache = Some(path_arg(&mut args, "--cache")?),
-            "--deps" => options.deps = Some(path_arg(&mut args, "--deps")?),
-            "--changed" => options.changed = Some(path_arg(&mut args, "--changed")?),
             "--limit" => {
                 options.limit = args
                     .next()

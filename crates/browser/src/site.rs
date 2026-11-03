@@ -109,10 +109,10 @@ impl Site {
     /// Whether a parsed tuple origin belongs in a renderer locked to this site.
     #[must_use]
     fn allows_origin(&self, origin: &url::Origin) -> bool {
-        let url::Origin::Tuple(..) = origin else {
+        let Self::Tuple(locked) = self else {
             return false;
         };
-        Url::parse(&origin.ascii_serialization()).is_ok_and(|url| self.allows_url(&url))
+        net::site_for_origin(origin).is_some_and(|site| site == *locked)
     }
 }
 

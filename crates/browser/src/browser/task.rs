@@ -584,11 +584,12 @@ mod tests {
     use super::TabRegistry;
     use crate::actor::TabId;
 
-    /// A name is either present or absent: an empty assignment removes it, so
-    /// a cleared name cannot be found again
+    /// A cleared name is removed, not stored as `""`: the empty lookup would
+    /// otherwise match every cleared tab in the group, and a renderer can ask
+    /// for it (`WindowByName { name: "" }`)
     /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#resetBCName>).
     #[test]
-    fn an_empty_name_removes_the_entry() {
+    fn a_cleared_name_is_not_found_by_the_empty_name() {
         let tabs = TabRegistry::new();
         let opener = TabId::new(1);
         let popup = TabId::new(2);
@@ -599,6 +600,9 @@ mod tests {
         tabs.set_name(popup, String::new());
         assert_eq!(tabs.name(popup), "");
         assert_eq!(tabs.find_by_name(opener, "peer"), None);
+        // The only assertion that tells removal apart from an overwrite with
+        // `""`: with an entry stored, this lookup would return `popup`.
+        assert_eq!(tabs.find_by_name(opener, ""), None);
     }
 
     /// The lookup is scoped to the opener chain: a name one group holds is not
