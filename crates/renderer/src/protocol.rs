@@ -153,6 +153,11 @@ pub enum TabError {
         /// The frame id the caller passed.
         frame: u64,
     },
+    /// The tab's session history holds no entry with the given identity.
+    UnknownHistoryEntry {
+        /// The entry id the caller passed.
+        entry: u64,
+    },
     /// `QuickJS` eval or a host callback failed.
     Script(ScriptFailure),
     /// The renderer is stopped.
@@ -179,6 +184,7 @@ impl fmt::Display for TabError {
         match self {
             Self::InvalidUrl { spec } => write!(f, "invalid url: {spec}"),
             Self::UnknownFrame { frame } => write!(f, "unknown frame: {frame}"),
+            Self::UnknownHistoryEntry { entry } => write!(f, "unknown history entry: {entry}"),
             Self::Script(failure) => write!(f, "script: {failure}"),
             Self::ActorStopped => f.write_str("renderer stopped"),
             Self::RendererUnavailable { message } => {

@@ -15,11 +15,48 @@ use url::Url;
 pub struct EntryId(u64);
 
 impl EntryId {
+    /// An identity from a value a caller already holds, such as a protocol
+    /// adapter's entry id. A value that names no entry answers no target; it
+    /// is never redirected to a neighbour.
+    #[must_use]
+    pub fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+
     /// The wire value protocol adapters put on their surface.
     #[must_use]
     pub fn get(self) -> u64 {
         self.0
     }
+}
+
+/// How a traversal names the entry it activates
+/// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#traverse-the-history>).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HistoryStep {
+    /// A signed distance from the active entry, as `history.go` speaks
+    /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-history-go>).
+    Delta(i32),
+    /// An identity the caller already holds, as a CDP history entry id does
+    /// (<https://chromedevtools.github.io/devtools-protocol/tot/Page/#method-navigateToHistoryEntry>).
+    Entry(EntryId),
+}
+
+/// One session-history entry a traversal selected, with what the tab needs to
+/// activate it.
+///
+/// The step resolves to the entry itself, not to a list position: an entry's
+/// identity survives the list shifting under it, and the two callers speak
+/// different languages (a script speaks a delta, a protocol adapter speaks an
+/// id), so resolving both into an index would make the index the answer.
+pub(crate) struct Target<'a> {
+    /// The entry the step selected.
+    pub(crate) id: EntryId,
+    /// The URL the entry commits.
+    pub(crate) url: &'a Url,
+    /// Whether the active document presents the same document state, which
+    /// makes the step a same-document traversal.
+    pub(crate) same_document: bool,
 }
 
 /// What one commit does to the session history.
@@ -87,18 +124,6 @@ impl HistorySnapshot {
     pub fn current_index(&self) -> usize {
         self.current_index
     }
-
-    /// Total entry count.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    /// Always false: a snapshot carries at least the initial blank entry.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
 }
 
 #[derive(Clone)]
@@ -150,12 +175,25 @@ impl SessionHistory {
     }
 
     /// State the renderer needs for `history.length`, `history.state`, and
-    /// traversal.
+    /// traversal, for the active entry.
     pub(crate) fn renderer_snapshot(&self) -> RendererHistorySnapshot {
+        self.snapshot_of(self.current)
+    }
+
+    /// The same mirror for the entry a same-document traversal is activating.
+    ///
+    /// The renderer's `index` is a list position by definition — it mirrors
+    /// `history.length`/`history.state` — so the position is computed here,
+    /// from the entry the traversal already chose.
+    pub(crate) fn renderer_snapshot_at(&self, entry: EntryId) -> Option<RendererHistorySnapshot> {
+        self.locate(entry).map(|index| self.snapshot_of(index))
+    }
+
+    fn snapshot_of(&self, index: usize) -> RendererHistorySnapshot {
         RendererHistorySnapshot {
             length: self.entries.len(),
-            index: self.current,
-            state: self.entries[self.current].state.clone(),
+            index,
+            state: self.entries[index].state.clone(),
         }
     }
 
@@ -186,11 +224,7 @@ impl SessionHistory {
     pub(crate) fn commit(&mut self, commit: Commit) -> bool {
         match commit {
             Commit::Traverse { entry, url } => {
-                let Some(index) = self
-                    .entries
-                    .iter()
-                    .position(|candidate| candidate.id == entry)
-                else {
+                let Some(index) = self.locate(entry) else {
                     return false;
                 };
                 // Repopulating an entry replaces only *its* document state:
@@ -259,10 +293,8 @@ impl SessionHistory {
 
     /// The target name stored with a session-history entry's document state.
     pub(crate) fn name(&self, entry: EntryId) -> Option<renderer::ContextName> {
-        self.entries
-            .iter()
-            .find(|candidate| candidate.id == entry)
-            .and_then(|candidate| self.names.get(&candidate.document).cloned())
+        self.locate(entry)
+            .and_then(|index| self.names.get(&self.entries[index].document).cloned())
     }
 
     pub(crate) fn update(&mut self, url: Url, state: String, handling: HistoryHandling) {
@@ -308,21 +340,34 @@ impl SessionHistory {
         }
     }
 
-    pub(crate) fn target(&self, delta: i32) -> Option<(usize, EntryId, &Url, Option<&str>, bool)> {
-        let index = self.current.checked_add_signed(delta as isize)?;
-        let entry = self.entries.get(index)?;
-        let same_document = entry.document == self.entries[self.current].document;
-        Some((
-            index,
-            entry.id,
-            &entry.url,
-            entry.state.as_deref(),
-            same_document,
-        ))
+    /// The entry `step` names, or `None` when it names none.
+    pub(crate) fn target(&self, step: HistoryStep) -> Option<Target<'_>> {
+        let index = match step {
+            HistoryStep::Delta(delta) => self.current.checked_add_signed(delta as isize)?,
+            HistoryStep::Entry(entry) => self.locate(entry)?,
+        };
+        let target = self.entries.get(index)?;
+        Some(Target {
+            id: target.id,
+            url: &target.url,
+            same_document: target.document == self.entries[self.current].document,
+        })
     }
 
-    pub(crate) fn traverse_same_document(&mut self, index: usize) {
+    fn locate(&self, entry: EntryId) -> Option<usize> {
+        self.entries
+            .iter()
+            .position(|candidate| candidate.id == entry)
+    }
+
+    /// Makes a same-document traversal target current. `false` when the entry
+    /// is gone, which a caller must not mistake for a completed traversal.
+    pub(crate) fn traverse_same_document(&mut self, entry: EntryId) -> bool {
+        let Some(index) = self.locate(entry) else {
+            return false;
+        };
         self.current = index;
+        true
     }
 
     /// The active entry, for reloads that keep their history position.
@@ -333,7 +378,7 @@ impl SessionHistory {
 
 #[cfg(test)]
 mod tests {
-    use super::{Commit, SessionHistory};
+    use super::{Commit, EntryId, HistoryStep, SessionHistory};
     use url::Url;
 
     fn url(text: &str) -> Url {
@@ -353,9 +398,10 @@ mod tests {
         history.commit(push("https://example.com/a", None));
         history.commit(push("https://example.com/b", None));
 
-        let (index, entry, _, _, same_document) = history.target(-1).expect("back target");
-        assert!(!same_document);
-        history.traverse_same_document(index);
+        let target = history.target(HistoryStep::Delta(-1)).expect("back target");
+        assert!(!target.same_document);
+        let entry = target.id;
+        assert!(history.traverse_same_document(entry));
 
         history.commit(push("https://example.com/c", None));
 
@@ -402,7 +448,10 @@ mod tests {
         let named = |raw: &str| renderer::ContextName::parse(raw);
         let mut history = SessionHistory::new(url("about:blank"), named("start"));
         history.commit(push("https://example.com/a", named("first")));
-        let (_, first, _, _, _) = history.target(0).expect("entry");
+        let first = history
+            .target(HistoryStep::Entry(EntryId(1)))
+            .expect("entry")
+            .id;
         assert_eq!(history.name(first), named("first"));
 
         // The setter writes the active document state.
@@ -459,17 +508,21 @@ mod tests {
         let pushed = history.current_entry();
         history.commit(push("https://example.com/b", None));
 
-        let (_, entry, _, _, same_document) = history.target(-1).expect("back target");
+        let target = history.target(HistoryStep::Delta(-1)).expect("back target");
+        let entry = target.id;
         assert_eq!(entry, pushed);
-        assert!(!same_document);
+        assert!(!target.same_document);
         assert!(history.commit(Commit::Traverse {
             entry,
             url: url("https://example.com/a#hash"),
         }));
 
         // The sibling still presents the pre-traversal document object.
-        let (_, sibling, _, _, same_document) = history.target(-1).expect("sibling target");
-        assert!(!same_document);
+        let sibling = history
+            .target(HistoryStep::Delta(-1))
+            .expect("sibling target");
+        assert!(!sibling.same_document);
+        let sibling = sibling.id;
         assert!(history.commit(Commit::Traverse {
             entry: sibling,
             url: url("https://example.com/a"),

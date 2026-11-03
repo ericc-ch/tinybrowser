@@ -346,6 +346,76 @@ fn page_navigate_from_a_fresh_tab_is_same_site_for_cookies() {
     assert!(head.contains("sec-fetch-site: none"), "{head}");
 }
 
+/// `Page.navigateToHistoryEntry` names an entry by identity and the browser
+/// resolves it, so a client never turns an id into a position and back. An id
+/// the tab no longer holds is an error rather than a traversal to a
+/// neighbour.
+#[test]
+fn navigate_to_history_entry_takes_the_entry_id() {
+    let server = TestServer::start(
+        vec![
+            ("/one", ok("text/html", b"<!doctype html><p>one</p>")),
+            ("/two", ok("text/html", b"<!doctype html><p>two</p>")),
+        ],
+        None,
+    );
+    let origin = format!("http://{}/", server.address());
+    let (_fixture, mut client) = start();
+    let session = load_page(
+        &mut client,
+        &format!("{origin}one"),
+        Duration::from_secs(10),
+    );
+    client
+        .call(
+            "Page.navigate",
+            &json!({"url": format!("{origin}two")}),
+            Some(&session),
+        )
+        .expect("navigate");
+    server.wait("/two");
+    crate::fixture::wait_for_load(&mut client, &session, Duration::from_secs(10));
+
+    let history = client
+        .call("Page.getNavigationHistory", &json!({}), Some(&session))
+        .expect("history");
+    assert_eq!(history["currentIndex"], json!(2));
+    let first = history["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .find(|entry| entry["url"] == json!(format!("{origin}one")))
+        .expect("first entry")["id"]
+        .as_u64()
+        .expect("entry id");
+
+    client
+        .call(
+            "Page.navigateToHistoryEntry",
+            &json!({"entryId": first}),
+            Some(&session),
+        )
+        .expect("traverse to the first entry");
+    // The browser re-fetched the first entry's document and committed it, so
+    // the traversal really loaded that entry rather than answering "done".
+    server.wait_count("/one", 2);
+    let after = client
+        .call("Page.getNavigationHistory", &json!({}), Some(&session))
+        .expect("history after");
+    assert_eq!(after["currentIndex"], json!(1));
+
+    let unknown = client.call(
+        "Page.navigateToHistoryEntry",
+        &json!({"entryId": 9999}),
+        Some(&session),
+    );
+    let error = unknown.expect_err("an unknown entry id is refused");
+    assert!(
+        error.to_string().contains("unknown history entry"),
+        "{error}"
+    );
+}
+
 fn http_get(addr: std::net::SocketAddr, path: &str) -> (u16, String) {
     let mut stream = TcpStream::connect(addr).expect("http connect");
     let request = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");

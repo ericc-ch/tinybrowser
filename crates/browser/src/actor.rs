@@ -11,9 +11,8 @@ use std::time::Duration;
 
 use crate::wire::{Command as RendererCommand, Reply};
 use renderer::{
-    BrowserEvent, DialFailure, FrameId, HistorySnapshot as RendererHistorySnapshot,
-    MAX_RESPONSE_BODY_BYTES, Mount, RemoteValue, ResourceLimit, ResponseHead, ScriptSource,
-    TabError,
+    BrowserEvent, DialFailure, FrameId, MAX_RESPONSE_BODY_BYTES, Mount, RemoteValue, ResourceLimit,
+    ResponseHead, ScriptSource, TabError,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
@@ -23,7 +22,7 @@ use url::Url;
 use crate::assignment::{Assignment, RendererWake};
 use crate::browser::{TabNames, TabRegistry};
 use crate::exchange::{self, RequestId, ServerInput};
-use crate::history::{Commit, HistorySnapshot, SessionHistory};
+use crate::history::{Commit, EntryId, HistorySnapshot, HistoryStep, SessionHistory};
 use crate::manager::RendererProcessManager;
 use crate::network::{NavOutcome, TabNetworkHandle, dial_failure};
 use crate::site::Site;
@@ -165,7 +164,7 @@ enum Command {
         reply: ReplySender<HistorySnapshot>,
     },
     TraverseHistory {
-        delta: i32,
+        step: HistoryStep,
         reply: ReplySender<()>,
     },
     LastNavigationFailed {
@@ -531,14 +530,35 @@ impl TabHandle {
         self.ask(|reply| Command::History { reply }).await
     }
 
-    /// Traverses `delta` entries through the tab's session history.
+    /// Traverses `delta` entries through the tab's session history, as a
+    /// script's `history.go` speaks.
     ///
     /// # Errors
     ///
     /// [`TabError::ActorStopped`].
     pub async fn traverse_history(&self, delta: i32) -> Result<(), TabError> {
-        self.ask(|reply| Command::TraverseHistory { delta, reply })
-            .await
+        self.ask(|reply| Command::TraverseHistory {
+            step: HistoryStep::Delta(delta),
+            reply,
+        })
+        .await
+    }
+
+    /// Activates one session-history entry by identity.
+    ///
+    /// The browser resolves the identity against the history it owns, so a
+    /// caller that read an entry id never has to turn it into a position.
+    ///
+    /// # Errors
+    ///
+    /// [`TabError::ActorStopped`], or [`TabError::UnknownHistoryEntry`] when
+    /// the tab no longer holds that entry.
+    pub async fn traverse_to_entry(&self, entry: EntryId) -> Result<(), TabError> {
+        self.ask(|reply| Command::TraverseHistory {
+            step: HistoryStep::Entry(entry),
+            reply,
+        })
+        .await
     }
 
     /// Subscribes to tab events emitted after this call.
@@ -1443,7 +1463,7 @@ impl Tab {
                 }
             }
             BrowserEvent::HistoryTraversal { delta } => {
-                self.traverse_history(*delta).await;
+                let _result = self.traverse(HistoryStep::Delta(*delta)).await;
             }
         }
     }
@@ -1476,47 +1496,57 @@ impl Tab {
         self.history.sync_current_name(name.as_ref());
     }
 
-    async fn traverse_history(&mut self, delta: i32) {
+    async fn traverse(&mut self, step: HistoryStep) -> Result<(), TabError> {
         // A script may rename the tab and traverse in the same turn, so the
         // entry being left takes the value before the traversal reads any.
         self.sync_outgoing_name();
         // `go(0)` reloads the current entry without touching history
         // (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-history-go>).
-        if delta == 0 {
+        if step == HistoryStep::Delta(0) {
             let url = self.document_url.to_string();
             if self.goto(&url, None).is_ok() {
                 self.traversal = Some(self.history.current_entry());
             }
-            return;
+            return Ok(());
         }
-        let Some((index, entry, url, state, same_document)) = self.history.target(delta) else {
-            return;
+        let Some(target) = self.history.target(step) else {
+            // A distance past either end of the list is a step that goes
+            // nowhere. An identity that names no entry is the caller's
+            // mistake, and answering "done" would hide it.
+            return match step {
+                HistoryStep::Entry(entry) => {
+                    Err(TabError::UnknownHistoryEntry { entry: entry.get() })
+                }
+                HistoryStep::Delta(_) => Ok(()),
+            };
         };
-        let url = url.to_string();
-        let state = state.map(str::to_owned);
+        let entry = target.id;
+        let url = target.url.to_string();
+        let same_document = target.same_document;
         if same_document {
+            let Some(history) = self.history.renderer_snapshot_at(entry) else {
+                return Ok(());
+            };
             let result = self
                 .renderer_request(RendererCommand::HistoryTraverse {
                     url: url.clone(),
-                    history: RendererHistorySnapshot {
-                        state,
-                        index,
-                        length: self.history.renderer_snapshot().length,
-                    },
+                    history,
                 })
                 .await;
-            if matches!(result, Ok(Reply::Unit(Ok(())))) {
-                self.history.traverse_same_document(index);
+            if matches!(result, Ok(Reply::Unit(Ok(()))))
+                && self.history.traverse_same_document(entry)
+            {
                 if let Ok(url) = Url::parse(&url) {
                     self.document_url = url;
                 }
                 self.record_event(TabEvent::SameDocumentNavigation).await;
             }
-            return;
+            return Ok(());
         }
         if self.goto(&url, None).is_ok() {
             self.traversal = Some(entry);
         }
+        Ok(())
     }
 
     async fn record_event(&self, event: TabEvent) {
@@ -1820,9 +1850,9 @@ impl Command {
             Command::History { reply } => {
                 let _result = reply.send(Ok(tab.history.snapshot()));
             }
-            Command::TraverseHistory { delta, reply } => {
-                tab.traverse_history(delta).await;
-                let _result = reply.send(Ok(()));
+            Command::TraverseHistory { step, reply } => {
+                let result = tab.traverse(step).await;
+                let _result = reply.send(result);
             }
             Command::LastNavigationFailed { reply } => {
                 let _result = reply.send(Ok(tab.navigation_failed));

@@ -51,8 +51,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// typed browsing-context names (non-empty, never a keyword) and merged the
 /// name lookup and navigation into one call. Version 21 separates a
 /// `window.name` assignment, which writes the active history entry, from the
-/// cross-origin reset.
-pub const PROTOCOL_VERSION: u8 = 21;
+/// cross-origin reset. Version 22 adds the error for a history entry a
+/// traversal names but the tab no longer holds.
+pub const PROTOCOL_VERSION: u8 = 22;
 
 /// Fixed frame header size in bytes.
 pub const HEADER_BYTES: usize = 16;

@@ -1024,10 +1024,10 @@ impl Conn {
         json!({"executionContextId": context_id})
     }
 
-    /// `Page.navigateToHistoryEntry`: traversal by the entry's signed distance
-    /// from the active index, so Playwright's `goBack`/`goForward` use the
-    /// tab's real session history.
-    /// <https://chromedevtools.github.io/devtools-protocol/tot/Page/#method-navigateToHistoryEntry>
+    /// `Page.navigateToHistoryEntry`: activates the named entry. The entry id
+    /// is the browser's own identity, so it travels to the browser unchanged;
+    /// the browser decides whether it still holds that entry
+    /// (<https://chromedevtools.github.io/devtools-protocol/tot/Page/#method-navigateToHistoryEntry>).
     async fn navigate_to_history_entry(
         &mut self,
         params: &Value,
@@ -1037,20 +1037,7 @@ impl Conn {
             .get("entryId")
             .and_then(Value::as_u64)
             .ok_or_else(|| DispatchError::Failed("missing entryId".into()))?;
-        let history = tab
-            .history()
-            .await
-            .map_err(|error| DispatchError::Failed(error.to_string()))?;
-        let target = history
-            .entries()
-            .iter()
-            .position(|entry| entry.id().get() == entry_id)
-            .ok_or_else(|| DispatchError::Failed("unknown history entry".into()))?;
-        let delta = i64::try_from(target).unwrap_or(i64::MAX)
-            - i64::try_from(history.current_index()).unwrap_or(0);
-        let delta = i32::try_from(delta)
-            .map_err(|_| DispatchError::Failed("history entry is out of range".into()))?;
-        tab.traverse_history(delta)
+        tab.traverse_to_entry(browser::EntryId::new(entry_id))
             .await
             .map_err(|error| DispatchError::Failed(error.to_string()))?;
         Ok(json!({}))
