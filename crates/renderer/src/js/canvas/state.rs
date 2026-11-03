@@ -9,6 +9,8 @@ use std::collections::HashMap;
 use std::f32::consts::FRAC_PI_4;
 use std::sync::Arc;
 
+use num_traits::ToPrimitive as _;
+
 /// Shadows larger than this are skipped rather than allocating unbounded
 /// temporary bitmaps from hostile coordinates.
 const MAX_SHADOW_SIDE: u32 = 4096;
@@ -2565,9 +2567,10 @@ impl Canvas2D {
         Some(png)
     }
 
-    /// Encodes the bitmap as JPEG. `quality` is in `0..=1`; the caller applies
-    /// the spec's default when it is missing or invalid.
-    pub(crate) fn to_jpeg(&self, quality: f32) -> Option<Vec<u8>> {
+    /// Encodes the bitmap as JPEG. `quality` is already the encoder's range
+    /// (`JpegQuality::new`); the caller applies the spec's default when it is
+    /// missing or invalid.
+    pub(crate) fn to_jpeg(&self, quality: JpegQuality) -> Option<Vec<u8>> {
         let pixels = self.read_pixels(0, 0, self.width, self.height)?;
         // JPEG has no alpha channel: composite the straight source over opaque
         // black, the spec's rule for formats without one
@@ -2613,7 +2616,7 @@ impl Canvas2D {
     }
 
     /// A black JPEG for a canvas that never had a context.
-    pub(crate) fn blank_jpeg(width: u32, height: u32, quality: f32) -> Option<Vec<u8>> {
+    pub(crate) fn blank_jpeg(width: u32, height: u32, quality: JpegQuality) -> Option<Vec<u8>> {
         let pixels = crate::js::world::canvas_bytes(width, height)?;
         let pixels = pixels / 4 * 3;
         encode_jpeg(
@@ -3710,18 +3713,18 @@ fn box_blur_vertical(data: &mut [u8], width: usize, height: usize, radius: usize
     data.copy_from_slice(&out);
 }
 
-/// Encodes one JPEG image. `quality` is in `0..=1`; the spec default is
-/// applied before this point (`canvas_quality`).
+/// Encodes one JPEG image. `quality` is already in the encoder's `1..=100`
+/// range.
 fn encode_jpeg(
     pixels: &[u8],
     width: u32,
     height: u32,
     color: image::ExtendedColorType,
-    quality: f32,
+    quality: JpegQuality,
 ) -> Option<Vec<u8>> {
     let mut jpeg = Vec::new();
     image::ImageEncoder::write_image(
-        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, jpeg_quality(quality)),
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, quality.0),
         pixels,
         width,
         height,
@@ -3731,16 +3734,23 @@ fn encode_jpeg(
     Some(jpeg)
 }
 
-/// The JPEG encoder's `1..=100` quality for a canvas quality that is already
-/// in `0..=1` (`canvas_quality`)
+/// The JPEG encoder's `1..=100` quality for a canvas `0..=1` quality
 /// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-canvas-todataurl>).
-#[expect(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "quality is clamped to 0..=1 and scaled to 1..=100"
-)]
-fn jpeg_quality(quality: f32) -> u8 {
-    (quality * 100.0).round().clamp(1.0, 100.0) as u8
+///
+/// Constructing the type is the only place the float range becomes the
+/// encoder's integer range, so no caller can hand the encoder an out-of-range
+/// value and no float-to-integer cast needs a lint suppression.
+#[derive(Clone, Copy)]
+pub(crate) struct JpegQuality(u8);
+
+impl JpegQuality {
+    /// `quality` is a finite canvas quality in `0..=1`.
+    pub(crate) fn new(quality: f64) -> Self {
+        // The clamp makes the value exact for `to_u8`: 1..=100 rounds to an
+        // integer in that range.
+        let scaled = (quality * 100.0).round().clamp(1.0, 100.0);
+        Self(scaled.to_u8().unwrap_or(100))
+    }
 }
 
 #[cfg(test)]
@@ -3934,7 +3944,7 @@ mod tests {
     fn blank_encoders_emit_their_containers() {
         let png = Canvas2D::blank_png(2, 2).expect("blank PNG");
         assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
-        let jpeg = Canvas2D::blank_jpeg(2, 2, 0.92).expect("blank JPEG");
+        let jpeg = Canvas2D::blank_jpeg(2, 2, JpegQuality::new(0.92)).expect("blank JPEG");
         assert_eq!(&jpeg[..2], &[0xff, 0xd8]);
     }
 
@@ -3943,7 +3953,7 @@ mod tests {
         let mut canvas = Canvas2D::new(2, 2);
         canvas.set_fill_style(StyleValue::Color([255, 0, 0, 128]));
         canvas.fill_rect(0.0, 0.0, 2.0, 2.0);
-        let jpeg = canvas.to_jpeg(0.92).expect("JPEG");
+        let jpeg = canvas.to_jpeg(JpegQuality::new(0.92)).expect("JPEG");
         let decoded = image::load_from_memory_with_format(&jpeg, image::ImageFormat::Jpeg)
             .expect("decode the encoded JPEG")
             .to_rgb8();

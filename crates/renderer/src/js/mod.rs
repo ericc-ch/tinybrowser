@@ -1038,6 +1038,7 @@ impl JsRealm {
             bindings::install_messaging(&ctx)?;
             reactions::install(&ctx)?;
             bridge::evaluate(&ctx, install_web_apis_js(&ctx)?)?;
+            crate::js::canvas::install_serialization(&ctx)?;
             reactions::capture(&ctx)?;
             let constructor: Object = ctx.globals().get("PopStateEvent")?;
             let prototype: Object = constructor.get("prototype")?;

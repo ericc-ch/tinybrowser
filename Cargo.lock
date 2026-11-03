@@ -2743,6 +2743,7 @@ dependencies = [
  "kurbo",
  "markup5ever",
  "net",
+ "num-traits",
  "parley",
  "percent-encoding",
  "png",

@@ -8,12 +8,15 @@
 //! Spec: <https://html.spec.whatwg.org/multipage/canvas.html#2dcontext>
 
 mod path2d;
+mod serialization;
 mod state;
 mod text;
 
-pub(crate) use state::{Canvas2D, ColorMatrix, Gradient, Pattern, Rect, SourceImage, StyleValue};
+pub(crate) use serialization::install as install_serialization;
+pub(crate) use state::{
+    Canvas2D, ColorMatrix, Gradient, JpegQuality, Pattern, Rect, SourceImage, StyleValue,
+};
 
-use base64::Engine as _;
 use rquickjs::atom::PredefinedAtom;
 use rquickjs::function::This;
 use rquickjs::object::{Accessor, Property};
@@ -115,137 +118,6 @@ fn canvas_host_node<'js>(ctx: &Ctx<'js>, source: &Value<'js>) -> Result<Option<N
     Ok((owner.owns_node(id) && is_canvas).then_some(id))
 }
 
-#[derive(Clone, Copy)]
-enum CanvasImageFormat {
-    Png,
-    Jpeg,
-}
-
-impl CanvasImageFormat {
-    fn mime(self) -> &'static str {
-        match self {
-            Self::Png => "image/png",
-            Self::Jpeg => "image/jpeg",
-        }
-    }
-}
-
-/// The `type` argument of `toDataURL`/`toBlob`/`convertToBlob`, converted with
-/// `ToString` once and compared ASCII case-insensitively. An unsupported type
-/// falls back to PNG
-/// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-canvas-todataurl>).
-fn canvas_format<'js>(ctx: &Ctx<'js>, mime: Option<&Value<'js>>) -> Result<CanvasImageFormat> {
-    let Some(mime) = mime.filter(|mime| !mime.is_undefined()) else {
-        return Ok(CanvasImageFormat::Png);
-    };
-    let mime = DomString::from_js(ctx, mime.clone())?;
-    Ok(if mime.0.eq_ignore_ascii_case("image/jpeg") {
-        CanvasImageFormat::Jpeg
-    } else {
-        CanvasImageFormat::Png
-    })
-}
-
-/// JPEG `quality` is in `0..=1`; anything else uses the 0.92 default
-/// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-canvas-todataurl>).
-fn canvas_quality<'js>(ctx: &Ctx<'js>, quality: Option<&Value<'js>>) -> Result<f32> {
-    let Some(quality) = quality else {
-        return Ok(0.92);
-    };
-    if quality.is_undefined() || quality.is_null() {
-        return Ok(0.92);
-    }
-    let quality = Coerced::<f64>::from_js(ctx, quality.clone())?.0;
-    if quality.is_finite() && (0.0..=1.0).contains(&quality) {
-        Ok(f32_of(quality))
-    } else {
-        Ok(0.92)
-    }
-}
-
-/// Encodes a canvas bitmap. `None` is the spec's "encoding failed" branch: a
-/// zero-sized canvas, or an encoder that could not produce bytes, serializes
-/// as `data:,` or a null Blob
-/// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-canvas-todataurl>).
-fn canvas_image<'js>(
-    ctx: &Ctx<'js>,
-    source: &Value<'js>,
-    format: CanvasImageFormat,
-    quality: f32,
-) -> Result<Option<Vec<u8>>> {
-    let Some(id) = canvas_host_node(ctx, source)? else {
-        return Ok(None);
-    };
-    let width = canvas_dimension(ctx, id, "width", 300);
-    let height = canvas_dimension(ctx, id, "height", 150);
-    if width == 0 || height == 0 {
-        return Ok(None);
-    }
-    let world = world(ctx)?;
-    let registry = world.borrow().registry();
-    let registry = registry.borrow();
-    if registry.canvas_has_open_layer(id) {
-        return Err(crate::js::bindings::throw_dom(
-            ctx,
-            "InvalidStateError",
-            "a layer is open",
-        ));
-    }
-    let origin_clean = registry.canvas_origin_clean(id);
-    if origin_clean == Some(false) {
-        return Err(crate::js::bindings::throw_dom(
-            ctx,
-            "SecurityError",
-            "the canvas is not origin-clean",
-        ));
-    }
-    let bytes = match (format, origin_clean) {
-        (CanvasImageFormat::Png, Some(_)) => registry.canvas_png(id),
-        (CanvasImageFormat::Jpeg, Some(_)) => registry.canvas_jpeg(id, quality),
-        (CanvasImageFormat::Png, None) => Canvas2D::blank_png(width, height),
-        (CanvasImageFormat::Jpeg, None) => Canvas2D::blank_jpeg(width, height, quality),
-    };
-    Ok(bytes)
-}
-
-fn canvas_to_data_url<'js>(
-    ctx: Ctx<'js>,
-    source: Value<'js>,
-    mime: Opt<Value<'js>>,
-    quality: Opt<Value<'js>>,
-) -> Result<String> {
-    let format = canvas_format(&ctx, mime.0.as_ref())?;
-    let quality = canvas_quality(&ctx, quality.0.as_ref())?;
-    let Some(bytes) = canvas_image(&ctx, &source, format, quality)? else {
-        return Ok("data:,".to_owned());
-    };
-    Ok(format!(
-        "data:{};base64,{}",
-        format.mime(),
-        base64::engine::general_purpose::STANDARD.encode(bytes)
-    ))
-}
-
-/// Encodes a canvas for `toBlob`/`convertToBlob` as `{ bytes, type }`; `null`
-/// is the spec's "encoding failed" branch. The type is the encoding the
-/// renderer settled on, so the page never re-derives it.
-fn canvas_to_blob_bytes<'js>(
-    ctx: Ctx<'js>,
-    source: Value<'js>,
-    mime: Opt<Value<'js>>,
-    quality: Opt<Value<'js>>,
-) -> Result<Option<Object<'js>>> {
-    let format = canvas_format(&ctx, mime.0.as_ref())?;
-    let quality = canvas_quality(&ctx, quality.0.as_ref())?;
-    let Some(bytes) = canvas_image(&ctx, &source, format, quality)? else {
-        return Ok(None);
-    };
-    let blob = Object::new(ctx.clone())?;
-    blob.set("bytes", TypedArray::new(ctx, bytes)?)?;
-    blob.set("type", format.mime())?;
-    Ok(Some(blob))
-}
-
 /// `OffscreenCanvas.transferToImageBitmap()`: snapshot the bitmap, clear the
 /// canvas to transparent black, and wrap the pixels in an `ImageBitmap`
 /// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-offscreencanvas-transfertoimagebitmap>).
@@ -295,10 +167,6 @@ fn canvas_transfer_to_image_bitmap<'js>(ctx: Ctx<'js>, source: Value<'js>) -> Re
 
 /// Builds the `CanvasRenderingContext2D` constructor and its prototype.
 pub(crate) fn install(ctx: &Ctx<'_>) -> Result<()> {
-    ctx.globals()
-        .set("__tbCanvasToDataURL", Func::from(canvas_to_data_url))?;
-    ctx.globals()
-        .set("__tbCanvasToBlobBytes", Func::from(canvas_to_blob_bytes))?;
     ctx.globals().set(
         "__tbCanvasTransferToImageBitmap",
         Func::from(canvas_transfer_to_image_bitmap),

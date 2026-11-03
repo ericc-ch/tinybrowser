@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use blitz_traits::node_id::NodeId as BlitzNodeId;
 use net::ReferrerPolicy;
-use rquickjs::{Object, Persistent, Value, class::Trace, function::Function};
+use rquickjs::{Constructor, Object, Persistent, Value, class::Trace, function::Function};
 use url::Url;
 
 use crate::documents::DocumentStore;
@@ -276,7 +276,11 @@ impl RealmRegistry {
         self.canvases.get(&id)?.to_png()
     }
 
-    pub(crate) fn canvas_jpeg(&self, id: NodeId, quality: f32) -> Option<Vec<u8>> {
+    pub(crate) fn canvas_jpeg(
+        &self,
+        id: NodeId,
+        quality: crate::js::canvas::JpegQuality,
+    ) -> Option<Vec<u8>> {
         self.canvases.get(&id)?.to_jpeg(quality)
     }
 
@@ -1100,6 +1104,17 @@ pub(crate) struct World {
     /// raises the realm's own exception: a page that swaps `EvalError` must
     /// neither run code inside the bindings nor substitute another value.
     pub(crate) pristine_eval_error: Option<Persistent<Function<'static>>>,
+    /// The pristine `Blob` constructor, captured after the web bundle. Canvas
+    /// serialization builds its Blob here so a page that replaces `Blob`
+    /// cannot reroute `toBlob`/`convertToBlob`.
+    pub(crate) pristine_blob: Option<Persistent<Constructor<'static>>>,
+    /// The pristine `setTimeout`, captured with the web bundle. `toBlob` queues
+    /// its callback through this value instead of a page-replaceable global.
+    pub(crate) pristine_set_timeout: Option<Persistent<Function<'static>>>,
+    /// The pristine `OffscreenCanvas` detached/has-context probes, so
+    /// `convertToBlob` keeps its early checks after the method moves to Rust.
+    pub(crate) pristine_offscreen_detached: Option<Persistent<Function<'static>>>,
+    pub(crate) pristine_offscreen_has_context: Option<Persistent<Function<'static>>>,
     /// The realm's own event-interface constructors, captured after the web
     /// bundle installs them and before page script runs. `createEvent` uses
     /// these, never `globals[interface]`: a page that replaces the global
@@ -1414,6 +1429,10 @@ impl World {
             pristine_reflect_set: None,
             pristine_queue_microtask: None,
             pristine_eval_error: None,
+            pristine_blob: None,
+            pristine_set_timeout: None,
+            pristine_offscreen_detached: None,
+            pristine_offscreen_has_context: None,
             event_ctors: HashMap::new(),
             weak_references: None,
             deliver_mutations_fn: None,
@@ -2684,6 +2703,10 @@ impl World {
         self.pristine_reflect_set = None;
         self.pristine_queue_microtask = None;
         self.pristine_eval_error = None;
+        self.pristine_blob = None;
+        self.pristine_set_timeout = None;
+        self.pristine_offscreen_detached = None;
+        self.pristine_offscreen_has_context = None;
         self.event_ctors.clear();
         self.weak_references = None;
         self.deliver_mutations_fn = None;

@@ -138,16 +138,25 @@ pub(crate) fn main_document(ctx: &Ctx<'_>) -> Result<NodeId> {
         .ok_or_else(|| Exception::throw_type(ctx, "no document"))
 }
 
+/// Builds a `DOMException` value from Rust with a real prototype, so
+/// `instanceof DOMException` and `constructor` checks pass. Promise rejections
+/// hand this value to the reject function; a thrown one goes through
+/// [`throw_dom`].
+pub(crate) fn dom_exception_value<'js>(
+    ctx: &Ctx<'js>,
+    name: &str,
+    message: &str,
+) -> rquickjs::Result<Value<'js>> {
+    let name = rquickjs::String::from_str(ctx.clone(), name)?;
+    let message = rquickjs::String::from_str(ctx.clone(), message)?;
+    Ok(host::instance(ctx, JsDomException { name, message })?.into_value())
+}
+
 /// Builds and throws a `DOMException` from Rust with a real prototype, so
 /// `instanceof DOMException` and `constructor` checks pass.
 pub(crate) fn throw_dom(ctx: &Ctx<'_>, name: &str, message: &str) -> rquickjs::Error {
-    let exception = (|| {
-        let name = rquickjs::String::from_str(ctx.clone(), name)?;
-        let message = rquickjs::String::from_str(ctx.clone(), message)?;
-        host::instance(ctx, JsDomException { name, message })
-    })();
-    match exception {
-        Ok(exception) => ctx.throw(Class::into_value(exception)),
+    match dom_exception_value(ctx, name, message) {
+        Ok(exception) => ctx.throw(exception),
         Err(err) => err,
     }
 }
@@ -1923,6 +1932,83 @@ mod realm_tests {
             outcome,
             "true,true,true,true,true,true,true,true,true,true,true,true,true"
         );
+    }
+
+    #[test]
+    fn canvas_serialization_converts_options_in_rust() {
+        let services: Arc<dyn BrowserServices> = Arc::new(NullServices);
+        let shared = SharedJsRuntime::default();
+        let stop = Arc::new(Stop::new());
+        let documents = Rc::new(RefCell::new(crate::documents::DocumentStore::default()));
+        let registry = Rc::new(RefCell::new(crate::js::RealmRegistry::default()));
+        let world = world_with_document(
+            &shared,
+            &services,
+            &documents,
+            &registry,
+            "https://a.test/",
+            "<!doctype html><canvas id=c width=4 height=4></canvas>",
+        );
+        let realm = JsRealm::new(&shared.handle(), world, stop).expect("realm");
+        realm
+            .eval(
+                r"
+                var canvas = document.getElementById('c');
+                canvas.getContext('2d').fillRect(0, 0, 4, 4);
+
+                // `any` quality: no WebIDL conversion, so `valueOf` never runs.
+                var valueOfRan = false;
+                canvas.toDataURL('image/jpeg', { valueOf() { valueOfRan = true; return 0.5; } });
+
+                // `convertToBlob` reads and converts the dictionary members in
+                // lexicographic order, once each.
+                var off = new OffscreenCanvas(4, 4);
+                off.getContext('2d').fillRect(0, 0, 4, 4);
+                var order = [];
+                var qualityConversions = 0;
+                var typeConversions = 0;
+                var options = {};
+                Object.defineProperty(options, 'quality', {
+                  get() { order.push('quality'); return { valueOf() { qualityConversions++; return 0.5; } }; },
+                });
+                Object.defineProperty(options, 'type', {
+                  get() { order.push('type'); return { toString() { typeConversions++; return 'image/png'; } }; },
+                });
+                var first = off.convertToBlob(options);
+                globalThis.__order = order.join(',');
+                globalThis.__conversions = qualityConversions + ',' + typeConversions;
+                globalThis.__valueOfRan = valueOfRan;
+                globalThis.__first = first;
+
+                // The Blob and the task come from captured values, not from the
+                // page-replaceable globals.
+                globalThis.Blob = function () { throw new Error('page Blob'); };
+                globalThis.setTimeout = function () { throw new Error('page setTimeout'); };
+                canvas.toBlob(function () {}, 'image/png');
+                off.convertToBlob({ type: 'image/png' }).then(function (blob) {
+                  globalThis.__blob = { size: blob.size, tag: Object.prototype.toString.call(blob) };
+                }, function (error) {
+                  globalThis.__blob = { error: String(error) };
+                });
+                'ok'
+                ",
+            )
+            .expect("canvas serialization");
+        let outcome = realm
+            .eval(
+                r"
+                [
+                  __valueOfRan,
+                  __order,
+                  __conversions,
+                  __first instanceof Promise,
+                  __blob && __blob.size > 0,
+                  __blob && __blob.tag,
+                ].join('|')
+                ",
+            )
+            .expect("canvas serialization result");
+        assert_eq!(outcome, "false|quality,type|1,1|true|true|[object Blob]");
     }
 
     #[test]

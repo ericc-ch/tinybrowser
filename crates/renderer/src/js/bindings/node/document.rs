@@ -2048,8 +2048,7 @@ pub(crate) fn prepare_classic_script(ctx: &Ctx<'_>, id: NodeId) -> Result<()> {
             if !Rc::ptr_eq(&caller, &owner) {
                 let owner_context = owner.borrow().realm_context.clone();
                 if let Some(owner_context) = owner_context {
-                    return owner_context
-                        .with(|owner_ctx| prepare_classic_script(&owner_ctx, id));
+                    return owner_context.with(|owner_ctx| prepare_classic_script(&owner_ctx, id));
                 }
                 owner.borrow_mut().queue_deferred_script(id);
                 return Ok(());

@@ -142,48 +142,6 @@
       }
       return globalThis.__tbCanvasTransferToImageBitmap(state.canvas);
     }
-
-    convertToBlob(options) {
-      const state = stateOf(this);
-      if (state.detached) {
-        return Promise.reject(
-          new DOMException('the OffscreenCanvas is detached', 'InvalidStateError'),
-        );
-      }
-      if (!state.context) {
-        return Promise.reject(
-          new DOMException('the OffscreenCanvas has no 2D context', 'IndexSizeError'),
-        );
-      }
-      if (state.canvas.width === 0 || state.canvas.height === 0) {
-        return Promise.reject(
-          new DOMException('the OffscreenCanvas has a zero-sized bitmap', 'IndexSizeError'),
-        );
-      }
-      if (
-        options !== undefined &&
-        options !== null &&
-        typeof options !== 'object' &&
-        typeof options !== 'function'
-      ) {
-        return Promise.reject(new TypeError('options must be an object'));
-      }
-      try {
-        const blob = globalThis.__tbCanvasToBlobBytes(
-          state.canvas,
-          options ? options.type : undefined,
-          options ? options.quality : undefined,
-        );
-        if (blob === null) {
-          return Promise.reject(
-            new DOMException('the OffscreenCanvas could not be serialized', 'IndexSizeError'),
-          );
-        }
-        return Promise.resolve(new Blob([blob.bytes], { type: blob.type }));
-      } catch (error) {
-        return Promise.reject(error);
-      }
-    }
   }
 
   Object.defineProperty(OffscreenCanvas.prototype, Symbol.toStringTag, {
