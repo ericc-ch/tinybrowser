@@ -114,6 +114,13 @@
     value: element => { userEdited.add(element); },
     writable: false, configurable: false, enumerable: false,
   });
+  // A script assignment, a reset, or an input-type change ends a user edit, so
+  // `maxlength`/`minlength` stop applying
+  // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#suffering-from-being-too-long>).
+  Object.defineProperty(host, '__tbClearUserEdited', {
+    value: element => { userEdited.delete(element); },
+    writable: false, configurable: false, enumerable: false,
+  });
 
   const VALUE_MODE_TYPES = new Set([
     'text', 'search', 'tel', 'url', 'email', 'password', 'date', 'month',
@@ -980,7 +987,7 @@
   // before it crosses the JS boundary; the form data set conversion and the
   // attribute setters both apply the same replacement
   // (<https://infra.spec.whatwg.org/#javascript-string-convert>).
-  const wellFormedSetter = (prototype, property, nullToEmpty = false) => {
+  const wellFormedSetter = (prototype, property, nullToEmpty = false, clearUserEdit = false) => {
     if (!prototype) return;
     const descriptor = Object.getOwnPropertyDescriptor(prototype, property);
     if (descriptor === undefined || descriptor.set === undefined) return;
@@ -989,16 +996,21 @@
       set(value) {
         const text = nullToEmpty && value === null ? '' : String(value);
         descriptor.set.call(this, toWellFormed(text));
+        // A script assignment is not a user edit, so `maxlength`/`minlength`
+        // stop applying (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#suffering-from-being-too-long>).
+        if (clearUserEdit && typeof host.__tbClearUserEdited === 'function') {
+          host.__tbClearUserEdited(this);
+        }
       },
       enumerable: descriptor.enumerable,
       configurable: true,
     });
   };
   wellFormedSetter(globalThis.HTMLInputElement && globalThis.HTMLInputElement.prototype, 'name');
-  wellFormedSetter(globalThis.HTMLInputElement && globalThis.HTMLInputElement.prototype, 'value', true);
+  wellFormedSetter(globalThis.HTMLInputElement && globalThis.HTMLInputElement.prototype, 'value', true, true);
   wellFormedSetter(globalThis.HTMLSelectElement && globalThis.HTMLSelectElement.prototype, 'name');
-  wellFormedSetter(globalThis.HTMLSelectElement && globalThis.HTMLSelectElement.prototype, 'value', true);
-  wellFormedSetter(globalThis.HTMLTextAreaElement && globalThis.HTMLTextAreaElement.prototype, 'value', true);
+  wellFormedSetter(globalThis.HTMLSelectElement && globalThis.HTMLSelectElement.prototype, 'value', true, true);
+  wellFormedSetter(globalThis.HTMLTextAreaElement && globalThis.HTMLTextAreaElement.prototype, 'value', true, true);
   wellFormedSetter(globalThis.HTMLOptionElement && globalThis.HTMLOptionElement.prototype, 'value');
   // The tentative `switch` attribute on a checkbox is a reflected boolean;
   // the stable IDL has no member for it yet
@@ -1833,6 +1845,13 @@
       if (!state.valueMode) state.defaultValue = output.textContent;
       state.valueMode = false;
       output.textContent = state.defaultValue;
+    }
+    // The reset algorithm restores each control's default value and clears the
+    // dirty flags; the per-control JS edit state must follow
+    // (<https://html.spec.whatwg.org/multipage/input.html#the-input-element>).
+    for (const control of form.elements) {
+      userEdited.delete(control);
+      if (typeof host.__tbClearInputState === 'function') host.__tbClearInputState(control);
     }
   };
   Object.defineProperty(host, '__tbResetForm', {

@@ -206,6 +206,10 @@
       internalCaret.delete(this);
       numberBuffer.delete(this);
       badInputs.delete(this);
+      // A script assignment is not a user edit, so `maxlength`/`minlength`
+      // must stop treating the control as user-edited
+      // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#suffering-from-being-too-long>).
+      if (typeof host.__tbClearUserEdited === 'function') host.__tbClearUserEdited(this);
       // `[LegacyNullToEmptyString]` maps null to the empty string before the
       // DOMString conversion (<https://webidl.spec.whatwg.org/#LegacyNullToEmptyString>).
       inputValue.set.call(this, value === null ? '' : value);
@@ -213,6 +217,37 @@
     enumerable: inputValue.enumerable,
     configurable: true,
   });
+
+  // Clear the per-control edit state that only this shim owns. The reset and
+  // type-change paths call it, so state from a previous value or input type
+  // cannot leak into the next one
+  // (<https://html.spec.whatwg.org/multipage/input.html#the-input-element>).
+  Object.defineProperty(host, '__tbClearInputState', {
+    value: element => {
+      internalCaret.delete(element);
+      numberBuffer.delete(element);
+      badInputs.delete(element);
+    },
+    writable: false, enumerable: false, configurable: false,
+  });
+
+  // A type change runs the value-mode transition: the edit buffer, caret, and
+  // bad-input flag belong to the previous input type.
+  const inputType = Object.getOwnPropertyDescriptor(globalThis.HTMLInputElement.prototype, 'type');
+  if (inputType !== undefined && inputType.set !== undefined) {
+    Object.defineProperty(globalThis.HTMLInputElement.prototype, 'type', {
+      get: inputType.get,
+      set(value) {
+        inputType.set.call(this, value);
+        internalCaret.delete(this);
+        numberBuffer.delete(this);
+        badInputs.delete(this);
+        if (typeof host.__tbClearUserEdited === 'function') host.__tbClearUserEdited(this);
+      },
+      enumerable: inputType.enumerable,
+      configurable: true,
+    });
+  }
   const fireInput = (element, inputType, data) => {
     fire(element, new InputEvent('input', {
       bubbles: true, composed: true, inputType: inputType, data: data,
