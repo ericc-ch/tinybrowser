@@ -1,0 +1,78 @@
+# The gate every change must pass: formatting, clippy at `-D warnings`, the
+# embedded JavaScript syntax check, the realm-free layer check, the
+# parsed-type guards, rustdoc, the Python stack, and the workspace tests.
+#
+# Runs on every push and pull request so a rule can only regress in a red run.
+# The WPT suite is the scheduled workflow; this one never runs the browser
+# against the web platform.
+#
+# `tools/check` uses `nix develop` when Nix is present and the directly
+# installed toolchain otherwise, so the same script runs on a runner and in a
+# contributor shell. The toolchain comes from `rust-toolchain.toml` (nightly
+# for `[unstable] build-std`), plus `rust-src` for that and `clippy`/`rustfmt`
+# for the gate.
+name: Check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: check-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: "0"
+  # Mirrors the flake devShell; the vendored OpenSSL needs perl and minutes.
+  OPENSSL_NO_VENDOR: "1"
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      - name: System libraries
+        run: >
+          sudo apt-get update -qq &&
+          sudo apt-get install -y -qq --no-install-recommends
+          libfontconfig1-dev libssl-dev pkg-config
+      - name: Toolchain
+        run: |
+          rustup toolchain install --profile minimal \
+            --component rust-src --component clippy --component rustfmt
+          cargo --version
+      - name: Submodules (build inputs and the Python check, shallow)
+        run: |
+          git submodule update --init --depth 1 --jobs 4 \
+            third_party/blitz third_party/rquickjs third_party/html5ever \
+            third_party/wpt
+          git -C third_party/rquickjs submodule update --init --depth 1 sys/quickjs
+      - uses: astral-sh/setup-uv@v10.3.0
+      - name: Cargo cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+      - name: sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+        with:
+          version: "v0.18.0"
+      - name: Workspace gate
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
+        run: tools/check clippy
+      - name: Tests
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
+        run: cargo test --workspace

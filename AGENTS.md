@@ -11,7 +11,7 @@ Maximize web spec conformance per byte.
 - Handwritten `unsafe` is prohibited unless runtime safety is proven (`// SAFETY:` invariant, Miri/valgrind checks via `tools/check`) and no safe alternative is as simple, clear, or fast.
 - Let upstream bugs fail honestly. Never build tinybrowser workarounds for upstream engine bugs; record gaps in `docs/upstream.md`.
 - Keep feedback loop fast. Cargo tests cover tinybrowser internals only (`cargo test --workspace`); never test web-platform spec conformance in cargo tests. Run the smallest slice that answers the question (single files or directories, never full suites). Never run long or whole-suite test runs without explicit approval.
-- A WPT timeout is a failure. The harness budget (`tools/wpt/tinybrowser_wpt.py`) is the speed standard, so a test that cannot finish inside it is too slow and is a work item. Profile and fix the slow path; never raise a budget to hide one.
+- A WPT timeout is a failure. The harness budget (`tools/wpt/timeouts.py`) is the speed standard, so a test that cannot finish inside it is too slow and is a work item. Profile and fix the slow path; never raise a budget to hide one.
 - Commit messages should also record decisions.
 - Throwaway experiments belong in `/tmp/`.
 
@@ -47,8 +47,30 @@ Maximize web spec conformance per byte.
 - Delete stale config when its reason expires. Workarounds are removed with the reason recorded in the commit, not left to rot.
 - Forks are for correctness, not micro-wins. A fork change needs a spec or crash reason recorded in `docs/upstream.md`; compile or size tricks stay upstream.
 
+## Types and boundaries
+
+- The browser is the trust boundary. It decides from state it owns; a
+  renderer message is a claim to check, never an answer.
+- Parse once into a type. Never stringify a typed value to parse it again, and
+  a type with a parser deserializes through that parser at the wire.
+- Design types so invalid states cannot exist: `Option<ContextName>` is the
+  only "no name", never `""`.
+- No `_ =>` on a closed enum. A missing answer is an error, not a default.
+- A change that makes "one X" deletes every other X in the same change, fork
+  included, and adds a guard to `tools/check` when a grep can see it.
+- Prefer the upstream crate or spec table over a hand copy; when a copy stays,
+  record the reason in `docs/upstream.md`.
+- A test names the mutation that makes it fail, and the commit says it was
+  checked.
+
 ## Pointers
 
+- **Concept owners**: Read `docs/owners.md` before adding a parser, table, or
+  second copy of a concept; it names the one module each belongs to.
+- **The gate**: `tools/check clippy` runs on every push
+  (`.github/workflows/check.yml`) and is what a local change must pass.
+  `tools/check` uses `nix develop` when available and the installed toolchain
+  otherwise, so the same script runs in CI.
 - **Web API bindings & IDL**: Read `docs/bindings.md` for JS/Rust ownership, WebIDL contracts, and platform objects.
 - **Engine behavior**: Read `docs/engines.md` to search and fetch Chromium/Firefox sources without cloning.
 - **Engine forks & submodules**: Read `third_party/README.md` for submodule maintenance, fork branches, and update workflows.

@@ -1,0 +1,24 @@
+# Concept owners
+
+Where each domain concept is parsed, validated, and decided. A second copy is a
+bug: the fix deletes it and adds a guard to `tools/check` when a grep can see
+it (#239).
+
+| Concept | Owner | Other layers take |
+| --- | --- | --- |
+| Browsing-context names | `renderer::protocol::ContextName` | `Option<ContextName>`; `""` is not a name |
+| Target names and keywords | `renderer::protocol::TargetName` | the type; never a `_self`/`_blank` spelling |
+| Serialized origins | `renderer::protocol::SerializedOrigin` | `Origin`/`Site` after parsing |
+| Origin to URL | `net::origin_url` (`crates/net/src/lib.rs`) | the `Url`, not a string |
+| Site for an origin | `net::site_for_origin`, `cookies::site_for_origin` | the site string |
+| Referrer policy | `net::referrer` | the enum |
+| Header grammar and request methods | `net::protocol`, `net::cors` | `http`/`net` types |
+| Sandbox flags | `renderer::protocol::SandboxFlags` | the bit set |
+| Enumerated attributes | `enumerated!` (`crates/enumerated`) | generated `parse`/`Deserialize` |
+| Secure context | `net::secure_context` | the computed bit |
+| Wall/monotonic time | `net::Clock`/`ClockSource` | an injected clock |
+| Fetch policy and cache | `crates/browser/src/network.rs` with `crates/net` | the transport only feeds bytes (#233) |
+| WPT timeout policy | `tools/wpt/timeouts.py` | flags from `cli.py` |
+| WPT test selection | `tools/wpt-harness/src/suite.rs` (manifest) | — |
+| WPT response metadata | `tools/wpt-harness/src/{services,wrapper,template}.rs` | — |
+| WPT report shape | `tools/wpt-report` | — |
