@@ -60,6 +60,21 @@ The BMP decode feature is not a fork change: which formats an engine carries is 
 
 ### rquickjs (third_party/rquickjs, master)
 
+- Nested realms under a live `Ctx`. `Context::full` and `Context::with` took
+  the runtime's `RefCell`/`Mutex` unconditionally, so an embedder that already
+  held the lock (the normal case inside `outer.with(...)`) could not create or
+  enter a second realm: the single-threaded path aborted on a double borrow
+  and the parallel path deadlocked. `Runtime` now carries the raw
+  `JSRuntime` pointer, and the single-threaded path tries the lock first and
+  falls back to `JS_NewContext`/`Ctx::new` through the raw pointer when the
+  current thread already owns it. QuickJS allows creating a context while
+  another is running, and the live guard keeps the runtime exclusive; the
+  parallel runtime keeps blocking on the lock because it has no reentrant
+  owner. A unit test creates, enters, and drops a nested realm under a live
+  one and reuses the outer realm afterwards. This lets the renderer run an
+  inline script inserted into another document's live realm synchronously
+  instead of deferring every cross-realm insertion to the next drain.
+
 Exotic hooks for WebIDL legacy platform objects (dcd8edd, 9bcc543, 42688aa, 31e1683, 62d9c1a, 09be401, f99e205, 52744cf, cfc6c77, de4b9d9). The shared QuickJS class installed get/has/set callbacks for every exotic object, hiding prototypes and swallowing ordinary assignment. Now each Rust type registers only its derived hooks with explicit fallthrough to the ordinary path, so OwnPropertyKeys ordering, IsDataDescriptor, and receiver/holder distinction match WebIDL. Each engine-side fix has a binding proof that was red before it.
 
 - d73fbda safe realm-aware native callbacks with copyable dispatch state. Callbacks keep argument counts, receive new.target, and run in their creation realm; Copy/Send/Sync-only state fits GC (no Rust destructors mid-collection).

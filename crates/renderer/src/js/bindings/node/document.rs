@@ -2038,14 +2038,19 @@ pub(crate) fn prepare_classic_script(ctx: &Ctx<'_>, id: NodeId) -> Result<()> {
     world(ctx)?.borrow_mut().clear_parser_inserted(id);
     let (source, base_line) = match kind {
         Kind::Inline(source, line) => {
-            // An inline script inserted into another document's realm cannot
-            // run here: that document's realm does not exist yet, because a
-            // `QuickJS` realm cannot be created while this script runs (the
-            // common case is a script appended to a `window.open()` document).
-            // Keep it for the document's own realm to run.
+            // The script runs in its own document's realm, not the caller's.
+            // Enter that realm now when it exists; the nested-context fork
+            // permits it while the caller's script is still on the stack. Only
+            // a document with no realm at all (a `window.open()` document the
+            // engine has not installed yet) defers to its own drain.
             let caller = world(ctx)?;
             let owner = world_for_node(ctx, id)?;
             if !Rc::ptr_eq(&caller, &owner) {
+                let owner_context = owner.borrow().realm_context.clone();
+                if let Some(owner_context) = owner_context {
+                    return owner_context
+                        .with(|owner_ctx| prepare_classic_script(&owner_ctx, id));
+                }
                 owner.borrow_mut().queue_deferred_script(id);
                 return Ok(());
             }

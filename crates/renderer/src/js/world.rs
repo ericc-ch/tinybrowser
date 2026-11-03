@@ -1002,6 +1002,11 @@ pub(crate) struct World {
     frame_host: Option<FrameHost>,
     /// The active document of the frame this realm belongs to.
     document: Option<u32>,
+    /// The realm's own context, kept so a script inserted from another realm
+    /// can run in this document's realm while the caller's script is still on
+    /// the stack. Cleared when the realm is torn down, so it never keeps an
+    /// old realm alive.
+    pub(crate) realm_context: Option<rquickjs::Context>,
     /// Document ids this realm created. Its logs feed every realm's
     /// observers through the union drain.
     owned: HashSet<u32>,
@@ -1375,6 +1380,7 @@ impl World {
             deferred_scripts: Vec::new(),
             frame_host: None,
             document: None,
+            realm_context: None,
             owned: HashSet::new(),
             origin: document_url.origin(),
             top_level: None,

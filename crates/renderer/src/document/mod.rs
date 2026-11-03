@@ -634,10 +634,6 @@ pub(crate) struct Document {
     /// Whether init scripts were deferred because the realm was created while
     /// a navigation response was still streaming.
     init_scripts_deferred: bool,
-    /// Skip `QuickJS` realm creation while installing a document. Nested
-    /// iframe insertion runs inside an active realm, and `QuickJS` forbids
-    /// entering another one until that script returns.
-    defer_js: bool,
     /// The current parse's markup and delay, or `None` when no parse is active.
     active_parse: Option<ActiveParse>,
     /// Whether `document.open` or `document.close` ran and the engine still
@@ -891,7 +887,6 @@ impl Document {
             js_timers: HashMap::new(),
             load_delay: LoadDelay::default(),
             init_scripts_deferred: false,
-            defer_js: false,
             active_parse: None,
             stream_publish: None,
             executed_scripts: HashSet::new(),
@@ -1449,12 +1444,14 @@ impl Document {
         self.load_html(markup);
     }
 
-    /// Installs the initial `about:blank` tree without creating a realm
+    /// Installs the initial `about:blank` tree for a newly inserted `iframe`
+    /// or `window.open()` document
     /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#process-the-iframe-attributes>).
     ///
-    /// Used when a parent script inserts an `iframe`: the document must exist
-    /// for `contentDocument` in the same task, but `QuickJS` cannot enter a new
-    /// realm until that script returns.
+    /// The tree exists before the caller returns so `contentDocument` is
+    /// available in the same task. A realm is created here when the document
+    /// needs one: the fork permits a nested realm under a live `Ctx`, so a
+    /// script that opens a window gets a live document synchronously.
     pub(crate) fn load_about_blank_tree(
         &mut self,
         inherited_url: Option<&Url>,
@@ -1464,9 +1461,7 @@ impl Document {
         // The initial blank reports its creator's URL as its referrer
         // (<https://html.spec.whatwg.org/multipage/browsers.html#creating-a-new-browsing-context>).
         self.world.borrow_mut().document_referrer = inherited_url.cloned();
-        self.defer_js = true;
         self.load_html("");
-        self.defer_js = false;
         self.initial_blank = true;
     }
 
@@ -2333,6 +2328,8 @@ impl Document {
         self.timers.retain(|_, timer| timer.js_id.is_none());
         self.js_timers.clear();
         self.js = None;
+        // The realm is gone; do not keep its context alive through the world.
+        self.world.borrow_mut().realm_context = None;
         self.init_scripts_deferred = false;
         self.active_parse = None;
         self.stream_publish = None;
@@ -2443,7 +2440,7 @@ impl Document {
     /// whether a realm owns it afterwards.
     fn install_parsed(&mut self, parsed: Parsed) -> bool {
         if self.js.is_none() {
-            let skip_js = self.defer_js || self.skip_nested_html_realm(&parsed);
+            let skip_js = self.skip_nested_html_realm(&parsed);
             let document = self.world.borrow_mut().replace_document(parsed);
             self.register_document(document);
             // Style resolution and scripts both read the viewport; apply the

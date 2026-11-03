@@ -406,6 +406,9 @@ impl JsRealm {
             turn_deadline,
         };
         host.install()?;
+        // Publish the context so a cross-realm script insertion can enter this
+        // realm synchronously instead of deferring to the next drain.
+        host.world.borrow_mut().realm_context = Some(host.context.clone());
         Ok(host)
     }
 
