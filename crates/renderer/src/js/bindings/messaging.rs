@@ -429,7 +429,9 @@ fn set_frame_name(ctx: Ctx<'_>, frame: f64, name: String) -> Result<()> {
     // runs: a host that answered by re-entering this realm would panic on a
     // second borrow. An unchanged name is not worth the round trip.
     if changed && frame == FrameId::MAIN {
-        services.set_window_name(crate::protocol::ContextName::parse(&name).as_ref());
+        services.set_window_name(crate::protocol::NameChange::Assigned(
+            crate::protocol::ContextName::parse(&name),
+        ));
     }
     Ok(())
 }

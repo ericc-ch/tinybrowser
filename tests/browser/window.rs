@@ -485,6 +485,276 @@ fn a_popups_name_follows_the_opener_it_was_opened_with() {
     }
 }
 
+/// A tab's target name belongs to the session-history entry it was committed
+/// with: crossing an origin clears the live name, traversing back restores the
+/// earlier entry's name, and traversing forward restores the cleared one
+/// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#resetBCName>,
+/// "the target name is set to the target name of the session history entry").
+///
+/// The tab is a `noopener` popup so it is neither auxiliary nor attached to an
+/// opener: that is what makes the cross-origin commit clear the name.
+#[test]
+fn a_target_name_is_restored_by_history_traversal() {
+    // `sessionStorage` is per origin and survives a traversal, so it marks
+    // the phase: the first load moves forward, the back load moves forward
+    // again, and each origin reports once per visit.
+    let second = TestServer::start(
+        vec![(
+            "/second",
+            ok(
+                "text/html",
+                b"<!doctype html><script>\
+                  fetch('/seen?where=second&name=' + encodeURIComponent(window.name)).then(function () {\
+                    if (!sessionStorage.getItem('visited')) {\
+                      sessionStorage.setItem('visited', '1');\
+                      history.back();\
+                    }\
+                  });\
+                  </script>",
+            ),
+        )],
+        None,
+    );
+    let second_port = second.address().port();
+    let first_page = format!(
+        "<!doctype html><script>\
+         if (!sessionStorage.getItem('named')) {{\
+           sessionStorage.setItem('named', '1');\
+           window.name = 'peer';\
+         }}\
+         fetch('/seen?where=first&name=' + encodeURIComponent(window.name)).then(function () {{\
+           if (!sessionStorage.getItem('visited')) {{\
+             sessionStorage.setItem('visited', '1');\
+             location.href = 'http://localhost:{second_port}/second';\
+           }} else if (!sessionStorage.getItem('forwarded')) {{\
+             sessionStorage.setItem('forwarded', '1');\
+             history.forward();\
+           }}\
+         }});\
+         </script>"
+    );
+    let first = TestServer::start(
+        vec![("/first", ok("text/html", first_page.as_bytes()))],
+        None,
+    );
+    let first_port = first.address().port();
+    let (listener, address) = server();
+    let page = format!(
+        "<!doctype html><script>\
+         window.open('http://localhost:{first_port}/first', '_blank', 'noopener');\
+         </script>"
+    );
+    TestServer::serve_on(listener, vec![("/start", ok("text/html", page.as_bytes()))]);
+    let (_fixture, _client, _session) = open_page(
+        "tinybrowser-history-name",
+        &format!("http://127.0.0.1:{}/start", address.port()),
+    );
+    // The name the first entry was committed with, then the second origin's
+    // commit, which clears it because the popup has no live opener.
+    first.wait_count("/seen?where=first&name=peer", 1);
+    second.wait("/seen?where=second&name=");
+    // Back traverses to the first entry: its name is restored from history,
+    // not from the cleared live context.
+    first.wait_count("/seen?where=first&name=peer", 2);
+    // Forward traverses to the second entry, which stored the cleared name.
+    second.wait_count("/seen?where=second&name=", 2);
+}
+
+/// The entry a document leaves keeps the name that document had, even when the
+/// next document renames the tab before the browser handles the commit event.
+///
+/// A renderer-driven commit is reported to the browser after the new
+/// document's scripts have run, so the live name is already the new one by
+/// then; the commit event carries the outgoing name for exactly this reason
+/// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#resetBCName>).
+#[test]
+fn the_next_documents_name_does_not_overwrite_the_entry_behind_it() {
+    let second = TestServer::start(
+        vec![(
+            "/second",
+            ok(
+                "text/html",
+                b"<!doctype html><script>\
+                  window.name = 'second';\
+                  fetch('/seen?where=second&name=' + encodeURIComponent(window.name)).then(function () {\
+                    history.back();\
+                  });\
+                  </script>",
+            ),
+        )],
+        None,
+    );
+    let second_port = second.address().port();
+    let first_page = format!(
+        "<!doctype html><script>\
+         if (!sessionStorage.getItem('named')) {{\
+           sessionStorage.setItem('named', '1');\
+           window.name = 'first';\
+         }}\
+         fetch('/seen?where=first&name=' + encodeURIComponent(window.name)).then(function () {{\
+           if (!sessionStorage.getItem('left')) {{\
+             sessionStorage.setItem('left', '1');\
+             location.href = 'http://localhost:{second_port}/second';\
+           }}\
+         }});\
+         </script>"
+    );
+    let first = TestServer::start(
+        vec![("/first", ok("text/html", first_page.as_bytes()))],
+        None,
+    );
+    let first_port = first.address().port();
+    let (listener, address) = server();
+    let page = format!(
+        "<!doctype html><script>\
+         window.open('http://localhost:{first_port}/first', '_blank', 'noopener');\
+         </script>"
+    );
+    TestServer::serve_on(listener, vec![("/start", ok("text/html", page.as_bytes()))]);
+    let (_fixture, _client, _session) = open_page(
+        "tinybrowser-history-name",
+        &format!("http://127.0.0.1:{}/start", address.port()),
+    );
+    first.wait_count("/seen?where=first&name=first", 1);
+    second.wait("/seen?where=second&name=second");
+    // Back on the first entry, the restored name is the one its own document
+    // set at commit, not the one the second document set afterwards.
+    first.wait_count("/seen?where=first&name=first", 2);
+}
+
+/// A name belongs to the entry its document committed with, so a
+/// browser-driven navigation records it before leaving, and a same-document
+/// push presents the same document state's name
+/// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#resetBCName>).
+#[test]
+fn a_browser_navigation_keeps_the_entrys_name() {
+    let second = TestServer::start(
+        vec![(
+            "/second",
+            ok(
+                "text/html",
+                b"<!doctype html><script>fetch('/seen?where=second');</script>",
+            ),
+        )],
+        None,
+    );
+    let second_port = second.address().port();
+    let first_page = "<!doctype html><script>\
+        if (!sessionStorage.getItem('named')) {\
+          sessionStorage.setItem('named', '1');\
+          window.name = 'kept';\
+          history.pushState({}, '', '/first#kept');\
+        }\
+        fetch('/seen?where=first&name=' + encodeURIComponent(window.name));\
+        </script>";
+    let first = TestServer::start(
+        vec![("/first", ok("text/html", first_page.as_bytes()))],
+        None,
+    );
+    let first_port = first.address().port();
+    let (_fixture, mut client, session) = open_page(
+        "tinybrowser-history-name",
+        &format!("http://localhost:{first_port}/first"),
+    );
+    first.wait("/seen?where=first&name=kept");
+    // The browser drives this commit and the pushed entry shares the document
+    // state, so both need the assignment recorded before the new entry exists.
+    client
+        .call(
+            "Page.navigate",
+            &json!({"url": format!("http://localhost:{second_port}/second")}),
+            Some(&session),
+        )
+        .expect("navigate");
+    second.wait("/seen?where=second");
+    evaluate(&mut client, &session, "history.back()");
+    first.wait_count("/seen?where=first&name=kept", 2);
+}
+
+/// A traversal restores the browsing context's target name as well as the
+/// document's copy, so another tab in the group finds the context under the
+/// restored name and no longer under the one the next document set.
+///
+/// The renderer's own frame tree would answer a lookup from inside the tab, so
+/// the check comes from the opener, which has to ask the browser
+/// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#resetBCName>).
+#[test]
+fn a_traversal_restores_the_name_the_group_opens() {
+    let pages = TestServer::start(
+        vec![
+            (
+                "/one",
+                ok(
+                    "text/html",
+                    b"<!doctype html><script>\
+                      fetch('/ready?where=one');\
+                      if (sessionStorage.getItem('came-back')) {\
+                        fetch('/ready?where=back');\
+                      } else {\
+                        sessionStorage.setItem('came-back', '1');\
+                        location.href = '/two';\
+                      }\
+                      </script>",
+                ),
+            ),
+            (
+                "/two",
+                ok(
+                    "text/html",
+                    b"<!doctype html><script>\
+                      window.name = 'other';\
+                      fetch('/ready?where=two').then(function () { history.back(); });\
+                      </script>",
+                ),
+            ),
+            ("/check", ok("text/html", b"<!doctype html>check")),
+        ],
+        None,
+    );
+    let port = pages.address().port();
+    let (listener, address) = server();
+    let page = format!(
+        "<!doctype html><script>\
+         window.__first = window.open('http://localhost:{port}/one', 'peer');\
+         </script>"
+    );
+    TestServer::serve_on(listener, vec![("/start", ok("text/html", page.as_bytes()))]);
+    let (_fixture, mut client, session) = open_page(
+        "tinybrowser-window-name",
+        &format!("http://127.0.0.1:{}/start", address.port()),
+    );
+    pages.wait("/ready?where=one");
+    pages.wait("/ready?where=two");
+    pages.wait("/ready?where=back");
+    // The tab is back on the entry that was committed with `peer`, so the
+    // opener's lookup by that name selects it.
+    assert_eq!(
+        evaluate(
+            &mut client,
+            &session,
+            &format!(
+                "window.__peer = window.open('http://localhost:{port}/check', 'peer');\
+                 window.__peer === window.__first"
+            ),
+        ),
+        json!(true),
+        "the traversal did not restore the browsing context's name"
+    );
+    pages.wait("/check");
+    // The name the second document set is gone with the entry that owned it,
+    // so the same lookup now creates a context instead of selecting this one.
+    assert_eq!(
+        evaluate(
+            &mut client,
+            &session,
+            "window.__stale = window.open('', 'other');\
+             window.__stale === window.__first",
+        ),
+        json!(false),
+        "the replaced name still selects the traversed tab"
+    );
+}
+
 /// A sandboxed document's popup keeps the inherited flag set in the browser
 /// tab it becomes: an opaque origin, no storage, and no top-level navigation
 /// after the popup commits a document of its own

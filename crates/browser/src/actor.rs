@@ -21,9 +21,9 @@ use tokio::time::{Instant, sleep_until, timeout};
 use url::Url;
 
 use crate::assignment::{Assignment, RendererWake};
-use crate::browser::TabRegistry;
+use crate::browser::{TabNames, TabRegistry};
 use crate::exchange::{self, RequestId, ServerInput};
-use crate::history::{HistorySnapshot, SessionHistory};
+use crate::history::{Commit, HistorySnapshot, SessionHistory};
 use crate::manager::RendererProcessManager;
 use crate::network::{NavOutcome, TabNetworkHandle, dial_failure};
 use crate::site::Site;
@@ -204,6 +204,14 @@ enum TabOutcome {
     Retained,
     /// The operation stopped the renderer; the loop returns.
     Shutdown,
+}
+
+/// What one browser-driven commit replaced in the tab's name registry.
+struct CommitNames {
+    /// The pair the commit replaced; `None` when its tab had closed.
+    previous: Option<TabNames>,
+    /// The pair the commit installed, which a failed mount may put back.
+    installed: TabNames,
 }
 
 /// One pending `RunUntilLoadTimeout` or `RunUntilJsTrue` wait.
@@ -610,6 +618,19 @@ impl TabTask {
         }
     }
 
+    /// A task with no coordinator behind it, for unit tests that only need a
+    /// live tab id.
+    #[cfg(test)]
+    pub(crate) fn fixture(id: TabId) -> Self {
+        let (client, _server) = exchange::local(1);
+        let (deliveries, _receiver) = mpsc::channel(1);
+        Self {
+            handle: TabHandle { id, client },
+            deliveries,
+            join: None,
+        }
+    }
+
     /// The tab's `postMessage` mailbox.
     pub(crate) fn deliveries(&self) -> mpsc::Sender<RemoteWindowMessage> {
         self.deliveries.clone()
@@ -770,8 +791,9 @@ impl Tab {
         tab: NewTab,
     ) -> Self {
         let (dial_tx, dial_rx) = mpsc::unbounded_channel();
+        let initial_name = tabs.name(id);
         let pending_mount = blank_mount(renderer::TabState {
-            name: tabs.name(id),
+            name: initial_name.clone(),
             auxiliary_with_opener: tabs.opener(id).is_some(),
             popup_sandbox: tab.popup_sandbox,
         });
@@ -790,7 +812,7 @@ impl Tab {
             viewport: renderer::DEFAULT_VIEWPORT,
             init_scripts: Vec::new(),
             next_init_script: 1,
-            history: SessionHistory::new(net::about_blank()),
+            history: SessionHistory::new(net::about_blank(), initial_name),
             traversal: None,
             document_loaded: false,
             navigation_failed: false,
@@ -1089,12 +1111,15 @@ impl Tab {
             return false;
         };
         let site = Site::for_url(&url).unwrap_or_else(|| Site::opaque(self.id));
+        self.sync_outgoing_name();
+        let state = self.commit_state(&url);
+        let commit = self.history_commit(&url, &state);
         let mut history = self.history.clone();
-        if !history.navigate(url.clone(), self.traversal.take()) {
+        if !history.commit(commit) {
             self.navigation_failed = true;
             return false;
         }
-        let (tab, previous_name) = self.begin_commit(&url);
+        let previous_names = self.begin_commit(&state);
         let mount = Mount {
             head: ResponseHead {
                 history: history.renderer_snapshot(),
@@ -1102,11 +1127,11 @@ impl Tab {
                 init_scripts: self.init_scripts.clone(),
                 ..ResponseHead::local(url.clone(), Some(content_type), None)
             },
-            tab,
+            tab: state,
             body,
         };
         if let Err(error) = self.mount(&site, mount).await {
-            self.abort_commit(previous_name);
+            self.abort_commit(previous_names);
             logging::error!(
                 target: "browser::tab",
                 "data navigation mount failed for {}: {error}",
@@ -1191,8 +1216,26 @@ impl Tab {
         self.document_url = url;
     }
 
-    /// Applies the target-name reset a browser-driven commit at `url` performs
-    /// and returns the browsing-context state its mount carries plus the name
+    /// The browsing-context state a commit of `url` installs.
+    ///
+    /// A traversal restores the target name stored with the history entry;
+    /// every other commit takes the tab's live name through the target-name
+    /// reset. "A navigable's target name is its active session history entry's
+    /// document state's navigable target name", so the entry, not the live
+    /// context, is what a traversal installs
+    /// (<https://html.spec.whatwg.org/multipage/document-sequences.html#navigable>,
+    /// <https://html.spec.whatwg.org/multipage/browsing-the-web.html#resetBCName>).
+    fn commit_state(&self, url: &Url) -> renderer::TabState {
+        match self.traversal {
+            Some(entry) => renderer::TabState {
+                name: self.history.name(entry),
+                ..self.current_tab_state()
+            },
+            None => self.tab_state_at(url),
+        }
+    }
+
+    /// Applies a commit's browsing-context state and returns the names
     /// [`Self::abort_commit`] restores if the mount fails.
     ///
     /// The registry is written *before* the mount runs the new document's
@@ -1200,17 +1243,20 @@ impl Tab {
     /// this value and wins; resolving it after the mount would clobber the
     /// script's name
     /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#resetBCName>).
-    fn begin_commit(&mut self, url: &Url) -> (renderer::TabState, Option<renderer::ContextName>) {
-        let previous = self.tabs.name(self.id);
-        let state = self.tab_state_at(url);
-        self.tabs.set_name(self.id, state.name.clone());
-        (state, previous)
+    fn begin_commit(&mut self, state: &renderer::TabState) -> CommitNames {
+        let installed = TabNames::from_name(state.name.as_ref());
+        let previous = self.tabs.install_commit(self.id, state.name.as_ref());
+        CommitNames {
+            previous,
+            installed,
+        }
     }
 
     /// Undoes [`Self::begin_commit`] when the navigation did not commit and the
     /// previous document is still active.
-    fn abort_commit(&mut self, previous_name: Option<renderer::ContextName>) {
-        self.tabs.set_name(self.id, previous_name);
+    fn abort_commit(&mut self, names: CommitNames) {
+        self.tabs
+            .restore_commit(self.id, names.previous, &names.installed);
     }
 
     fn launch_navigation(&mut self) {
@@ -1288,8 +1334,11 @@ impl Tab {
     async fn commit_navigation(&mut self, outcome: NavOutcome) -> bool {
         let final_url = outcome.head.url.clone();
         let site = Site::for_url(&final_url).unwrap_or_else(|| Site::opaque(self.id));
+        self.sync_outgoing_name();
+        let state = self.commit_state(&final_url);
+        let commit = self.history_commit(&final_url, &state);
         let mut history = self.history.clone();
-        if !history.navigate(final_url.clone(), self.traversal.take()) {
+        if !history.commit(commit) {
             logging::error!(
                 target: "browser::tab",
                 "navigation rejected by history for {}",
@@ -1304,20 +1353,20 @@ impl Tab {
             init_scripts: self.init_scripts.clone(),
             ..outcome.head
         };
-        let (tab, previous_name) = self.begin_commit(&final_url);
+        let previous_names = self.begin_commit(&state);
         if let Err(error) = self
             .mount_stream(
                 &site,
                 Mount {
                     head,
-                    tab,
+                    tab: state,
                     body: Vec::new(),
                 },
                 outcome.body,
             )
             .await
         {
-            self.abort_commit(previous_name);
+            self.abort_commit(previous_names);
             logging::error!(
                 target: "browser::tab",
                 "navigation mount failed for {}: {error}",
@@ -1338,9 +1387,22 @@ impl Tab {
             return;
         }
         match event {
-            BrowserEvent::Navigated { url } => {
+            BrowserEvent::Navigated { url, outgoing_name } => {
                 if let Ok(url) = Url::parse(url) {
-                    self.history.navigate(url.clone(), None);
+                    // This commit was driven by the renderer, which resolved
+                    // the reset itself. The event carries the name the document
+                    // being replaced had, because the new document's scripts
+                    // may already have renamed the tab; the new entry takes the
+                    // live name
+                    // (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#resetBCName>).
+                    self.history.sync_current_name(outgoing_name.as_ref());
+                    let name = self.tabs.name(self.id);
+                    self.history.commit(Commit::Push {
+                        url: url.clone(),
+                        name: name.clone(),
+                    });
+                    self.tabs
+                        .settle_document_name(self.id, outgoing_name.as_ref(), name);
                     self.advance_document_url(url);
                 }
                 self.document_loaded = false;
@@ -1386,7 +1448,38 @@ impl Tab {
         }
     }
 
+    /// The history commit this navigation makes: a traversal re-populates the
+    /// entry it selected, and every other commit pushes a new one.
+    fn history_commit(&mut self, url: &Url, state: &renderer::TabState) -> Commit {
+        match self.traversal.take() {
+            Some(entry) => Commit::Traverse {
+                entry,
+                url: url.clone(),
+            },
+            None => Commit::Push {
+                url: url.clone(),
+                name: state.name.clone(),
+            },
+        }
+    }
+
+    /// Folds the active document state's name into the entry the document is
+    /// about to leave.
+    ///
+    /// `window.name` writes the registry and not the entry, because the entry
+    /// outlives the renderer that reported it. The registry keeps the value
+    /// apart from the live name so a reset that lands before this commit does
+    /// not erase it
+    /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-name>).
+    fn sync_outgoing_name(&mut self) {
+        let name = self.tabs.document_name(self.id);
+        self.history.sync_current_name(name.as_ref());
+    }
+
     async fn traverse_history(&mut self, delta: i32) {
+        // A script may rename the tab and traverse in the same turn, so the
+        // entry being left takes the value before the traversal reads any.
+        self.sync_outgoing_name();
         // `go(0)` reloads the current entry without touching history
         // (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-history-go>).
         if delta == 0 {

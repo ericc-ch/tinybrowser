@@ -996,17 +996,16 @@ async fn route_window_call(
             .open(url, target, opener, source)
             .await?;
         }
-        BrowsingContextCall::WindowName { name } => {
+        BrowsingContextCall::WindowName { change } => {
             // The call names no target, so a renderer can only rename its own
             // tab. The name is the target a `window.open` from any tab in the
             // group may select
             // (<https://html.spec.whatwg.org/multipage/document-sequences.html#the-rules-for-choosing-a-navigable>).
-            // A tab that closed while the call was in flight has already had
-            // its name removed; re-inserting it would make a dead id look live
-            // to the next lookup.
-            if context.tabs.tab(assignment.tab).is_some() {
-                context.tabs.set_name(assignment.tab, name);
-            }
+            // The registry is the one store: the tab actor reads the document
+            // state's name from it when it commits, so this handler never waits
+            // on a coordinator that may be running the script that made the
+            // call. The registry itself skips a tab that closed in flight.
+            context.tabs.rename(assignment.tab, change);
             send_reply(&context.responder, id, ServiceReply::Unit).await?;
         }
         BrowsingContextCall::NavigateNamed {

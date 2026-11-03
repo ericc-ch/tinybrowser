@@ -199,7 +199,7 @@ impl Tab {
 fn to_event(event: RendererEvent) -> Event {
     match event {
         RendererEvent::Browser(event) => match event {
-            BrowserEvent::Navigated { url } => Event::Navigated(url),
+            BrowserEvent::Navigated { url, .. } => Event::Navigated(url),
             BrowserEvent::HistoryUpdated {
                 url,
                 state,
@@ -680,7 +680,7 @@ impl BrowsingContextHost for WasmServices {
         None
     }
 
-    fn set_window_name(&self, _name: Option<&renderer::ContextName>) {}
+    fn set_window_name(&self, _change: renderer::NameChange) {}
 
     fn window_close(&self, _window: renderer::WindowId) {}
 

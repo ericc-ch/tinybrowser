@@ -477,11 +477,9 @@ impl BrowsingContextHost for HostServices {
         }
     }
 
-    fn set_window_name(&self, name: Option<&renderer::ContextName>) {
+    fn set_window_name(&self, change: renderer::NameChange) {
         let _result = self.call(ServiceCall::BrowsingContext(
-            BrowsingContextCall::WindowName {
-                name: name.cloned(),
-            },
+            BrowsingContextCall::WindowName { change },
         ));
     }
 

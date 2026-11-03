@@ -314,6 +314,29 @@ fn subresource_request(
     }
 }
 
+/// The frame factory a realm calls when a page creates a child or auxiliary
+/// document.
+///
+/// The closure only queues the document: `QuickJS` cannot enter a new context
+/// while the script that created the frame still runs, so the carrier
+/// materializes it later from the queue.
+fn frame_host(new_frames: &Rc<RefCell<Vec<CreatedFrame>>>) -> crate::js::world::FrameHost {
+    crate::js::world::FrameHost {
+        child: Rc::new({
+            let new_frames = Rc::clone(new_frames);
+            move |world_rc: &Rc<RefCell<World>>, frame, container| {
+                materialize_iframe_document(world_rc, frame, container, &new_frames);
+            }
+        }),
+        auxiliary: Rc::new({
+            let new_frames = Rc::clone(new_frames);
+            move |world_rc: &Rc<RefCell<World>>, frame, opener: crate::protocol::OpenerPolicy| {
+                materialize_auxiliary_document(world_rc, frame, opener, &new_frames);
+            }
+        }),
+    }
+}
+
 /// Builds and queues the initial `about:blank` document for one connected
 /// `iframe` so `contentDocument` is available in the inserting script
 /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element:html-element-insertion-steps>).
@@ -523,6 +546,16 @@ pub(crate) struct Document {
     /// already resolved
     /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#resetBCName>).
     committed: bool,
+    /// Whether the next commit arrives from the browser with the target name
+    /// already resolved.
+    ///
+    /// A mount carries [`crate::protocol::TabState`], whose name the browser
+    /// computed against the document it is replacing
+    /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#resetBCName>).
+    /// A commit this renderer drives, such as a child frame's response, has no
+    /// browser step and resolves the name here, so the reset still runs. The
+    /// flag is consumed by the commit it describes.
+    name_resolved: bool,
     /// The frame's persistent viewport in device pixels (the scale is fixed
     /// at 1, so device and CSS pixels coincide). CDP emulation and every
     /// document mount use it, so Blitz layout, the painted size, and
@@ -807,24 +840,7 @@ impl Document {
         // host for a child or auxiliary document and never names a document
         // type.
         let new_frames: Rc<RefCell<Vec<CreatedFrame>>> = Rc::new(RefCell::new(Vec::new()));
-        world
-            .borrow_mut()
-            .set_frame_host(crate::js::world::FrameHost {
-                child: Rc::new({
-                    let new_frames = Rc::clone(&new_frames);
-                    move |world_rc: &Rc<RefCell<World>>, frame, container| {
-                        materialize_iframe_document(world_rc, frame, container, &new_frames);
-                    }
-                }),
-                auxiliary: Rc::new({
-                    let new_frames = Rc::clone(&new_frames);
-                    move |world_rc: &Rc<RefCell<World>>,
-                          frame,
-                          opener: crate::protocol::OpenerPolicy| {
-                        materialize_auxiliary_document(world_rc, frame, opener, &new_frames);
-                    }
-                }),
-            });
+        world.borrow_mut().set_frame_host(frame_host(&new_frames));
         // Blitz subresources enqueue here and ride carrier dials: the
         // renderer owns no network runtime of its own.
         let (blitz_tx, blitz_rx) = std::sync::mpsc::channel();
@@ -847,6 +863,7 @@ impl Document {
             style_policies: HashMap::new(),
             frame,
             committed: false,
+            name_resolved: false,
             viewport_size: crate::engine::DEFAULT_VIEWPORT,
             shared: Rc::clone(&runtime.shared),
             url: document_url,
@@ -1552,15 +1569,18 @@ impl Document {
     /// only place that can clear the name before the new document's scripts run
     /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#resetBCName>).
     /// A frame's first document in this renderer is always the former, which
-    /// is what [`Self::committed`] skips.
+    /// is what [`Self::committed`] skips; a later mount reports its resolved
+    /// name through [`Self::install_tab_state`], which is what
+    /// [`Self::name_resolved`] skips.
     fn commit_document_url(&mut self, url: Url, origin: Option<url::Origin>) {
         let new_origin = origin.clone().unwrap_or_else(|| url.origin());
         let frame = self.frame;
         let previous = self.world.borrow().origin.clone();
         let first_document = !self.committed;
+        let resolved_by_browser = std::mem::take(&mut self.name_resolved);
         self.committed = true;
         self.set_document_url(url, origin);
-        if first_document {
+        if first_document || resolved_by_browser {
             return;
         }
         // The reset compares the new document's origin with the *active*
@@ -1580,7 +1600,7 @@ impl Document {
             // reset it did not perform itself. The call is synchronous, so no
             // world borrow may be live while it runs.
             let services = self.world.borrow().runtime.services.clone();
-            services.set_window_name(None);
+            services.set_window_name(crate::protocol::NameChange::Reset);
         }
     }
 
@@ -1884,6 +1904,10 @@ impl Document {
             FrameId::MAIN,
             "a tab's browsing-context state belongs to its top-level document"
         );
+        // The mount carries the name the browser resolved against the document
+        // it is replacing, so the commit that follows must not reset it again
+        // (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#resetBCName>).
+        self.name_resolved = true;
         let frame = self.frame;
         {
             let world = self.world.borrow();
@@ -3479,8 +3503,18 @@ impl Document {
         // Announce the commit before the new document's load, so the
         // browser can re-create the top-level execution contexts
         // (<https://chromedevtools.github.io/devtools-protocol/tot/Page/#event-frameNavigated>).
+        // The name is read before the install below: the reset that install
+        // performs clears the live name, and the new document's scripts may
+        // rename the tab, while the entry the old document owns keeps the
+        // value it had
+        // (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#resetBCName>).
+        let outgoing_name = {
+            let shared = self.shared.borrow();
+            crate::protocol::ContextName::parse(shared.tree.name(self.frame))
+        };
         self.record_event(RendererEvent::Browser(BrowserEvent::Navigated {
             url: url.to_string(),
+            outgoing_name,
         }));
         let crate::protocol::ResponseBody::Bytes(body) = &outcome.body else {
             return;

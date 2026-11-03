@@ -96,7 +96,7 @@ impl BrowsingContextHost for NullServices {
         None
     }
 
-    fn set_window_name(&self, _name: Option<&crate::protocol::ContextName>) {}
+    fn set_window_name(&self, _change: crate::protocol::NameChange) {}
 
     fn window_close(&self, _window: crate::protocol::WindowId) {}
 

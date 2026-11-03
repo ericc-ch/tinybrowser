@@ -49,8 +49,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// calling document's sandbox set part of a navigation source and dropped the
 /// `window.open` flags the browser now derives from its own copy. Version 20
 /// typed browsing-context names (non-empty, never a keyword) and merged the
-/// name lookup and navigation into one call.
-pub const PROTOCOL_VERSION: u8 = 20;
+/// name lookup and navigation into one call. Version 21 separates a
+/// `window.name` assignment, which writes the active history entry, from the
+/// cross-origin reset.
+pub const PROTOCOL_VERSION: u8 = 21;
 
 /// Fixed frame header size in bytes.
 pub const HEADER_BYTES: usize = 16;

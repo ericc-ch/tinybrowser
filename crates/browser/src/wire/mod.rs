@@ -390,11 +390,14 @@ pub enum BrowsingContextCall {
         /// <https://html.spec.whatwg.org/multipage/browsers.html#sandboxing>).
         source: NavigationSource,
     },
-    /// The calling tab's target name changed, or was cleared
+    /// The calling tab's target name changed, or the browsing context's name
+    /// was cleared
     /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-name>).
     WindowName {
-        /// The tab's new name; `None` after a cross-origin reset.
-        name: Option<renderer::ContextName>,
+        /// An assignment from `window.name`, which writes the live name and
+        /// the active document state's name, or the cross-origin reset, which
+        /// clears only the live one.
+        change: renderer::NameChange,
     },
     /// Selects the tab this tab's browsing context group holds under `name`
     /// and navigates it. The browser answers the selected tab, or `None` when

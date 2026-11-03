@@ -437,7 +437,7 @@ impl BrowsingContextHost for FsServices {
 
     /// A target name only matters to a browser that keeps a cross-tab table.
     /// This host has one tab, so the name has nowhere to go.
-    fn set_window_name(&self, _name: Option<&renderer::ContextName>) {}
+    fn set_window_name(&self, _change: renderer::NameChange) {}
 
     fn window_opener(&self) -> Option<WindowId> {
         None

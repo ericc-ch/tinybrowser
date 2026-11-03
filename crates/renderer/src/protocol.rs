@@ -316,6 +316,14 @@ pub enum BrowserEvent {
     Navigated {
         /// The final URL after redirects.
         url: String,
+        /// The target name the document being replaced keeps.
+        ///
+        /// The browser stores it on the session-history entry that document
+        /// owns. It travels with the event because the new document's scripts
+        /// can rename the tab before the browser reads the event, and the entry
+        /// must keep the name its own document state carried
+        /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#resetBCName>).
+        outgoing_name: Option<ContextName>,
     },
     /// A history API update in the active document (no new JS realm).
     HistoryUpdated {
@@ -614,11 +622,14 @@ impl SandboxFlags {
 /// The browsing-context state a mount carries: the target name, the popup
 /// sandboxing flag set, and whether the context keeps its name across origins.
 ///
-/// All three belong to the context rather than to any one document, so they
-/// travel with every mount: a renderer replacement must rebuild them, and a
-/// document commit is when each one can change
+/// The flag set and the opener relationship belong to the context, and the
+/// name is the value this commit settled: the tab's live name after a
+/// navigation, or the name stored with the history entry a traversal
+/// re-populates. All three travel with every mount, because a renderer
+/// replacement must rebuild them
 /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-name>,
-/// <https://html.spec.whatwg.org/multipage/browsers.html#popup-sandboxing-flag-set>).
+/// <https://html.spec.whatwg.org/multipage/browsers.html#popup-sandboxing-flag-set>,
+/// <https://html.spec.whatwg.org/multipage/browsing-the-web.html#resetBCName>).
 /// A carrier with no browser behind it, the WebAssembly component, sends the
 /// default value: no name, no opener, and no sandbox.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1698,6 +1709,23 @@ impl<'de> Deserialize<'de> for ContextName {
     }
 }
 
+/// How a browsing context's target name changed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NameChange {
+    /// `window.name = value` on the active document. The assignment belongs to
+    /// the active document state, so the browser keeps it apart from the live
+    /// browsing-context name and the next commit copies it onto the entry the
+    /// document is leaving
+    /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-name>).
+    Assigned(Option<ContextName>),
+    /// The reset before a cross-origin commit. It clears the live
+    /// browsing-context name only: the document being left keeps the name its
+    /// document state already carries, and the browser resolves the new
+    /// entry's name itself
+    /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#resetBCName>).
+    Reset,
+}
+
 impl TargetName {
     /// Parses a target for the rules for choosing a navigable, where the
     /// empty string selects the current context.
@@ -1839,12 +1867,13 @@ pub trait BrowsingContextHost: Send + Sync + 'static {
         source: &NavigationSource,
     ) -> Option<WindowId>;
 
-    /// Records the target name of this realm's tab after a script set
-    /// `window.name`, or `None` after a commit reset it. The browser keeps it
-    /// because it searches target names across tabs and because the name
-    /// outlives the renderer that reported it
+    /// Records how this realm's tab target name changed: an assignment from
+    /// `window.name`, or the reset a cross-origin commit performs. The browser
+    /// keeps both because the live name is what a `window.open` searches and
+    /// the document state's name is what the next session-history entry
+    /// stores, and because the values outlive the renderer that reported them
     /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-name>).
-    fn set_window_name(&self, name: Option<&ContextName>);
+    fn set_window_name(&self, change: NameChange);
 
     /// `window.close()` on a window this realm opened.
     fn window_close(&self, window: WindowId);

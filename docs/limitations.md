@@ -89,3 +89,30 @@ declaration accessors. Still open: constructable `insertRule` /
 `deleteRule` throw `NotSupportedError`, and a cross-origin `<link>` is
 never origin-clean because the fetch path does not record a CORS
 approval. Conformance for this surface is WPT `css/cssom/`.
+
+## Session history
+
+A session-history entry stores its URL, title, classic state, and the
+document state's navigable target name. It does not store the document
+state's origin, so the traversal rule that clears the target name when a
+re-fetch lands on another origin
+(`https://html.spec.whatwg.org/multipage/browsing-the-web.html#apply-the-history-step`,
+"targetEntry's document's origin is not same origin with oldOrigin") is not
+applied. Until it is, a stored entry that redirects across origins restores
+the old name and another tab in the group can still select it by that name.
+`history.state` is likewise kept instead of cleared. The browser knows the
+origin of an ordinary HTTP commit, so the redirect case is fixable by storing
+an origin per entry; the opaque cases (sandboxed, `data:`, inherited
+`about:blank`) need the renderer's computed origin on the commit.
+
+`window.name` is stored as `ContextName`, which cannot be a keyword, so
+assigning `_self` or `_blank` is recorded as no name and that string does not
+survive a commit or a traversal. The spec keeps any string in the document
+state and treats keywords specially only when a target is resolved.
+
+A popup's renderer records "auxiliary with a live opener" when it mounts, and
+nothing tells it when that opener closes, so a later cross-origin navigation
+it drives itself keeps the target name. The browser's copy of the rule
+(`Tab::keeps_target_name_at`) is checked live, but a renderer-driven commit
+never consults it. The name survives the navigation and the group can still
+select the tab by it until a browser-driven commit clears it.

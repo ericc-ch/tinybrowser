@@ -2,7 +2,7 @@
 
 mod task;
 
-pub(crate) use self::task::TabRegistry;
+pub(crate) use self::task::{TabNames, TabRegistry};
 
 use std::convert::Infallible;
 use std::fmt;

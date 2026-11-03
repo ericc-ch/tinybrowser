@@ -43,7 +43,7 @@ pub use protocol::{
     BodyDelivery, BrowserEvent, BrowserServices, BrowsingContextHost, ContextName, CorsMode,
     CorsRequest, DialCancellation, DialCompletion, DialFailure, DialKind, DialOutcome, DialRequest,
     FrameId, HistoryHandling, HistorySnapshot, HttpHead, MAX_RESPONSE_BODY_BYTES, MessagingHost,
-    Mount, NavigationSource, NetworkHost, OpenerPolicy, PolicyContainer, PostedMessage,
+    Mount, NameChange, NavigationSource, NetworkHost, OpenerPolicy, PolicyContainer, PostedMessage,
     ReferrerRequest, RendererEvent, RequestCache, RequestPolicy, ResourceLimit, ResponseBody,
     ResponseHead, ResponseSource, STORAGE_QUOTA_BYTES, SandboxFlags, ScreenshotClip,
     ScreenshotRequest, ScriptFailure, ScriptSource, SerializedOrigin, StorageChange, StorageError,
