@@ -73,9 +73,19 @@ struct Discovery<'db, 'idl, 'source> {
 
 impl<'ast> Visit<'ast> for Discovery<'_, '_, '_> {
     fn visit_call_expression(&mut self, call: &ast::CallExpression<'ast>) {
-        if matches!(&call.callee, ast::Expression::Identifier(identifier) if identifier.name == "__tbInstallInterface")
-        {
-            let result = self.installation(call);
+        let form = match &call.callee {
+            ast::Expression::Identifier(identifier)
+                if identifier.name == "__tbInstallInterface" =>
+            {
+                Some(InstallForm::Interface)
+            }
+            ast::Expression::Identifier(identifier) if identifier.name == "__tbInstallGlobal" => {
+                Some(InstallForm::Global)
+            }
+            _ => None,
+        };
+        if let Some(form) = form {
+            let result = self.installation(call, form);
             match result {
                 Ok(replacement) => self.replacements.push((call.span, replacement)),
                 Err(error) => {
@@ -93,29 +103,58 @@ impl<'ast> Visit<'ast> for Discovery<'_, '_, '_> {
     }
 }
 
+/// Which installer a shim asked for.
+///
+/// `Interface` leaves global registration to the shim, so it cannot host a
+/// `[SecureContext]` interface: the shim would define the global on an
+/// insecure page. `Global` owns the registration, so it can.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InstallForm {
+    Interface,
+    Global,
+}
+
 impl Discovery<'_, '_, '_> {
-    fn installation(&mut self, call: &ast::CallExpression<'_>) -> Result<String, Error> {
-        let (class, unimplemented) = match call.arguments.as_slice() {
-            [ast::Argument::ClassExpression(class)] => (class, BTreeSet::new()),
-            [
-                ast::Argument::ClassExpression(class),
-                ast::Argument::ArrayExpression(list),
-            ] => {
-                let mut names = BTreeSet::new();
-                for element in &list.elements {
-                    let ast::ArrayExpressionElement::StringLiteral(name) = element else {
-                        return Err(Error(
-                            "unimplemented members must be string literals".into(),
-                        ));
-                    };
-                    names.insert(name.value.as_str().to_owned());
-                }
-                (class, names)
+    fn installation(
+        &mut self,
+        call: &ast::CallExpression<'_>,
+        form: InstallForm,
+    ) -> Result<String, Error> {
+        let (name, class, unimplemented) = match (form, call.arguments.as_slice()) {
+            (InstallForm::Interface, [ast::Argument::ClassExpression(class)]) => {
+                (None, class, BTreeSet::new())
             }
+            (
+                InstallForm::Interface,
+                [
+                    ast::Argument::ClassExpression(class),
+                    ast::Argument::ArrayExpression(list),
+                ],
+            ) => (None, class, string_list(list)?),
+            (
+                InstallForm::Global,
+                [
+                    ast::Argument::StringLiteral(name),
+                    ast::Argument::ClassExpression(class),
+                ],
+            ) => (Some(name), class, BTreeSet::new()),
+            (
+                InstallForm::Global,
+                [
+                    ast::Argument::StringLiteral(name),
+                    ast::Argument::ClassExpression(class),
+                    ast::Argument::ArrayExpression(list),
+                ],
+            ) => (Some(name), class, string_list(list)?),
             _ => {
-                return Err(Error(
-                    "interface installation requires one named class expression and an optional list of unimplemented members".into(),
-                ));
+                return Err(Error(match form {
+                    InstallForm::Interface => {
+                        "interface installation requires one class expression and an optional list of unimplemented members".into()
+                    }
+                    InstallForm::Global => {
+                        "global installation requires a name string, a class expression, and an optional list of unimplemented members".into()
+                    }
+                }));
             }
         };
         if call.optional || class.heritage.is_some() || !class.decorators.is_empty() {
@@ -123,12 +162,11 @@ impl Discovery<'_, '_, '_> {
                 "conditional or inherited JS class installation is not supported yet".into(),
             ));
         }
-        let name = class
-            .id
-            .as_ref()
-            .ok_or_else(|| Error("interface class must be named".into()))?
-            .name
-            .as_str();
+        let class_name = class.id.as_ref().map(|id| id.name.as_str());
+        let name = match name {
+            Some(name) => name.value.as_str(),
+            None => class_name.ok_or_else(|| Error("interface class must be named".into()))?,
+        };
         if !self.interfaces.insert(name.into()) {
             return Err(Error(format!("duplicate JS implementation of {name}")));
         }
@@ -137,9 +175,10 @@ impl Discovery<'_, '_, '_> {
             declaration.attributes.as_ref(),
             &["Exposed", "SecureContext"],
         )?;
-        if interface_attributes.contains(&"SecureContext") {
+        let secure_only = interface_attributes.contains(&"SecureContext");
+        if secure_only && form == InstallForm::Interface {
             return Err(Error(
-                "a secure-only JS interface is not supported yet: the installer does not own global registration".into(),
+                "a secure-only JS interface must use __tbInstallGlobal so the installer owns global registration".into(),
             ));
         }
         let exposed = crate::database::exposed_in(declaration.attributes.as_ref(), "Window");
@@ -156,11 +195,31 @@ impl Discovery<'_, '_, '_> {
         )?;
         let constructor = constructor.unwrap_or_else(|| "null".into());
         let implementation = class.span.source_text(self.source);
-        Ok(format!(
-            "__tbInstallInterface({implementation}, {name:?}, {constructor}, [{}])",
-            members.join(",")
-        ))
+        Ok(match form {
+            InstallForm::Interface => format!(
+                "__tbInstallInterface({implementation}, {name:?}, {constructor}, [{}])",
+                members.join(",")
+            ),
+            InstallForm::Global => format!(
+                "__tbInstallGlobal({implementation}, {name:?}, {constructor}, [{}], {secure_only})",
+                members.join(",")
+            ),
+        })
     }
+}
+
+/// The string literals in an installation's `unimplemented` array.
+fn string_list(list: &ast::ArrayExpression<'_>) -> Result<BTreeSet<String>, Error> {
+    let mut names = BTreeSet::new();
+    for element in &list.elements {
+        let ast::ArrayExpressionElement::StringLiteral(name) = element else {
+            return Err(Error(
+                "unimplemented members must be string literals".into(),
+            ));
+        };
+        names.insert(name.value.as_str().to_owned());
+    }
+    Ok(names)
 }
 
 fn implementation_methods(
@@ -340,7 +399,10 @@ fn lower_attribute_member(
     members: &mut Vec<String>,
 ) -> Result<(), Error> {
     resolved.validate_scopes()?;
-    attributes(member.attributes.as_ref(), &["SecureContext", "SameObject"])?;
+    attributes(
+        member.attributes.as_ref(),
+        &["Exposed", "SecureContext", "SameObject"],
+    )?;
     attributes(member.type_.attributes.as_ref(), &[])?;
     if member.modifier.is_some() {
         return Err(Error("JS special attributes are not supported yet".into()));
@@ -359,7 +421,7 @@ fn lower_attribute_member(
     ));
     if member.readonly.is_none() {
         signature(implemented, name, Kind::Set, 1)?;
-        let converted = input(&lowered, "args[0]", false)?;
+        let converted = input(database, &lowered, "args[0]", false)?;
         members.push(member_descriptor(
             name,
             "set",
@@ -381,7 +443,10 @@ fn lower_operation_member(
     members: &mut Vec<String>,
 ) -> Result<(), Error> {
     resolved.validate_scopes()?;
-    attributes(member.attributes.as_ref(), &["NewObject", "SecureContext"])?;
+    attributes(
+        member.attributes.as_ref(),
+        &["Exposed", "NewObject", "SecureContext"],
+    )?;
     if member.modifier.is_some() || member.special.is_some() {
         return Err(Error("JS special operations are not supported yet".into()));
     }
@@ -429,16 +494,45 @@ enum JsType {
     /// `ArrayBufferView`: any typed array or `DataView`
     /// (<https://webidl.spec.whatwg.org/#ArrayBufferView>).
     ArrayBufferView,
+    /// `sequence<T>`: a copied JS array, converted element by element
+    /// (<https://webidl.spec.whatwg.org/#es-sequence>).
+    Sequence(Box<JsType>),
+    /// `FrozenArray<T>`: a frozen JS array, converted element by element
+    /// (<https://webidl.spec.whatwg.org/#es-frozen-array>).
+    FrozenArray(Box<JsType>),
+    /// `Promise<T>`: a promise whose fulfillment value is converted
+    /// (<https://webidl.spec.whatwg.org/#es-promise>).
+    Promise(Box<JsType>),
 }
 
 fn js_type(database: &Database<'_>, type_: &weedle::types::Type<'_>) -> Result<JsType, Error> {
-    if matches!(
-        type_,
-        weedle::types::Type::Single(weedle::types::SingleType::NonAny(
-            weedle::types::NonAnyType::ArrayBufferView(item)
-        )) if item.q_mark.is_none()
-    ) {
-        return Ok(JsType::ArrayBufferView);
+    if let weedle::types::Type::Single(weedle::types::SingleType::NonAny(non_any)) = type_ {
+        match non_any {
+            weedle::types::NonAnyType::ArrayBufferView(item) if item.q_mark.is_none() => {
+                return Ok(JsType::ArrayBufferView);
+            }
+            weedle::types::NonAnyType::FrozenArrayType(item) if item.q_mark.is_none() => {
+                return Ok(JsType::FrozenArray(Box::new(js_type(
+                    database,
+                    &item.type_.generics.body,
+                )?)));
+            }
+            weedle::types::NonAnyType::Sequence(item) if item.q_mark.is_none() => {
+                return Ok(JsType::Sequence(Box::new(js_type(
+                    database,
+                    &item.type_.generics.body.type_,
+                )?)));
+            }
+            weedle::types::NonAnyType::Promise(promise) => {
+                let weedle::types::ReturnType::Type(inner) = &*promise.generics.body else {
+                    return Err(Error(
+                        "JS Promise<undefined> results are not supported yet".into(),
+                    ));
+                };
+                return Ok(JsType::Promise(Box::new(js_type(database, inner)?)));
+            }
+            _ => {}
+        }
     }
     native_type(database, type_, &mut BTreeSet::new()).map(JsType::Native)
 }
@@ -509,11 +603,11 @@ fn arguments(
         let present = format!("args.length > {index}");
         let value = format!("{present} ? args[{index}] : undefined");
         let lowered = js_type(database, &argument.type_.type_)?;
-        let converted = input(&lowered, &value, allow_shared)?;
+        let converted = input(database, &lowered, &value, allow_shared)?;
         let converted = match (&argument.optional, &argument.default) {
             (None, None) if !optional => {
                 required += 1;
-                input(&lowered, &format!("args[{index}]"), allow_shared)?
+                input(database, &lowered, &format!("args[{index}]"), allow_shared)?
             }
             (Some(_), Some(default)) => {
                 optional = true;
@@ -536,10 +630,21 @@ fn arguments(
     Ok((required, format!("[{}]", conversions.join(","))))
 }
 
-fn input(type_: &JsType, value: &str, allow_shared: bool) -> Result<String, Error> {
+fn input(
+    database: &Database<'_>,
+    type_: &JsType,
+    value: &str,
+    allow_shared: bool,
+) -> Result<String, Error> {
     // https://webidl.spec.whatwg.org/#es-type-mapping
     match type_ {
         JsType::ArrayBufferView => Ok(format!("__tbIDLBufferSource({value}, {allow_shared})")),
+        JsType::Sequence(element) => {
+            let converted = input(database, element, "item", false)?;
+            Ok(format!("__tbIDLSequence({value}, item => {converted})"))
+        }
+        JsType::FrozenArray(_) => Err(Error("FrozenArray is a result type only".into())),
+        JsType::Promise(_) => Err(Error("Promise is a result type only".into())),
         // `AllowShared` is meaningless on a copied string; only the argument
         // conversion differs from the native side.
         JsType::Native(ReturnType::String) if !allow_shared => {
@@ -548,9 +653,69 @@ fn input(type_: &JsType, value: &str, allow_shared: bool) -> Result<String, Erro
         JsType::Native(ReturnType::UsvString) if !allow_shared => {
             Ok(format!("__tbIDLUSVString({value})"))
         }
+        JsType::Native(ReturnType::Boolean) => Ok(format!("__tbIDLBoolean({value})")),
+        JsType::Native(ReturnType::UnsignedLong) => Ok(format!("__tbIDLUnsignedLong({value})")),
+        JsType::Native(ReturnType::UnsignedLongLong) => {
+            Ok(format!("__tbIDLUnsignedLongLong({value})"))
+        }
+        JsType::Native(ReturnType::Long) => Ok(format!("__tbIDLLong({value})")),
+        JsType::Native(ReturnType::Double) => Ok(format!("__tbIDLDouble({value})")),
+        JsType::Native(ReturnType::RestrictedDouble) => {
+            Ok(format!("__tbIDLRestrictedDouble({value})"))
+        }
         JsType::Native(ReturnType::Uint8Array) => {
             Ok(format!("__tbIDLUint8Array({value}, {allow_shared})"))
         }
+        JsType::Native(ReturnType::Enumeration(name)) => {
+            let keywords = enum_keywords(database, name)?;
+            Ok(format!(
+                "__tbIDLEnum({value}, [{}])",
+                keywords
+                    .iter()
+                    .map(|keyword| format!("{keyword:?}"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ))
+        }
+        JsType::Native(ReturnType::Dictionary(name)) => {
+            let dictionary = database.dictionary(name)?;
+            attributes(dictionary.attributes.as_ref(), &[])?;
+            if dictionary.inheritance.is_some() {
+                return Err(Error(
+                    "JS argument dictionary inheritance is not supported yet".into(),
+                ));
+            }
+            let mut fields = Vec::new();
+            for member in dictionary.members.body {
+                attributes(member.attributes.as_ref(), &[])?;
+                attributes(member.type_.attributes.as_ref(), &[])?;
+                if member.default.is_some() {
+                    return Err(Error(
+                        "JS argument dictionary defaults are not supported yet".into(),
+                    ));
+                }
+                let lowered = js_type(database, &member.type_.type_)?;
+                let converted = input(database, &lowered, "member", false)?;
+                fields.push(format!(
+                    "[{:?}, member => {converted}, {}]",
+                    member.identifier.0,
+                    member.required.is_some()
+                ));
+            }
+            Ok(format!(
+                "__tbIDLDictionary({value}, [{}])",
+                fields.join(",")
+            ))
+        }
+        // A platform object argument is already the value; its interface
+        // brand and required type are the caller's contract.
+        JsType::Native(
+            ReturnType::Any
+            | ReturnType::PlatformObject
+            | ReturnType::Node
+            | ReturnType::NullableNode
+            | ReturnType::NullableDocumentType,
+        ) => Ok(value.to_owned()),
         JsType::Native(other) => Err(Error(format!(
             "JS argument type is not supported yet: {other:?}"
         ))),
@@ -559,13 +724,58 @@ fn input(type_: &JsType, value: &str, allow_shared: bool) -> Result<String, Erro
 
 fn output(database: &Database<'_>, type_: &JsType, value: &str) -> Result<String, Error> {
     match type_ {
-        // The conversion of an IDL `ArrayBufferView` back to JS is the object
-        // the argument conversion already validated
+        // An `ArrayBufferView` and a platform object both pass through: the
+        // argument conversion already validated `ArrayBufferView`, and the
+        // algorithm built the platform object itself
         // (<https://webidl.spec.whatwg.org/#es-buffer-source-types>).
-        JsType::ArrayBufferView => Ok(value.to_owned()),
-        JsType::Native(ReturnType::String) => Ok(format!("__tbIDLResult({value}, 'string')")),
+        JsType::ArrayBufferView
+        | JsType::Native(
+            ReturnType::Any
+            | ReturnType::PlatformObject
+            | ReturnType::Node
+            | ReturnType::NullableNode
+            | ReturnType::NullableDocumentType,
+        ) => Ok(value.to_owned()),
+        JsType::Sequence(element) => {
+            let converted = output(database, element, "item")?;
+            Ok(format!(
+                "__tbIDLSequenceResult({value}, item => {converted})"
+            ))
+        }
+        JsType::FrozenArray(element) => {
+            let converted = output(database, element, "item")?;
+            Ok(format!(
+                "__tbIDLFrozenArrayResult({value}, item => {converted})"
+            ))
+        }
+        JsType::Promise(inner) => {
+            let converted = output(database, inner, "item")?;
+            Ok(format!("__tbIDLPromise({value}, item => {converted})"))
+        }
+        JsType::Native(ReturnType::String | ReturnType::UsvString) => {
+            Ok(format!("__tbIDLResult({value}, 'string')"))
+        }
         JsType::Native(ReturnType::Uint8Array) => {
             Ok(format!("__tbIDLRealmUint8Array({value}, false, realm)"))
+        }
+        JsType::Native(ReturnType::Boolean) => Ok(format!("__tbIDLResult({value}, 'boolean')")),
+        JsType::Native(
+            ReturnType::UnsignedLong
+            | ReturnType::UnsignedLongLong
+            | ReturnType::Long
+            | ReturnType::Double
+            | ReturnType::RestrictedDouble,
+        ) => Ok(format!("__tbIDLResultNumber({value})")),
+        JsType::Native(ReturnType::Enumeration(name)) => {
+            let keywords = enum_keywords(database, name)?;
+            Ok(format!(
+                "__tbIDLResultEnum({value}, [{}])",
+                keywords
+                    .iter()
+                    .map(|keyword| format!("{keyword:?}"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ))
         }
         // https://webidl.spec.whatwg.org/#es-to-js-dictionary
         JsType::Native(ReturnType::Dictionary(name)) => {
@@ -580,16 +790,17 @@ fn output(database: &Database<'_>, type_: &JsType, value: &str) -> Result<String
             for member in dictionary.members.body {
                 attributes(member.attributes.as_ref(), &[])?;
                 attributes(member.type_.attributes.as_ref(), &[])?;
-                let lowered = js_type(database, &member.type_.type_)?;
-                if member.required.is_some()
-                    || member.default.is_some()
-                    || !matches!(lowered, JsType::Native(ReturnType::UnsignedLongLong))
-                {
+                if member.required.is_some() || member.default.is_some() {
                     return Err(Error(
-                        "JS result dictionary fields are not supported yet".into(),
+                        "JS result dictionary required/default fields are not supported yet".into(),
                     ));
                 }
-                fields.push(member.identifier.0);
+                let lowered = js_type(database, &member.type_.type_)?;
+                let converted = output(database, &lowered, "member")?;
+                fields.push(format!(
+                    "[{:?}, member => {converted}]",
+                    member.identifier.0
+                ));
             }
             fields.sort_unstable();
             if fields.windows(2).any(|pair| pair[0] == pair[1]) {
@@ -597,15 +808,23 @@ fn output(database: &Database<'_>, type_: &JsType, value: &str) -> Result<String
             }
             Ok(format!(
                 "__tbIDLResultDictionary({value}, [{}])",
-                fields
-                    .iter()
-                    .map(|field| format!("{field:?}"))
-                    .collect::<Vec<_>>()
-                    .join(",")
+                fields.join(",")
             ))
         }
         JsType::Native(other) => Err(Error(format!(
             "JS result type is not supported yet: {other:?}"
         ))),
     }
+}
+
+/// The keywords of one IDL enumeration, in declaration order.
+fn enum_keywords(database: &Database<'_>, name: &str) -> Result<Vec<String>, Error> {
+    let Some(weedle::Definition::Enum(definition)) = database.definition(name) else {
+        return Err(Error(format!("unknown enumeration: {name}")));
+    };
+    Ok(crate::model::Enumeration::parse(definition)?
+        .values
+        .into_iter()
+        .map(|(keyword, _)| keyword)
+        .collect())
 }

@@ -1064,6 +1064,63 @@ fn javascript_unsupported_implementations_fail_the_build() {
     }
 }
 
+/// A `[SecureContext]` interface must use the installer form that owns its
+/// global, so the global can be omitted on an insecure page.
+#[test]
+fn javascript_global_installation_hides_a_secure_only_interface() {
+    let idl = [Source {
+        name: "fixture.idl",
+        text: "[Exposed=Window, SecureContext] interface Sample { readonly attribute DOMString value; };",
+    }];
+    let interface = Source {
+        name: "fixture.js",
+        text: "__tbInstallInterface(class Sample { get value() { return 'v'; } })",
+    };
+    let error = compile_javascript(&idl, &interface)
+        .err()
+        .expect("a secure-only interface cannot leave its global to the shim");
+    assert!(error.to_string().contains("__tbInstallGlobal"), "{error}");
+    let global = Source {
+        name: "fixture.js",
+        text: "__tbInstallGlobal('Sample', class Sample { get value() { return 'v'; } })",
+    };
+    let output = compile_javascript(&idl, &global)
+        .expect("global installation")
+        .source;
+    assert!(
+        output.contains("__tbInstallGlobal(class Sample"),
+        "{output}"
+    );
+    assert!(
+        output.contains(", true)"),
+        "the secure bit gates the global: {output}"
+    );
+}
+
+/// Structured JS types lower to their conversion helpers, including the
+/// `Promise` fulfillment conversion.
+#[test]
+fn javascript_structured_types_convert_sequences_and_promises() {
+    let idl = [Source {
+        name: "fixture.idl",
+        text: "[Exposed=Window] interface Sample { readonly attribute FrozenArray<DOMString> list; Promise<DOMString> run(sequence<DOMString> names); };",
+    }];
+    let source = Source {
+        name: "fixture.js",
+        text: "__tbInstallGlobal('Sample', class Sample { get list() { return []; } run(names) { return Promise.resolve(''); } })",
+    };
+    let output = compile_javascript(&idl, &source)
+        .expect("structured types")
+        .source;
+    for fragment in [
+        "__tbIDLSequence(args[0], item => __tbIDLString(item))",
+        "__tbIDLPromise(value, item => __tbIDLResult(item, 'string'))",
+        "__tbIDLFrozenArrayResult(value, item => __tbIDLResult(item, 'string'))",
+    ] {
+        assert!(output.contains(fragment), "missing {fragment}: {output}");
+    }
+}
+
 #[test]
 fn a_secure_context_constant_is_gated_where_it_is_installed() {
     // `[SecureContext]` const is rejected on the member itself, but a

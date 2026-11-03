@@ -18,65 +18,40 @@
   const uaFullVersion = chromium !== undefined
     ? chromium.version
     : (lastFullVersion === undefined ? '' : lastFullVersion.version);
-  const uaDataKey = host.slots('NavigatorUAData');
-  class NavigatorUAData {
-    constructor() {
-      throw new TypeError('Illegal constructor');
-    }
+
+  // `NavigatorUAData` is generated from its IDL shape. Its global stays
+  // conditional because tinybrowser exposes it only where `userAgentData`
+  // itself is available; the installer's `__tbInstallGlobal` form is what a
+  // `[SecureContext]` interface needs, and `NavigatorUAData` is not one.
+  const [NavigatorUAData, userAgentData] = __tbInstallInterface(class NavigatorUAData {
     get brands() {
-      __tbBrand(this, uaDataKey);
       return uaBrands;
     }
     get mobile() {
-      __tbBrand(this, uaDataKey);
       return uaMobile;
     }
     get platform() {
-      __tbBrand(this, uaDataKey);
       return uaPlatform;
     }
     // https://wicg.github.io/ua-client-hints/#getHighEntropyValues
     getHighEntropyValues(hints) {
-      __tbBrand(this, uaDataKey);
-      if (arguments.length < 1) {
-        throw new TypeError("Failed to execute 'getHighEntropyValues' on 'NavigatorUAData': 1 argument required, but only 0 present.");
-      }
-      if (hints === null || (typeof hints !== 'object' && typeof hints !== 'function')) {
-        throw new TypeError('The hints argument must be a sequence');
-      }
-      const iteratorMethod = hints[Symbol.iterator];
-      if (typeof iteratorMethod !== 'function') {
-        throw new TypeError('The hints argument must be iterable');
-      }
-      const names = [];
-      const iterator = iteratorMethod.call(hints);
-      while (true) {
-        const step = iterator.next();
-        if (step.done) break;
-        names.push(String(step.value));
-      }
       const values = { brands: uaBrands, mobile: uaMobile, platform: uaPlatform };
-      if (names.includes('architecture')) values.architecture = identity.architecture;
-      if (names.includes('bitness')) values.bitness = identity.bitness;
-      if (names.includes('formFactors')) values.formFactors = Object.freeze(identity.formFactors);
-      if (names.includes('fullVersionList')) values.fullVersionList = uaFullVersionList;
-      if (names.includes('model')) values.model = identity.model;
-      if (names.includes('platformVersion')) values.platformVersion = identity.platformVersion;
-      if (names.includes('uaFullVersion')) values.uaFullVersion = uaFullVersion;
-      if (names.includes('wow64')) values.wow64 = identity.wow64;
+      if (hints.includes('architecture')) values.architecture = identity.architecture;
+      if (hints.includes('bitness')) values.bitness = identity.bitness;
+      if (hints.includes('formFactors')) values.formFactors = identity.formFactors.slice();
+      if (hints.includes('fullVersionList')) values.fullVersionList = uaFullVersionList;
+      if (hints.includes('model')) values.model = identity.model;
+      if (hints.includes('platformVersion')) values.platformVersion = identity.platformVersion;
+      if (hints.includes('uaFullVersion')) values.uaFullVersion = uaFullVersion;
+      if (hints.includes('wow64')) values.wow64 = identity.wow64;
       return Promise.resolve(values);
     }
     // https://wicg.github.io/ua-client-hints/#h-tojson
     toJSON() {
-      __tbBrand(this, uaDataKey);
       return { brands: uaBrands, mobile: uaMobile, platform: uaPlatform };
     }
-  }
-  Object.defineProperty(NavigatorUAData.prototype, Symbol.toStringTag, {
-    value: 'NavigatorUAData', writable: false, enumerable: false, configurable: true,
   });
-  const userAgentData = Object.create(NavigatorUAData.prototype);
-  uaDataKey.set(userAgentData, Object.freeze({}));
+
   // https://html.spec.whatwg.org/multipage/interaction.html#dom-useractivation
   const userActivationKey = host.slots('UserActivation');
   class UserActivation {
@@ -97,8 +72,11 @@
   });
   const userActivation = Object.create(UserActivation.prototype);
   userActivationKey.set(userActivation, Object.freeze({}));
-  const secureContext = host.__tbSecureContext === true;
-  class Navigator {
+
+  // `Navigator` includes seven NavigatorID/Language/etc. mixins, so the
+  // generator resolves `userAgentData` from `Navigator includes NavigatorUA`
+  // and applies its `[SecureContext]` exposure per member.
+  const [Navigator, navigator] = __tbInstallGlobal('Navigator', class Navigator {
     get userAgent() {
       return identity.userAgent;
     }
@@ -120,19 +98,29 @@
     get userActivation() {
       return userActivation;
     }
-  }
-  if (secureContext) {
-    // Both are `[SecureContext]`
-    // (<https://wicg.github.io/ua-client-hints/#dom-navigator-useragentdata>).
-    // Web IDL names an attribute getter `get userAgentData`, and an
-    // object-literal accessor is what makes the engine name it
-    // (<https://webidl.spec.whatwg.org/#idl-attributes>).
-    const { get } = Object.getOwnPropertyDescriptor({
-      get userAgentData() { return userAgentData; },
-    }, 'userAgentData');
-    Object.defineProperty(Navigator.prototype, 'userAgentData', {
-      get, enumerable: true, configurable: true,
-    });
+    get userAgentData() {
+      return userAgentData;
+    }
+  }, [
+    'adAuctionComponents', 'attribution', 'audioSession', 'bluetooth',
+    'canShare', 'clearAppBadge', 'clipboard', 'connection', 'contacts',
+    'cpuPerformance', 'createHandwritingRecognizer', 'credentials',
+    'crossOriginStorage', 'deprecatedReplaceInURN', 'deprecatedURNtoURL',
+    'deviceMemory', 'devicePosture', 'geolocation', 'getAutoplayPolicy',
+    'getBattery', 'getGamepads', 'getInstalledRelatedApps',
+    'globalPrivacyControl', 'gpu', 'hid', 'ink', 'install',
+    'javaEnabled', 'keyboard', 'locks', 'login', 'managed',
+    'mediaCapabilities', 'mediaDevices', 'mediaSession', 'mimeTypes', 'ml',
+    'oscpu', 'pdfViewerEnabled', 'permissions', 'plugins', 'preferences',
+    'presentation', 'queryHandwritingRecognizer',
+    'registerProtocolHandler', 'requestMediaKeySystemAccess',
+    'requestMIDIAccess', 'scheduling', 'sendBeacon', 'serial',
+    'serviceWorker', 'setAppBadge', 'share', 'storage', 'storageBuckets',
+    'taintEnabled', 'unregisterProtocolHandler', 'usb', 'vibrate',
+    'virtualKeyboard', 'wakeLock', 'windowControlsOverlay', 'xr',
+  ]);
+
+  if (host.__tbSecureContext === true) {
     Object.defineProperty(globalThis, 'NavigatorUAData', {
       value: NavigatorUAData, writable: true, configurable: true,
     });
@@ -140,10 +128,7 @@
   Object.defineProperty(globalThis, 'UserActivation', {
     value: UserActivation, writable: true, configurable: true,
   });
-  Object.defineProperty(globalThis, 'Navigator', {
-    value: Navigator, writable: true, configurable: true,
-  });
   Object.defineProperty(globalThis, 'navigator', {
-    value: new Navigator(), writable: false, configurable: true,
+    value: navigator, writable: false, configurable: true,
   });
 }

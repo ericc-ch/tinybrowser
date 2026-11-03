@@ -95,20 +95,100 @@ const __tbIDLResult = (value, type) => {
   return value;
 };
 const __tbIDLInteger = Number.isInteger;
+const __tbIDLBoolean = value => Boolean(value);
+const __tbIDLUnsignedLong = value => value >>> 0;
+const __tbIDLUnsignedLongLong = value => {
+  // https://webidl.spec.whatwg.org/#es-unsigned-long-long
+  const number = Number(value);
+  if (!__tbIDLIsFinite(number) || number === 0) return 0;
+  const truncated = Math.trunc(number);
+  if (truncated < 0 || truncated >= 2 ** 64) {
+    throw new TypeError('value is out of range for unsigned long long');
+  }
+  return truncated;
+};
+const __tbIDLLong = value => value | 0;
+const __tbIDLDouble = value => Number(value);
+const __tbIDLIsFinite = Number.isFinite;
+const __tbIDLRestrictedDouble = value => {
+  const number = Number(value);
+  if (!__tbIDLIsFinite(number)) throw new TypeError('value is not a finite double');
+  return number;
+};
+const __tbIDLEnum = (value, keywords) => {
+  const string = __tbIDLString(value);
+  for (let index = 0; index < keywords.length; index++) {
+    if (string === keywords[index]) return string;
+  }
+  throw new TypeError('value is not a valid enumeration keyword');
+};
+const __tbIDLIteratorNext = Object.getPrototypeOf([][Symbol.iterator]()).next;
+const __tbIDLSequence = (value, convert) => {
+  // https://webidl.spec.whatwg.org/#es-sequence
+  if (value === null || value === undefined) return [];
+  if (typeof value !== 'object' && typeof value !== 'function') {
+    throw new TypeError('value is not iterable');
+  }
+  const iteratorMethod = value[Symbol.iterator];
+  if (typeof iteratorMethod !== 'function') throw new TypeError('value is not iterable');
+  const iterator = __tbApply(iteratorMethod, value, []);
+  const result = [];
+  while (true) {
+    const step = __tbApply(__tbIDLIteratorNext, iterator, []);
+    if (step.done) return result;
+    result[result.length] = convert(step.value);
+  }
+};
+const __tbIDLSequenceResult = (value, convert) => {
+  const result = [];
+  for (let index = 0; index < value.length; index++) {
+    result[result.length] = convert(value[index]);
+  }
+  return result;
+};
+const __tbIDLFrozenArrayResult = (value, convert) =>
+  Object.freeze(__tbIDLSequenceResult(value, convert));
+const __tbIDLPromise = (value, convert) => Promise.resolve(value).then(convert);
+const __tbIDLResultNumber = value => {
+  if (typeof value !== 'number') throw new TypeError('algorithm result does not match IDL');
+  return value;
+};
+const __tbIDLResultEnum = (value, keywords) => {
+  if (typeof value !== 'string') throw new TypeError('algorithm result does not match IDL');
+  for (let index = 0; index < keywords.length; index++) {
+    if (value === keywords[index]) return value;
+  }
+  throw new TypeError('algorithm result is not an enumeration keyword');
+};
 const __tbIDLResultDictionary = (value, fields) => {
   // https://webidl.spec.whatwg.org/#es-to-js-dictionary
   const result = {};
   for (let index = 0; index < fields.length; index++) {
-    const name = fields[index];
+    const name = fields[index][0];
     const member = value[name];
     if (member === undefined) continue;
-    if (!__tbIDLInteger(member) || member < 0 || member >= 2 ** 64) {
-      throw new TypeError('algorithm result does not match unsigned long long');
-    }
     __tbDefineProperty(result, name, {
       __proto__: null,
-      value: member, writable: true, enumerable: true, configurable: true,
+      value: fields[index][1](member), writable: true, enumerable: true, configurable: true,
     });
+  }
+  return result;
+};
+const __tbIDLDictionary = (value, fields) => {
+  // https://webidl.spec.whatwg.org/#es-dictionary
+  if (value === null || value === undefined) value = {};
+  if (typeof value !== 'object' && typeof value !== 'function') {
+    throw new TypeError('value is not a dictionary');
+  }
+  const result = {};
+  for (let index = 0; index < fields.length; index++) {
+    const name = fields[index][0];
+    const member = value[name];
+    if (member === undefined) {
+      if (fields[index][2]) throw new TypeError(name + ' is required');
+      continue;
+    }
+    result[name] = fields[index][1](member);
   }
   return result;
 };
@@ -177,4 +257,18 @@ const __tbInstallInterface = (implementation, name, construction, members) => {
     return [constructor, instance];
   }
   return constructor;
+};
+const __tbInstallGlobal = (implementation, name, construction, members, secureOnly) => {
+  // The generator owns the global registration so a `[SecureContext]`
+  // interface can be built internally and still keep its global off an
+  // insecure page's global object
+  // (<https://webidl.spec.whatwg.org/#es-interfaces>).
+  const value = __tbInstallInterface(implementation, name, construction, members);
+  if (!secureOnly || host.__tbSecureContext === true) {
+    const global = construction === null ? value[0] : value;
+    __tbDefineProperty(globalThis, name, {
+      __proto__: null, value: global, writable: true, configurable: true,
+    });
+  }
+  return value;
 };
