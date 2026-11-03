@@ -1748,6 +1748,7 @@ fn storage_area(ctx: &Ctx<'_>, kind: &str) -> rquickjs::Result<crate::protocol::
 
 impl Drop for JsRealm {
     fn drop(&mut self) {
+        bindings::forget_rejections(&self.world);
         bindings::forget_world(&self.context);
         self.context.with(|ctx| bridge::release(&ctx, &self.world));
         let world = self.world.clone();

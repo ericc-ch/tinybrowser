@@ -1,0 +1,28 @@
+[package]
+name = "wpt-harness"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+# Developer tooling only: not published, not part of the release binary.
+publish = false
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "wpt-harness"
+path = "src/main.rs"
+
+[dependencies]
+# The real page engine, hosted in this process instead of a renderer child.
+renderer = { workspace = true }
+net = { workspace = true }
+percent-encoding = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+# `test-util` is the virtual clock: when a test has nothing ready but a timer,
+# jump straight to it instead of spending the harness budget.
+tokio = { version = "1.53", default-features = false, features = ["rt", "time", "sync", "macros", "test-util"] }
+url = "2"
