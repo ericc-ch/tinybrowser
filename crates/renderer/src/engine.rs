@@ -2348,4 +2348,47 @@ mod messaging_tests {
             "going back restores the blank document the navigation created"
         );
     }
+
+    /// Several mutations made by separate tasks in one batch reach the next
+    /// rendering opportunity as one style/layout pass, not one per task.
+    #[test]
+    fn mutations_in_one_batch_settle_once() {
+        let mut engine = engine();
+        engine
+            .mount_frame(
+                FrameId::MAIN,
+                &mount(
+                    "https://example.test/",
+                    "<!doctype html><div id=d style=\"width:1px;height:1px\"></div>",
+                ),
+            )
+            .expect("mount");
+        let _ready = engine.drain_ready();
+        engine
+            .frames
+            .get_mut(&FrameId::MAIN)
+            .expect("main frame")
+            .reset_blitz_resolve_passes();
+        // Fifty timer callbacks run as fifty separate tasks before the engine
+        // goes idle; a per-task settle would cost fifty passes.
+        engine
+            .eval_in(
+                FrameId::MAIN,
+                "var d = document.getElementById('d'); \
+                 for (let i = 0; i < 50; i++) { \
+                   setTimeout(() => { d.style.width = (i + 2) + 'px'; }, 0); \
+                 }",
+            )
+            .expect("schedule mutations");
+        let _ready = engine.drain_ready();
+        assert_eq!(
+            engine
+                .frames
+                .get(&FrameId::MAIN)
+                .expect("main frame")
+                .blitz_resolve_passes(),
+            1,
+            "fifty tasks' mutations before the next paint must share one resolve"
+        );
+    }
 }

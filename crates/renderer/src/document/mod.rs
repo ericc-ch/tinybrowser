@@ -518,6 +518,10 @@ pub(crate) struct Document {
     /// Blitz shell: a mutation that changes rendered output asks for a frame,
     /// which is this document's cue to resolve style and layout.
     blitz_shell: std::sync::Arc<crate::render::TinyShell>,
+    /// Resolve passes run by [`Self::settle_blitz_layout`]. A test resets and
+    /// reads it to prove that several mutations between two paints settle once.
+    #[cfg(test)]
+    blitz_resolve_passes: u64,
     /// Image settlements from Blitz, drained on this document's thread.
     image_settle_rx: std::sync::mpsc::Receiver<blitz_dom::ImageSettlement>,
     /// Blitz subresource fetches awaiting carrier dials.
@@ -852,6 +856,8 @@ impl Document {
             net_provider,
             blitz_nav,
             blitz_shell: std::sync::Arc::new(crate::render::TinyShell::new()),
+            #[cfg(test)]
+            blitz_resolve_passes: 0,
             blitz_fetch_rx: blitz_rx,
             image_settle_rx: settle_rx,
             blitz_requests: HashMap::new(),
@@ -3608,10 +3614,9 @@ impl Document {
             blitz_traits::net::Bytes::from(body.unwrap_or_default().to_vec()),
             blitz_traits::net::ResponseInfo { origin_clean },
         );
-        // The arrival changes style or layout; apply it now so the tree is
-        // current for the next capture instead of waiting for one to pump
-        // the resolve loop.
-        self.settle_blitz_layout();
+        // The response is queued on Blitz's message channel; the batch's one
+        // settle ingests it, so several arrivals in one drain pass cost one
+        // resolve rather than one each.
     }
 
     pub(in crate::document) fn fail_dial(&mut self, fail: DialContext) {
@@ -3645,20 +3650,40 @@ impl Document {
         self.adopt_js_work();
     }
 
-    /// Applies Blitz's queued resource messages and re-lays out the active
-    /// document, so a stylesheet or image arrival is reflected before the
-    /// next capture instead of waiting for one to pump the resolve loop.
-    /// The arrival may also be the last one holding the load event.
+    /// Applies Blitz's queued resource messages and gives the active document
+    /// its one style/layout pass for this rendering opportunity. Resolving is a
+    /// no-op when nothing invalidated the tree. The arrival may also be the
+    /// last one holding the load event.
     fn settle_blitz_layout(&mut self) {
-        let world = self.world.borrow();
-        let Some(mut parsed) = world.main_document_mut() else {
-            return;
+        let passes = {
+            let world = self.world.borrow();
+            let Some(mut parsed) = world.main_document_mut() else {
+                return;
+            };
+            crate::render::resolve_until_settled(&mut parsed.document.base)
         };
-        crate::render::resolve_until_settled(&mut parsed.document.base);
-        drop(parsed);
-        drop(world);
+        #[cfg(test)]
+        {
+            self.blitz_resolve_passes += u64::from(passes);
+        }
+        #[cfg(not(test))]
+        let _ = passes;
         self.note_linked_stylesheets();
         self.drain_image_settlements();
+    }
+
+    /// Resolve passes run by [`Self::settle_blitz_layout`] since the last
+    /// reset. Test-only: it is the measurement behind "N mutations settle
+    /// once".
+    #[cfg(test)]
+    pub(crate) fn blitz_resolve_passes(&self) -> u64 {
+        self.blitz_resolve_passes
+    }
+
+    /// Clears the resolve-pass measurement before a test drives one batch.
+    #[cfg(test)]
+    pub(crate) fn reset_blitz_resolve_passes(&mut self) {
+        self.blitz_resolve_passes = 0;
     }
 
     /// Delivers Blitz's queued document messages without resolving layout, so
@@ -3890,17 +3915,22 @@ impl Document {
     pub(crate) fn check_load(&mut self) -> bool {
         // A queued document message (a failed image source, a landed
         // stylesheet) must reach the settlement drain even when no redraw is
-        // pending; a full settle only runs when the tree changed.
+        // pending.
         self.pump_blitz_messages();
-        // Blitz starts image requests from DOM mutations and settles them
-        // from resource messages, so resolving the pending redraw here is
-        // what turns a post-load `src` write into an event; without it the
-        // settlement would wait for a paint
-        // (<https://html.spec.whatwg.org/multipage/images.html#update-the-image-data>).
-        if self.blitz_shell.take_redraw() {
-            self.settle_blitz_layout();
-        }
+        // A stale tree must settle before load is decided: starting the image
+        // requests a newly inserted `src` implies is what makes `load` wait for
+        // them (<https://html.spec.whatwg.org/multipage/images.html#update-the-image-data>).
+        // `resolve_until_settled` is a no-op when nothing invalidated the
+        // tree, so a paint-only frame pays nothing here.
+        self.settle_blitz_layout();
+        // Answer the shell's request so a later settle is not opened by (or
+        // blocked on) a redraw that this pass already consumed.
+        self.blitz_shell.take_redraw();
         self.drain_image_settlements();
+        // The settle can start image fetches (a new `src`, a style-only
+        // background). Move them onto dials before any early return, or the
+        // loop sees no queued work and sleeps with the fetch parked.
+        self.drain_blitz_fetches();
         if !self.world.borrow().parser_active {
             self.tasks.extend(self.deferred_image_events.drain(..));
         }
@@ -3910,7 +3940,6 @@ impl Document {
         if self.world.borrow().main_ready_state() == ReadyState::Loading {
             return false;
         }
-        self.drain_blitz_fetches();
         if self.load_delay.is_pending() {
             return false;
         }
@@ -3960,7 +3989,6 @@ impl Document {
                     incoming.url.to_string(),
                     blitz_traits::net::Bytes::from(cached),
                 );
-                self.settle_blitz_layout();
                 continue;
             }
             let request = BlitzRequest {
@@ -4053,7 +4081,6 @@ impl Document {
         {
             self.tasks.push_back(Task::NodeError(node));
         }
-        self.settle_blitz_layout();
     }
 
     pub(crate) fn redirect_gate(

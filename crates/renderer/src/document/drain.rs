@@ -41,15 +41,12 @@ impl Document {
         // its deadline. A task outside a drain still opens its own turn.
         let _turn = self.js.as_ref().map(crate::js::JsRealm::enter_turn);
         self.run_task(task);
-        // A mutation that changes rendered output asks the shell for a frame.
-        // Before the document fires `load`, the load-time resolve settles the
-        // tree; afterwards this is the only cue that starts the image fetches
-        // a newly inserted style sheet or `style` attribute introduced, so the
-        // tree stays current for the turn's follow-up reads.
-        if self.load_fired && self.blitz_shell.take_redraw() {
-            self.settle_blitz_layout();
-        }
-        self.check_load();
+        // Deliver resource messages between tasks, but keep the settle for the
+        // end of the batch. A later task can observe an arrival (a font
+        // registered into the shaping collection, a stylesheet `@import`
+        // started), while several mutations still share one style/layout pass
+        // at the batch's one rendering opportunity.
+        self.pump_blitz_messages();
         // A task ran even when nothing is left: the engine still reconciles the
         // queued navigations and child frames it produced
         // (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#dom-iframe-contentdocument>).

@@ -20,15 +20,32 @@ pub(crate) fn blitz_base_url(url: &url::Url) -> String {
 }
 
 /// Resolves style and layout until Blitz reports no pending critical
-/// resources, bounded so a pathological tree still paints.
-pub(crate) fn resolve_until_settled(base: &mut blitz_dom::BaseDocument) {
+/// resources, bounded so a pathological tree still paints. A document whose
+/// [`needs_resolve`](blitz_dom::BaseDocument::needs_resolve) flag is clear has
+/// nothing to do, so a paint that follows a scroll or an animation frame does
+/// not pay for a style pass.
+///
+/// Returns how many real passes ran, which is the measurement a test uses to
+/// prove that several mutations between two paints cost one settle.
+pub(crate) fn resolve_until_settled(base: &mut blitz_dom::BaseDocument) -> u32 {
+    let mut passes = 0;
     for _ in 0..8 {
-        base.resolve(0.0);
         base.handle_messages();
-        if !base.has_pending_critical_resources() {
+        // A render-blocking resource (`<link rel=stylesheet>`) means there is
+        // nothing this pass can apply; the arrival marks the document stale and
+        // the next rendering opportunity resolves it.
+        if base.has_pending_critical_resources() || !base.needs_resolve() {
+            break;
+        }
+        base.resolve(0.0);
+        passes += 1;
+        // An animation sets `needs_resolve` for the *next* rendering
+        // opportunity, not this one.
+        if !base.needs_resolve() && !base.has_pending_critical_resources() {
             break;
         }
     }
+    passes
 }
 
 /// Renders `html` at `width` x `height` device pixels through Blitz.
