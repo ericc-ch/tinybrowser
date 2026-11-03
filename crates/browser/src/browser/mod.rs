@@ -102,6 +102,10 @@ pub(crate) struct OpenWindowOptions {
     /// it, which is what carries its referrer and `Sec-Fetch-Site`
     /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#window-open-steps>).
     pub(crate) initiator: NavigationInitiator,
+    /// The calling document's popup sandboxing flag set, which this tab gives
+    /// every document it installs
+    /// (<https://html.spec.whatwg.org/multipage/browsers.html#popup-sandboxing-flag-set>).
+    pub(crate) popup_sandbox: renderer::SandboxFlags,
 }
 
 pub(super) enum Command {

@@ -291,7 +291,7 @@ pub(super) fn form_navigate<'js>(
     if world_rc
         .borrow()
         .sandbox
-        .contains(crate::js::world::SandboxFlag::Forms)
+        .contains(crate::protocol::SandboxFlag::Forms)
     {
         return Ok(());
     }

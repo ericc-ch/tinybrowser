@@ -21,6 +21,7 @@ use tokio::time::{Instant, sleep_until, timeout};
 use url::Url;
 
 use crate::assignment::{Assignment, RendererWake};
+use crate::browser::TabRegistry;
 use crate::exchange::{self, RequestId, ServerInput};
 use crate::history::{HistorySnapshot, SessionHistory};
 use crate::manager::RendererProcessManager;
@@ -594,10 +595,12 @@ impl TabTask {
         id: TabId,
         network: TabNetworkHandle,
         renderers: Arc<RendererProcessManager>,
+        tabs: TabRegistry,
+        tab: NewTab,
     ) -> Self {
         let (client, server) = exchange::local(COMMAND_CAPACITY);
         let handle = TabHandle { id, client };
-        let tab = Tab::new(id, network, renderers, server.notifier());
+        let tab = Tab::new(id, network, renderers, server.notifier(), tabs, tab);
         let (deliveries, delivery_rx) = mpsc::channel(DELIVERY_CAPACITY);
         let join = tokio::spawn(coordinator_loop(server, tab, delivery_rx));
         Self {
@@ -664,6 +667,41 @@ struct ActiveNavigation {
     submitted: bool,
 }
 
+/// What the browser hands a new tab coordinator: the browsing-context state
+/// that belongs to the tab rather than to whatever document it commits first.
+pub(crate) struct NewTab {
+    /// The target name the tab starts with, which is the `window.open`
+    /// target's name
+    /// (<https://html.spec.whatwg.org/multipage/document-sequences.html#browsing-context-name>).
+    pub(crate) name: String,
+    /// The tab that opened this one, when the opener relationship is live.
+    /// A tab with a live opener keeps its target name across a cross-origin
+    /// navigation
+    /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#resetBCName>).
+    pub(crate) opener: Option<TabId>,
+    /// The popup sandboxing flag set every document this tab installs
+    /// inherits
+    /// (<https://html.spec.whatwg.org/multipage/browsers.html#popup-sandboxing-flag-set>).
+    pub(crate) popup_sandbox: renderer::SandboxFlags,
+    /// The origin the tab's initial `about:blank` inherits: the opener's for a
+    /// context web content opened, opaque for one the browser created
+    /// (<https://html.spec.whatwg.org/multipage/browsers.html#determining-the-origin>).
+    pub(crate) document_origin: url::Origin,
+}
+
+impl NewTab {
+    /// A tab the browser created itself: no name, no opener, no sandbox, and
+    /// an opaque initial document.
+    pub(crate) fn browser_created() -> Self {
+        Self {
+            name: String::new(),
+            opener: None,
+            popup_sandbox: renderer::SandboxFlags::empty(),
+            document_origin: url::Origin::new_opaque(),
+        }
+    }
+}
+
 /// Browser-owned tab state: identity, URL, navigation, and renderer link.
 struct Tab {
     id: TabId,
@@ -671,6 +709,22 @@ struct Tab {
     network: TabNetworkHandle,
     renderer: Option<Arc<Assignment>>,
     pending_mount: Option<Mount>,
+    /// Target names and opener links for the browsing context group. The
+    /// registry is authoritative for the cross-tab `window.open` lookup; the
+    /// document-side copy lives in the renderer's frame tree and mirrors it
+    /// (<https://html.spec.whatwg.org/multipage/document-sequences.html#the-rules-for-choosing-a-navigable>).
+    tabs: TabRegistry,
+    /// The origin the active document runs under. `about:blank` keeps it
+    /// because the blank inherits its creator's origin rather than deriving
+    /// one from its own URL; every other document reports its URL's origin,
+    /// which is the document's own for a tuple origin and opaque otherwise
+    /// (<https://html.spec.whatwg.org/multipage/browsers.html#determining-the-origin>).
+    document_origin: url::Origin,
+    /// The popup sandboxing flag set of this tab: empty unless web content
+    /// opened it from a document whose sandbox propagates. It is copied into
+    /// every mount, so every document this tab installs inherits it
+    /// (<https://html.spec.whatwg.org/multipage/browsers.html#popup-sandboxing-flag-set>).
+    popup_sandbox: renderer::SandboxFlags,
     site: Option<Site>,
     events_rx: Option<mpsc::Receiver<RendererWake>>,
     document_url: Url,
@@ -705,14 +759,24 @@ impl Tab {
         network: TabNetworkHandle,
         renderers: Arc<RendererProcessManager>,
         events: TabNotifier,
+        tabs: TabRegistry,
+        tab: NewTab,
     ) -> Self {
         let (dial_tx, dial_rx) = mpsc::unbounded_channel();
+        let pending_mount = blank_mount(renderer::TabState {
+            name: tabs.name(id),
+            auxiliary_with_opener: tabs.opener(id).is_some(),
+            popup_sandbox: tab.popup_sandbox,
+        });
         Self {
             id,
             renderers,
             network,
             renderer: None,
-            pending_mount: Some(blank_mount()),
+            pending_mount: Some(pending_mount),
+            tabs,
+            document_origin: tab.document_origin,
+            popup_sandbox: tab.popup_sandbox,
             site: None,
             events_rx: None,
             document_url: net::about_blank(),
@@ -734,7 +798,8 @@ impl Tab {
     }
 
     async fn load_html(&mut self, html: &str) -> Result<(), TabError> {
-        let site = Site::for_url(&self.document_url)
+        let url = self.document_url.clone();
+        let site = Site::for_url(&url)
             .or_else(|| self.site.clone())
             .unwrap_or_else(|| Site::opaque(self.id));
         let mount = Mount {
@@ -743,11 +808,12 @@ impl Tab {
                 viewport: Some(self.viewport),
                 init_scripts: self.init_scripts.clone(),
                 ..ResponseHead::local(
-                    self.document_url.clone(),
+                    url.clone(),
                     Some("text/html; charset=utf-8".to_owned()),
                     None,
                 )
             },
+            tab: self.current_tab_state(),
             body: html.as_bytes().to_vec(),
         };
         if self.renderer.is_none() && self.document_url.scheme() == "about" {
@@ -978,7 +1044,10 @@ impl Tab {
 
     /// Mounts the virtual blank document this tab has been carrying.
     async fn mount_virtual(&mut self) -> Result<(), TabError> {
-        let mut mount = self.pending_mount.take().unwrap_or_else(blank_mount);
+        let mut mount = self
+            .pending_mount
+            .take()
+            .unwrap_or_else(|| blank_mount(self.current_tab_state()));
         // The replacement renderer must come up with the tab's emulated
         // viewport and script list, not the defaults.
         mount.head.viewport = Some(self.viewport);
@@ -1018,6 +1087,7 @@ impl Tab {
             self.navigation_failed = true;
             return false;
         }
+        let (tab, previous_name) = self.begin_commit(&url);
         let mount = Mount {
             head: ResponseHead {
                 history: history.renderer_snapshot(),
@@ -1025,9 +1095,11 @@ impl Tab {
                 init_scripts: self.init_scripts.clone(),
                 ..ResponseHead::local(url.clone(), Some(content_type), None)
             },
+            tab,
             body,
         };
         if let Err(error) = self.mount(&site, mount).await {
+            self.abort_commit(previous_name);
             logging::error!(
                 target: "browser::tab",
                 "data navigation mount failed for {}: {error}",
@@ -1037,11 +1109,101 @@ impl Tab {
             return false;
         }
         self.history = history;
-        self.document_url = url;
+        self.advance_document_url(url);
         self.navigation_failed = false;
         let title = self.document_title().await;
         self.history.set_current_title(title);
         true
+    }
+
+    /// Whether this tab is an auxiliary browsing context whose opener is
+    /// still alive, which keeps its target name across a cross-origin
+    /// navigation. The opener link is recorded when the tab is created, so a
+    /// tab the browser created itself never qualifies
+    /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#resetBCName>).
+    fn auxiliary_with_opener(&self) -> bool {
+        self.tabs
+            .opener(self.id)
+            .is_some_and(|opener| self.tabs.tab(opener).is_some())
+    }
+
+    /// The browsing-context state a mount carries when no document is
+    /// committed: the tab's name as it stands, with no reset.
+    fn current_tab_state(&self) -> renderer::TabState {
+        renderer::TabState {
+            name: self.tabs.name(self.id),
+            auxiliary_with_opener: self.auxiliary_with_opener(),
+            popup_sandbox: self.popup_sandbox,
+        }
+    }
+
+    /// The browsing-context state a mount at `url` carries: the tab's name
+    /// after the commit's target-name reset, the popup sandboxing flag set,
+    /// and whether the tab keeps its name across origins
+    /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#resetBCName>).
+    fn tab_state_at(&self, url: &Url) -> renderer::TabState {
+        let mut state = self.current_tab_state();
+        if !self.keeps_target_name_at(url) {
+            state.name.clear();
+        }
+        state
+    }
+
+    /// Whether committing a document at `url` keeps this tab's target name.
+    ///
+    /// A commit clears the name when the new document's origin differs from
+    /// the active document's, unless the tab is an auxiliary context with a
+    /// live opener
+    /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#resetBCName>).
+    ///
+    /// An `about:` document inherits the active document's origin rather than
+    /// deriving one from its own URL, so it never crosses one. A sandboxed
+    /// document's origin is opaque, and a fresh opaque origin is never
+    /// same-origin with the previous document's, so every sandboxed commit
+    /// crosses one
+    /// (<https://html.spec.whatwg.org/multipage/browsers.html#sandboxed-origin-browsing-context-flag>).
+    fn keeps_target_name_at(&self, url: &Url) -> bool {
+        if self.auxiliary_with_opener() || url.scheme() == "about" {
+            return true;
+        }
+        !self.popup_sandbox.origin_is_opaque() && url.origin() == self.document_origin
+    }
+
+    /// Records that the tab's active document is now at `url`, which is what
+    /// the next commit's target-name reset compares against
+    /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#resetBCName>).
+    ///
+    /// The name is not touched here: a browser-driven commit resolves it
+    /// before the mount, because the document's own scripts may rename the tab
+    /// while they run, and a renderer-driven commit is the renderer's to reset
+    /// and report.
+    fn advance_document_url(&mut self, url: Url) {
+        if url.scheme() != "about" {
+            self.document_origin = url.origin();
+        }
+        self.document_url = url;
+    }
+
+    /// Applies the target-name reset a browser-driven commit at `url` performs
+    /// and returns the browsing-context state its mount carries plus the name
+    /// [`Self::abort_commit`] restores if the mount fails.
+    ///
+    /// The registry is written *before* the mount runs the new document's
+    /// scripts, so a script that sets `window.name` there is reported after
+    /// this value and wins; resolving it after the mount would clobber the
+    /// script's name
+    /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#resetBCName>).
+    fn begin_commit(&mut self, url: &Url) -> (renderer::TabState, String) {
+        let previous = self.tabs.name(self.id);
+        let state = self.tab_state_at(url);
+        self.tabs.set_name(self.id, state.name.clone());
+        (state, previous)
+    }
+
+    /// Undoes [`Self::begin_commit`] when the navigation did not commit and the
+    /// previous document is still active.
+    fn abort_commit(&mut self, previous_name: String) {
+        self.tabs.set_name(self.id, previous_name);
     }
 
     fn launch_navigation(&mut self) {
@@ -1135,17 +1297,20 @@ impl Tab {
             init_scripts: self.init_scripts.clone(),
             ..outcome.head
         };
+        let (tab, previous_name) = self.begin_commit(&final_url);
         if let Err(error) = self
             .mount_stream(
                 &site,
                 Mount {
                     head,
+                    tab,
                     body: Vec::new(),
                 },
                 outcome.body,
             )
             .await
         {
+            self.abort_commit(previous_name);
             logging::error!(
                 target: "browser::tab",
                 "navigation mount failed for {}: {error}",
@@ -1155,7 +1320,7 @@ impl Tab {
             return false;
         }
         self.history = history;
-        self.document_url = final_url;
+        self.advance_document_url(final_url);
         let title = self.document_title().await;
         self.history.set_current_title(title);
         true
@@ -1169,7 +1334,7 @@ impl Tab {
             BrowserEvent::Navigated { url } => {
                 if let Ok(url) = Url::parse(url) {
                     self.history.navigate(url.clone(), None);
-                    self.document_url = url;
+                    self.advance_document_url(url);
                 }
                 self.document_loaded = false;
                 self.navigation_failed = false;
@@ -1268,13 +1433,14 @@ impl Tab {
     }
 }
 
-fn blank_mount() -> Mount {
+fn blank_mount(tab: renderer::TabState) -> Mount {
     Mount {
         head: ResponseHead::local(
             net::about_blank(),
             Some("text/html; charset=utf-8".to_owned()),
             None,
         ),
+        tab,
         body: b"<!doctype html><title></title>".to_vec(),
     }
 }

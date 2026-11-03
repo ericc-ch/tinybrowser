@@ -6,6 +6,8 @@
 
 use std::time::{Duration, Instant};
 
+use serde_json::json;
+
 use crate::fixture::{Fixture, TestServer, evaluate, ok, open_page, server};
 
 /// Serves one page that opens a browser-hosted popup, and returns the popup
@@ -48,7 +50,7 @@ fn a_cross_site_popup_sends_the_openers_origin_as_referrer() {
     assert!(head.contains("sec-fetch-site: cross-site"), "{head}");
     assert_eq!(
         evaluate(&mut client, &session, "window.__popup !== null"),
-        serde_json::json!(true),
+        json!(true),
         "with `noopener` absent the call returns a `WindowProxy`"
     );
 }
@@ -135,7 +137,7 @@ window.__first = window.open('http://localhost:{port}/first', "shared");
     );
     assert_eq!(
         evaluate(&mut client, &session, &second),
-        serde_json::json!(true),
+        json!(true),
         "the second call with the same name selects the first tab"
     );
     popup.wait_count("/second", 1);
@@ -174,7 +176,7 @@ fn opening_the_current_context_with_no_url_keeps_its_document() {
             &session,
             "[window.__self === window, window.__top === window, window.__marker, document.title].join(',')"
         ),
-        serde_json::json!("true,true,1,stay")
+        json!("true,true,1,stay")
     );
 }
 
@@ -245,7 +247,7 @@ fn a_sandbox_without_allow_popups_cannot_open_a_context_by_spelling() {
             &session,
             "window.__answers.slice().sort().join('|')"
         ),
-        serde_json::json!("allowed:true|refused,true,true,true|self:true")
+        json!("allowed:true|refused,true,true,true|self:true")
     );
     // The permitted frame's tab really navigated; the refused names issued no
     // request. A refused call would have started its request in the same task
@@ -304,7 +306,7 @@ parent.postMessage(String(window.open(URL.createObjectURL(blob), '_blank') === n
             &session,
             "window.__same_site !== null && window.__same_site.opener != null"
         ),
-        serde_json::json!(true),
+        json!(true),
         "a same-site blob keeps the opener"
     );
     // The iframe's blob is same-origin with the iframe and cross-site with the
@@ -314,11 +316,11 @@ parent.postMessage(String(window.open(URL.createObjectURL(blob), '_blank') === n
         &mut client,
         &session,
         "window.__cross_site_refused !== null",
-        &serde_json::json!(true),
+        &json!(true),
     );
     assert_eq!(
         evaluate(&mut client, &session, "window.__cross_site_refused"),
-        serde_json::json!("true"),
+        json!("true"),
         "a cross-site iframe's blob severs the opener"
     );
 }
@@ -345,7 +347,7 @@ fn wait_for_value(
 fn wait_for_answers(client: &mut cdp::Client, session: &str) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        if evaluate(client, session, "window.__answers.length") == serde_json::json!(3) {
+        if evaluate(client, session, "window.__answers.length") == json!(3) {
             return;
         }
         assert!(
@@ -354,4 +356,393 @@ fn wait_for_answers(client: &mut cdp::Client, session: &str) {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// A browser tab opened with a name reports it: the name is browsing-context
+/// state the browser owns, and a renderer cannot derive it from the response
+/// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-name>).
+#[test]
+fn a_browser_tab_reports_the_name_it_was_opened_with() {
+    let popup = TestServer::start(
+        vec![(
+            "/",
+            ok(
+                "text/html",
+                b"<!doctype html><script>fetch('/report?name=' + encodeURIComponent(window.name));</script>",
+            ),
+        )],
+        None,
+    );
+    let port = popup.address().port();
+    let (listener, address) = server();
+    let page =
+        format!("<!doctype html><script>window.open('http://localhost:{port}/', 'peer');</script>");
+    TestServer::serve_on(listener, vec![("/start", ok("text/html", page.as_bytes()))]);
+    let (_fixture, _client, _session) = open_page(
+        "tinybrowser-window-name",
+        &format!("http://127.0.0.1:{}/start", address.port()),
+    );
+    popup.wait("/report?name=peer");
+}
+
+/// A name a page assigns is what a later `window.open` from the group
+/// searches: the renderer reports the change, so the browser's name table is
+/// not limited to names given at creation
+/// (<https://html.spec.whatwg.org/multipage/document-sequences.html#the-rules-for-choosing-a-navigable>).
+#[test]
+fn a_name_a_page_sets_is_what_the_group_opens_again() {
+    let popup = TestServer::start(
+        vec![
+            (
+                "/one",
+                ok(
+                    "text/html",
+                    b"<!doctype html><script>window.name = 'later'; fetch('/ready');</script>",
+                ),
+            ),
+            ("/two", ok("text/html", b"<!doctype html>two")),
+        ],
+        None,
+    );
+    let port = popup.address().port();
+    let (listener, address) = server();
+    let page = format!(
+        "<!doctype html><script>\
+         window.__first = window.open('http://localhost:{port}/one', '_blank');\
+         </script>"
+    );
+    TestServer::serve_on(listener, vec![("/start", ok("text/html", page.as_bytes()))]);
+    let (_fixture, mut client, session) = open_page(
+        "tinybrowser-window-name",
+        &format!("http://127.0.0.1:{}/start", address.port()),
+    );
+    popup.wait("/ready");
+    let second = format!(
+        "window.__second = window.open('http://localhost:{port}/two', 'later');\
+         window.__second === window.__first"
+    );
+    assert_eq!(
+        evaluate(&mut client, &session, &second),
+        json!(true),
+        "the name the popup set selects that tab instead of opening a new one"
+    );
+    popup.wait("/two");
+    assert_eq!(
+        popup.history("/one").len(),
+        1,
+        "the reused tab was navigated, not replaced"
+    );
+}
+
+/// The popup that a named open creates keeps its name across a cross-origin
+/// navigation while its opener is live, and loses it when `noopener` severed
+/// the opener
+/// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#resetBCName>).
+#[test]
+fn a_popups_name_follows_the_opener_it_was_opened_with() {
+    for (features, first_name, second_name) in [("", "peer", "peer"), ("noopener", "", "")] {
+        let second = TestServer::start(
+            vec![(
+                "/second",
+                ok(
+                    "text/html",
+                    b"<!doctype html><script>fetch('/report?name=' + encodeURIComponent(window.name));</script>",
+                ),
+            )],
+            None,
+        );
+        let second_port = second.address().port();
+        // The first document reports the name the open gave it and navigates
+        // to another origin only once the report has been sent: an in-flight
+        // fetch is aborted by the navigation that follows it.
+        let first_page = format!(
+            "<!doctype html><script>\
+             fetch('/first?name=' + encodeURIComponent(window.name)).then(function () {{\
+               location.href = 'http://localhost:{second_port}/second';\
+             }});\
+             </script>"
+        );
+        let first = TestServer::start(
+            vec![("/first", ok("text/html", first_page.as_bytes()))],
+            None,
+        );
+        let first_port = first.address().port();
+        let (listener, address) = server();
+        let page = format!(
+            "<!doctype html><script>\
+             window.open('http://localhost:{first_port}/first', 'peer', {features:?});\
+             </script>"
+        );
+        TestServer::serve_on(listener, vec![("/start", ok("text/html", page.as_bytes()))]);
+        let (_fixture, _client, _session) = open_page(
+            "tinybrowser-window-name",
+            &format!("http://127.0.0.1:{}/start", address.port()),
+        );
+        first.wait(&format!("/first?name={first_name}"));
+        // The second document is another origin, so the reset decides.
+        second.wait("/second");
+        second.wait(&format!("/report?name={second_name}"));
+    }
+}
+
+/// A sandboxed document's popup keeps the inherited flag set in the browser
+/// tab it becomes: an opaque origin, no storage, and no top-level navigation
+/// after the popup commits a document of its own
+/// (<https://html.spec.whatwg.org/multipage/browsers.html#popup-sandboxing-flag-set>).
+#[test]
+fn a_sandboxed_popup_inherits_its_flags_in_the_browser_tab() {
+    let popup = TestServer::start(
+        vec![(
+            "/",
+            ok(
+                "text/html",
+                b"<!doctype html><script>\
+                  let storage = 'ok';\
+                  try { localStorage.setItem('k', 'v'); } catch (error) { storage = error.name; }\
+                  fetch('/report?origin=' + encodeURIComponent(window.origin) + '&storage=' + storage);\
+                  </script>",
+            ),
+        )],
+        None,
+    );
+    let port = popup.address().port();
+    let (listener, address) = server();
+    let page = format!(
+        "<!doctype html><iframe sandbox=\"allow-scripts allow-popups\" \
+         srcdoc=\"<script>window.open('http://localhost:{port}/', '_blank')</script>\"></iframe>"
+    );
+    TestServer::serve_on(listener, vec![("/start", ok("text/html", page.as_bytes()))]);
+    let (_fixture, _client, _session) = open_page(
+        "tinybrowser-window-sandbox",
+        &format!("http://127.0.0.1:{}/start", address.port()),
+    );
+    popup.wait("/report?origin=null&storage=SecurityError");
+}
+
+/// `allow-popups-to-escape-sandbox` is the one keyword that keeps the popup
+/// out of the opener's flag set, so the tab starts unsandboxed
+/// (<https://html.spec.whatwg.org/multipage/browsers.html#sandbox-propagates-to-auxiliary-browsing-contexts-flag>).
+#[test]
+fn an_escaping_sandbox_popup_starts_unsandboxed() {
+    let popup = TestServer::start(
+        vec![(
+            "/",
+            ok(
+                "text/html",
+                b"<!doctype html><script>\
+                  let storage = 'ok';\
+                  try { localStorage.setItem('k', 'v'); } catch (error) { storage = error.name; }\
+                  fetch('/report?origin=' + encodeURIComponent(window.origin) + '&storage=' + storage);\
+                  </script>",
+            ),
+        )],
+        None,
+    );
+    let port = popup.address().port();
+    let (listener, address) = server();
+    let page = format!(
+        "<!doctype html><iframe sandbox=\"allow-scripts allow-popups allow-popups-to-escape-sandbox\" \
+         srcdoc=\"<script>window.open('http://localhost:{port}/', '_blank')</script>\"></iframe>"
+    );
+    TestServer::serve_on(listener, vec![("/start", ok("text/html", page.as_bytes()))]);
+    let (_fixture, _client, _session) = open_page(
+        "tinybrowser-window-sandbox",
+        &format!("http://127.0.0.1:{}/start", address.port()),
+    );
+    let expected = format!("/report?origin=http%3A%2F%2Flocalhost%3A{port}&storage=ok");
+    popup.wait(&expected);
+}
+
+/// A renderer-hosted popup keeps the opener's flag set after its first
+/// navigation: the popup sandboxing flag set belongs to the browsing context,
+/// so the `about:blank` it starts on is not the only sandboxed document
+/// (<https://html.spec.whatwg.org/multipage/browsers.html#popup-sandboxing-flag-set>).
+#[test]
+fn a_renderer_hosted_popup_keeps_its_flags_after_a_navigation() {
+    let (listener, address) = server();
+    let next = "<!doctype html><script>\
+        try { opener.top.location.href = '/hijacked'; } catch (error) {}\
+        setTimeout(function () { fetch('/report?attempted=1'); }, 0);\
+        </script>";
+    let page = "<!doctype html><iframe sandbox=\"allow-scripts allow-popups allow-same-origin\" \
+        srcdoc=\"<script>window.open('/next', '_blank')</script>\"></iframe>";
+    let pages = TestServer::serve_on(
+        listener,
+        vec![
+            ("/start", ok("text/html", page.as_bytes())),
+            ("/next", ok("text/html", next.as_bytes())),
+            ("/hijacked", ok("text/html", b"<!doctype html>hijacked")),
+        ],
+    );
+    let (_fixture, _client, _session) = open_page(
+        "tinybrowser-window-sandbox",
+        &format!("http://127.0.0.1:{}/start", address.port()),
+    );
+    // The sentinel is requested after the navigation attempt, so its arrival
+    // proves the attempt really happened.
+    pages.wait("/report?attempted=1");
+    assert!(
+        !pages.requested("/hijacked"),
+        "a sandboxed popup without `allow-top-navigation` cannot navigate its opener's top level"
+    );
+}
+
+/// A name a page sets in a browser tab is cleared when that tab navigates
+/// itself to another origin without a live opener, and the browser hears about
+/// the reset too
+/// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#resetBCName>).
+#[test]
+fn a_scripted_name_does_not_survive_a_cross_origin_navigation() {
+    let second = TestServer::start(
+        vec![(
+            "/second",
+            ok(
+                "text/html",
+                b"<!doctype html><script>fetch('/report?name=' + encodeURIComponent(window.name));</script>",
+            ),
+        )],
+        None,
+    );
+    let second_port = second.address().port();
+    let first_page = format!(
+        "<!doctype html><script>\
+         window.name = 'later';\
+         fetch('/first?name=' + encodeURIComponent(window.name)).then(function () {{\
+           location.href = 'http://localhost:{second_port}/second';\
+         }});\
+         </script>"
+    );
+    let first = TestServer::start(
+        vec![("/first", ok("text/html", first_page.as_bytes()))],
+        None,
+    );
+    let first_port = first.address().port();
+    let (listener, address) = server();
+    let page = format!(
+        "<!doctype html><script>\
+         window.open('http://localhost:{first_port}/first', '_blank', 'noopener');\
+         </script>"
+    );
+    TestServer::serve_on(listener, vec![("/start", ok("text/html", page.as_bytes()))]);
+    let (_fixture, _client, _session) = open_page(
+        "tinybrowser-window-name",
+        &format!("http://127.0.0.1:{}/start", address.port()),
+    );
+    first.wait("/first?name=later");
+    second.wait("/second");
+    second.wait("/report?name=");
+}
+
+/// A sandboxed browser-tab popup stays sandboxed after a navigation the
+/// renderer performs itself: the popup sandboxing flag set belongs to the
+/// browsing context, and `location.href` is not a mount from the browser
+/// (<https://html.spec.whatwg.org/multipage/browsers.html#popup-sandboxing-flag-set>).
+#[test]
+fn a_sandboxed_popup_stays_sandboxed_after_its_own_navigation() {
+    let popup = TestServer::start(
+        vec![
+            (
+                "/start",
+                ok(
+                    "text/html",
+                    b"<!doctype html><script>\
+                      fetch('/step').then(function () { location.href = '/next'; });\
+                      </script>",
+                ),
+            ),
+            (
+                "/next",
+                ok(
+                    "text/html",
+                    b"<!doctype html><script>\
+                      let storage = 'ok';\
+                      try { localStorage.setItem('k', 'v'); } catch (error) { storage = error.name; }\
+                      fetch('/report?origin=' + encodeURIComponent(window.origin) + '&storage=' + storage);\
+                      </script>",
+                ),
+            ),
+        ],
+        None,
+    );
+    let port = popup.address().port();
+    let (listener, address) = server();
+    let page = format!(
+        "<!doctype html><iframe sandbox=\"allow-scripts allow-popups\" \
+         srcdoc=\"<script>window.open('http://localhost:{port}/start', '_blank')</script>\"></iframe>"
+    );
+    TestServer::serve_on(listener, vec![("/start", ok("text/html", page.as_bytes()))]);
+    let (_fixture, _client, _session) = open_page(
+        "tinybrowser-window-sandbox",
+        &format!("http://127.0.0.1:{}/start", address.port()),
+    );
+    popup.wait("/step");
+    popup.wait("/next");
+    popup.wait("/report?origin=null&storage=SecurityError");
+}
+
+/// A name the new document sets wins over the name its own mount carried: the
+/// browser resolves the commit's reset before the document runs, so it cannot
+/// overwrite what the page already reported
+/// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#resetBCName>).
+#[test]
+fn a_name_the_new_document_sets_survives_its_mount() {
+    let popup = TestServer::start(
+        vec![
+            (
+                "/first",
+                ok(
+                    "text/html",
+                    b"<!doctype html><script>\
+                      window.name = 'chosen';\
+                      fetch('/first?name=' + encodeURIComponent(window.name));\
+                      </script>",
+                ),
+            ),
+            (
+                "/second",
+                ok(
+                    "text/html",
+                    b"<!doctype html><script>fetch('/report?name=' + encodeURIComponent(window.name));</script>",
+                ),
+            ),
+        ],
+        None,
+    );
+    let port = popup.address().port();
+    let (listener, address) = server();
+    let page = format!(
+        "<!doctype html><script>\
+         window.open('http://localhost:{port}/first', '_blank', 'noopener');\
+         </script>"
+    );
+    TestServer::serve_on(listener, vec![("/start", ok("text/html", page.as_bytes()))]);
+    let (_fixture, mut client, _session) = open_page(
+        "tinybrowser-window-name",
+        &format!("http://127.0.0.1:{}/start", address.port()),
+    );
+    popup.wait("/first?name=chosen");
+    // Navigate the popup from the browser, which mounts the next document and
+    // therefore carries the name the browser kept.
+    let first = format!("http://localhost:{port}/first");
+    let targets = client
+        .call("Target.getTargets", &json!({}), None)
+        .expect("targets");
+    let target_id = targets["targetInfos"]
+        .as_array()
+        .expect("target list")
+        .iter()
+        .find(|target| target["url"].as_str() == Some(first.as_str()))
+        .and_then(|target| target["targetId"].as_str())
+        .expect("the popup target")
+        .to_owned();
+    let popup_session = crate::fixture::attach(&mut client, &target_id);
+    client
+        .call(
+            "Page.navigate",
+            &json!({"url": format!("http://localhost:{port}/second")}),
+            Some(&popup_session),
+        )
+        .expect("navigate the popup");
+    popup.wait("/second");
+    popup.wait("/report?name=chosen");
 }

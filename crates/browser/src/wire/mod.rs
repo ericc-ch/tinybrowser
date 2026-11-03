@@ -219,6 +219,8 @@ pub struct ResponseStart {
     pub frame: FrameId,
     /// The response head the document installs.
     pub head: renderer::ResponseHead,
+    /// The browsing-context state the tab gives the document it installs.
+    pub tab: renderer::TabState,
 }
 
 /// One renderer-originated browser-service call.
@@ -389,10 +391,20 @@ pub enum BrowsingContextCall {
         /// again because it is the trust boundary
         /// (<https://html.spec.whatwg.org/multipage/browsers.html#sandboxed-auxiliary-navigation-browsing-context-flag>).
         allow_popups: bool,
+        /// The calling document's popup sandboxing flag set, which every
+        /// document in the new tab inherits
+        /// (<https://html.spec.whatwg.org/multipage/browsers.html#popup-sandboxing-flag-set>).
+        popup_sandbox: renderer::SandboxFlags,
     },
     /// The browser tab this tab's browsing context group holds under a name.
     WindowByName {
         /// The name to look up.
+        name: String,
+    },
+    /// The calling tab's target name changed
+    /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-name>).
+    WindowName {
+        /// The tab's new name, empty after a cross-origin reset.
         name: String,
     },
     /// Navigates a browser tab a name already selected.
@@ -498,6 +510,7 @@ impl ServiceReply {
             | ServiceCall::BrowsingContext(
                 BrowsingContextCall::WindowClose { .. }
                 | BrowsingContextCall::WindowMessage { .. }
+                | BrowsingContextCall::WindowName { .. }
                 | BrowsingContextCall::WindowNavigate { .. },
             ) => ServiceReply::Unit,
             ServiceCall::Storage(StorageCall::Get { .. })

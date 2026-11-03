@@ -448,7 +448,7 @@ impl ResponseStreams {
         if self.active.contains_key(&id) {
             return Err(stream_error("duplicate response start"));
         }
-        engine.open_body(response.frame, &response.head)?;
+        engine.open_body(response.frame, &response.head, &response.tab)?;
         self.active.insert(
             id,
             ActiveResponse {

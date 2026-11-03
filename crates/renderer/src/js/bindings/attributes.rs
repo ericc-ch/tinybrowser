@@ -214,7 +214,7 @@ impl<'js> dom_token_list_generated::DOMTokenList<'js> for JsTokenList {
             ));
         }
         let token = token.to_string()?;
-        Ok(crate::js::world::SandboxFlags::supports(&token))
+        Ok(crate::protocol::SandboxFlags::supports(&token))
     }
 }
 

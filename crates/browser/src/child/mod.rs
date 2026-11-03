@@ -444,6 +444,7 @@ impl BrowsingContextHost for HostServices {
         opener: OpenerPolicy,
         source: &renderer::NavigationSource,
         allow_popups: bool,
+        popup_sandbox: renderer::SandboxFlags,
     ) -> Option<WindowId> {
         match self.call(ServiceCall::BrowsingContext(
             BrowsingContextCall::WindowOpen {
@@ -452,6 +453,7 @@ impl BrowsingContextHost for HostServices {
                 opener,
                 source: source.clone(),
                 allow_popups,
+                popup_sandbox,
             },
         )) {
             Some(ServiceReply::Window(tab)) => tab,
@@ -468,6 +470,14 @@ impl BrowsingContextHost for HostServices {
             Some(ServiceReply::Window(tab)) => tab,
             _ => None,
         }
+    }
+
+    fn set_window_name(&self, name: &str) {
+        let _result = self.call(ServiceCall::BrowsingContext(
+            BrowsingContextCall::WindowName {
+                name: name.to_owned(),
+            },
+        ));
     }
 
     fn window_navigate(

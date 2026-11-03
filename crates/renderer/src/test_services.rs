@@ -83,6 +83,7 @@ impl BrowsingContextHost for NullServices {
         _opener: crate::protocol::OpenerPolicy,
         _source: &crate::protocol::NavigationSource,
         _allow_popups: bool,
+        _popup_sandbox: crate::protocol::SandboxFlags,
     ) -> Option<crate::protocol::WindowId> {
         None
     }
@@ -90,6 +91,8 @@ impl BrowsingContextHost for NullServices {
     fn window_by_name(&self, _name: &str) -> Option<crate::protocol::WindowId> {
         None
     }
+
+    fn set_window_name(&self, _name: &str) {}
 
     fn window_navigate(
         &self,

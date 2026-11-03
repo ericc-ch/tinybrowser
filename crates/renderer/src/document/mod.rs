@@ -158,7 +158,7 @@ pub(crate) enum DialContext {
         /// active set impose. They take effect when the response commits, not
         /// when the navigation starts
         /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#determine-navigation-params>).
-        sandbox: crate::js::world::SandboxFlags,
+        sandbox: crate::protocol::SandboxFlags,
     },
     /// A Blitz subresource (stylesheet, image, font) fetch. Its record waits
     /// in [`Document::blitz_requests`] under this id; delivery hands Blitz its
@@ -261,7 +261,7 @@ pub(crate) struct LocalDocumentState {
     pub(crate) referrer_url: Url,
     pub(crate) origin: url::Origin,
     pub(crate) policy: PolicyContainer,
-    pub(crate) sandbox: crate::js::world::SandboxFlags,
+    pub(crate) sandbox: crate::protocol::SandboxFlags,
 }
 
 struct Timer {
@@ -410,7 +410,7 @@ fn materialize_auxiliary_document(
         let world_handle = document.world();
         let mut world = world_handle.borrow_mut();
         world.policy = policy;
-        world.sandbox = sandbox;
+        world.install_sandbox(sandbox);
     }
     let origin = if sandbox.origin_is_opaque() {
         url::Origin::new_opaque()
@@ -433,7 +433,7 @@ fn materialize_auxiliary_document(
 pub(crate) fn sandboxing_flags(
     world_rc: &Rc<RefCell<World>>,
     container: crate::dom::tree::NodeId,
-) -> crate::js::world::SandboxFlags {
+) -> crate::protocol::SandboxFlags {
     let world = world_rc.borrow();
     let Some(parsed) = world.document(container) else {
         return world.sandbox;
@@ -443,7 +443,7 @@ pub(crate) fn sandboxing_flags(
         return world.sandbox;
     }
     let attribute = crate::dom::tree::attr(base, container.node, "sandbox");
-    crate::js::world::SandboxFlags::parse(attribute).union(world.sandbox)
+    crate::protocol::SandboxFlags::parse(attribute).union(world.sandbox)
 }
 
 /// One parse-time step over a document's element tree, in tree order.
@@ -515,6 +515,14 @@ pub(crate) struct Document {
     style_policies: HashMap<String, net::ReferrerPolicy>,
     /// The browsing context this document belongs to.
     frame: FrameId,
+    /// Whether this frame has committed a document since its engine started.
+    ///
+    /// The target-name reset compares the new document's origin with the
+    /// *active* document's, and a frame's first document has no predecessor to
+    /// compare against: a tab's first mount carries the name the browser
+    /// already resolved
+    /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#resetBCName>).
+    committed: bool,
     /// The frame's persistent viewport in device pixels (the scale is fixed
     /// at 1, so device and CSS pixels coincide). CDP emulation and every
     /// document mount use it, so Blitz layout, the painted size, and
@@ -838,6 +846,7 @@ impl Document {
             subresource_bytes: HashMap::new(),
             style_policies: HashMap::new(),
             frame,
+            committed: false,
             viewport_size: crate::engine::DEFAULT_VIEWPORT,
             shared: Rc::clone(&runtime.shared),
             url: document_url,
@@ -1126,7 +1135,7 @@ impl Document {
         // A traversed-to entry is always a document the frame navigated to,
         // never the blank created at insertion.
         self.initial_blank = false;
-        self.world.borrow_mut().sandbox = state.sandbox;
+        self.world.borrow_mut().install_sandbox(state.sandbox);
         if let Some(markup) = srcdoc {
             let base = state.base_url.as_ref().unwrap_or(&state.url);
             self.load_frame_srcdoc(
@@ -1324,7 +1333,7 @@ impl Document {
         embedder: Option<FrameId>,
         mut req: crate::protocol::DialRequest,
         ancestors: Vec<Url>,
-        sandbox: crate::js::world::SandboxFlags,
+        sandbox: crate::protocol::SandboxFlags,
     ) {
         req.delivery = crate::protocol::BodyDelivery::Buffer;
         self.dials.cancel_frame_loads();
@@ -1530,12 +1539,49 @@ impl Document {
         self.url = url;
     }
 
-    /// Commits a new document at `url`: writes the URL and captured origin. A
+    /// Commits a new document at `url`: writes the URL and captured origin,
+    /// and applies the target-name reset a navigation commit performs. A
     /// same-document history update keeps the secure-context bit its document
     /// already has
     /// (<https://html.spec.whatwg.org/multipage/webappapis.html#secure-contexts>).
+    ///
+    /// The reset has two owners by construction. A commit the browser drives
+    /// arrives as a mount, and the browser resolves the name against the
+    /// document it is replacing, which this renderer may never have hosted; a
+    /// commit this renderer drives has no browser step at all, so this is the
+    /// only place that can clear the name before the new document's scripts run
+    /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#resetBCName>).
+    /// A frame's first document in this renderer is always the former, which
+    /// is what [`Self::committed`] skips.
     fn commit_document_url(&mut self, url: Url, origin: Option<url::Origin>) {
+        let new_origin = origin.clone().unwrap_or_else(|| url.origin());
+        let frame = self.frame;
+        let previous = self.world.borrow().origin.clone();
+        let first_document = !self.committed;
+        self.committed = true;
         self.set_document_url(url, origin);
+        if first_document {
+            return;
+        }
+        // The reset compares the new document's origin with the *active*
+        // document's, so the old origin is captured before this write replaces
+        // it
+        // (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#resetBCName>).
+        let cleared = self
+            .world
+            .borrow()
+            .shared()
+            .borrow_mut()
+            .tree
+            .reset_name_on_cross_origin_navigation(frame, previous == new_origin);
+        if cleared && frame == FrameId::MAIN {
+            // The tab's name is what `window.open` searches across tabs and
+            // what a later mount carries, so the browser has to hear about a
+            // reset it did not perform itself. The call is synchronous, so no
+            // world borrow may be live while it runs.
+            let services = self.world.borrow().runtime.services.clone();
+            services.set_window_name("");
+        }
     }
 
     fn apply_document_url_same_origin(&mut self, url: &str) {
@@ -1818,7 +1864,38 @@ impl Document {
     pub(crate) fn mount(&mut self, mount: &Mount) {
         self.set_history(&mount.head.history);
         self.set_document_referrer(None);
+        self.install_tab_state(&mount.tab);
         self.install_response(&mount.head, &mount.body, None);
+    }
+
+    /// Seeds the browsing-context state the browser owns for this tab: its
+    /// target name, whether it keeps that name across origins, and the popup
+    /// sandboxing flag set every document it installs inherits.
+    ///
+    /// The flag set is stored in the frame tree, not only on this document:
+    /// every commit of the tab's top-level context unions it again, so a
+    /// navigation this renderer performs itself cannot install an unsandboxed
+    /// document
+    /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-name>,
+    /// <https://html.spec.whatwg.org/multipage/browsers.html#popup-sandboxing-flag-set>).
+    pub(crate) fn install_tab_state(&mut self, tab: &crate::protocol::TabState) {
+        debug_assert_eq!(
+            self.frame,
+            FrameId::MAIN,
+            "a tab's browsing-context state belongs to its top-level document"
+        );
+        let frame = self.frame;
+        {
+            let world = self.world.borrow();
+            let shared = world.shared();
+            let mut shared = shared.borrow_mut();
+            shared.tree.set_name(frame, tab.name.clone());
+            shared
+                .tree
+                .set_main_auxiliary_with_opener(tab.auxiliary_with_opener);
+            shared.tree.set_popup_sandbox(frame, tab.popup_sandbox);
+        }
+        self.world.borrow_mut().install_sandbox(tab.popup_sandbox);
     }
 
     /// Opens a parse on `input`, taking ownership of the input stream.
@@ -3347,7 +3424,7 @@ impl Document {
                     // The flags enter the frame with the document they
                     // govern, so a failed or cancelled navigation leaves the
                     // current document under its own flags.
-                    self.world.borrow_mut().sandbox = sandbox;
+                    self.world.borrow_mut().install_sandbox(sandbox);
                     self.commit_frame_response(&outcome, &url, embedder, &ancestors);
                 }
             }
@@ -3727,7 +3804,7 @@ impl Document {
                 .world
                 .borrow()
                 .sandbox
-                .contains(crate::js::world::SandboxFlag::AutomaticFeatures)
+                .contains(crate::protocol::SandboxFlag::AutomaticFeatures)
         {
             return;
         }

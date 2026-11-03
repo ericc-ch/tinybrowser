@@ -14,7 +14,7 @@ use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
 use crate::dom::tree::NodeId;
-use crate::protocol::{FrameId, TargetName};
+use crate::protocol::{FrameId, SandboxFlags, TargetName};
 
 /// Handle every realm of one page engine holds to its shared state.
 pub(crate) type SharedHandle = Rc<RefCell<Shared>>;
@@ -72,6 +72,20 @@ pub(crate) struct FrameTree {
     /// Browsing context names (`window.name`)
     /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-name>).
     names: HashMap<FrameId, String>,
+    /// Each top-level context's popup sandboxing flag set: the main frame's
+    /// for a tab the browser hosts, an auxiliary context's otherwise. It is
+    /// the opener's active set at creation, which every document the context
+    /// commits inherits until the context dies
+    /// (<https://html.spec.whatwg.org/multipage/browsers.html#popup-sandboxing-flag-set>).
+    popup_sandbox: HashMap<FrameId, SandboxFlags>,
+    /// Whether the tab's main frame is an auxiliary browsing context whose
+    /// opener is non-null, which keeps its target name across a navigation to
+    /// another origin
+    /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#resetBCName>).
+    ///
+    /// The main frame has no [`FrameOrigin`] entry, and only the browser knows
+    /// how the tab was opened, so the mount supplies this.
+    main_auxiliary_with_opener: bool,
 }
 
 impl FrameTree {
@@ -104,8 +118,17 @@ impl FrameTree {
 
     /// Adds `child` as an auxiliary top-level context opened by `opener`
     /// (<https://html.spec.whatwg.org/multipage/document-sequences.html#creating-a-new-auxiliary-browsing-context>).
-    /// `opener_visible` reports whether `window.opener` links the two.
-    pub(crate) fn add_auxiliary(&mut self, opener: FrameId, child: FrameId, opener_visible: bool) {
+    /// `opener_visible` reports whether `window.opener` links the two, and
+    /// `sandbox` is the popup sandboxing flag set the context gives every
+    /// document it commits
+    /// (<https://html.spec.whatwg.org/multipage/browsers.html#popup-sandboxing-flag-set>).
+    pub(crate) fn add_auxiliary(
+        &mut self,
+        opener: FrameId,
+        child: FrameId,
+        opener_visible: bool,
+        sandbox: SandboxFlags,
+    ) {
         self.origins.insert(
             child,
             FrameOrigin::Auxiliary {
@@ -114,6 +137,29 @@ impl FrameTree {
             },
         );
         self.names.entry(child).or_default();
+        self.set_popup_sandbox(child, sandbox);
+    }
+
+    /// The popup sandboxing flag set of `frame`: empty for a child navigable,
+    /// whose flags come from its container and embedder instead, and the
+    /// opener's active set for every top-level context web content opened
+    /// (<https://html.spec.whatwg.org/multipage/browsers.html#determining-the-creation-sandboxing-flags>).
+    pub(crate) fn popup_sandbox(&self, frame: FrameId) -> SandboxFlags {
+        self.popup_sandbox
+            .get(&frame)
+            .copied()
+            .unwrap_or_else(SandboxFlags::empty)
+    }
+
+    /// Records the popup sandboxing flag set a top-level context imposes on
+    /// every document it commits. An empty set drops the entry, so a mount
+    /// that replaces a tab's flags cannot leave the old set behind.
+    pub(crate) fn set_popup_sandbox(&mut self, frame: FrameId, sandbox: SandboxFlags) {
+        if sandbox == SandboxFlags::empty() {
+            self.popup_sandbox.remove(&frame);
+        } else {
+            self.popup_sandbox.insert(frame, sandbox);
+        }
     }
 
     /// Re-sorts an existing child before `before` (or last when `None`)
@@ -148,6 +194,56 @@ impl FrameTree {
         self.names.insert(frame, name);
     }
 
+    /// Records whether the tab's main frame is an auxiliary context with a
+    /// live opener, which decides whether a cross-origin navigation clears the
+    /// tab's name
+    /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#resetBCName>).
+    pub(crate) fn set_main_auxiliary_with_opener(&mut self, auxiliary: bool) {
+        self.main_auxiliary_with_opener = auxiliary;
+    }
+
+    /// Applies the target-name reset a document commit performs: a top-level
+    /// context that commits a document from another origin clears its name,
+    /// unless it is an auxiliary context with a live opener.
+    ///
+    /// A child navigable keeps its name: it has a parent, and its name is the
+    /// `iframe`'s `name` attribute's, not a target name it chose
+    /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#resetBCName>).
+    ///
+    /// Returns whether a non-empty name went away, so the caller can tell the
+    /// browser that the tab's cross-tab lookup no longer answers to it.
+    pub(crate) fn reset_name_on_cross_origin_navigation(
+        &mut self,
+        frame: FrameId,
+        same_origin: bool,
+    ) -> bool {
+        if same_origin || self.keeps_name_across_origins(frame) {
+            return false;
+        }
+        self.names
+            .remove(&frame)
+            .is_some_and(|name| !name.is_empty())
+    }
+
+    /// Whether `frame` keeps its target name when it commits a document from
+    /// another origin.
+    fn keeps_name_across_origins(&self, frame: FrameId) -> bool {
+        match self.origins.get(&frame) {
+            Some(FrameOrigin::Container { .. }) => true,
+            // The exemption is the opener browsing context being non-null, so
+            // a context whose opener has since been destroyed no longer
+            // qualifies
+            // (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#resetBCName>).
+            Some(FrameOrigin::Auxiliary {
+                opener,
+                opener_visible,
+            }) => *opener_visible && self.is_alive(*opener),
+            // The main frame is a top-level context; only the browser knows
+            // whether it is an auxiliary one with a live opener.
+            None => self.main_auxiliary_with_opener,
+        }
+    }
+
     /// Removes one frame and returns how it came to exist.
     pub(crate) fn remove(&mut self, child: FrameId) -> Option<FrameOrigin> {
         let origin = self.origins.remove(&child)?;
@@ -159,6 +255,7 @@ impl FrameTree {
         }
         self.children.remove(&child);
         self.names.remove(&child);
+        self.popup_sandbox.remove(&child);
         Some(origin)
     }
 
@@ -829,7 +926,7 @@ impl Shared {
 mod tests {
     use super::{FrameTree, TargetName};
     use crate::dom::tree::NodeId;
-    use crate::protocol::FrameId;
+    use crate::protocol::{FrameId, SandboxFlags};
 
     /// The tree every case reads, as `(parent, child)` edges and the names the
     /// frames carry. Frames are `1` (top) with children `2` and `3`, `2` with
@@ -900,7 +997,7 @@ mod tests {
     fn an_auxiliary_context_is_its_own_top_level_and_is_found_by_name() {
         let mut tree = tree();
         let popup = FrameId::new(9);
-        tree.add_auxiliary(FrameId::new(1), popup, true);
+        tree.add_auxiliary(FrameId::new(1), popup, true, SandboxFlags::empty());
         tree.set_name(popup, "popup".to_owned());
         // The name lookup and `_top` resolution prove the auxiliary is in the
         // browsing context group and is its own top-level traversable; the
@@ -923,7 +1020,7 @@ mod tests {
     fn a_noopener_auxiliary_hides_its_opener_but_stays_navigable() {
         let mut tree = tree();
         let popup = FrameId::new(9);
-        tree.add_auxiliary(FrameId::new(1), popup, false);
+        tree.add_auxiliary(FrameId::new(1), popup, false, SandboxFlags::empty());
         tree.set_name(popup, "popup".to_owned());
         assert_eq!(tree.opener(popup), None);
         assert_eq!(tree.auxiliary_opener(popup), Some(FrameId::new(1)));
@@ -931,5 +1028,114 @@ mod tests {
             tree.choose_navigable(&TargetName::parse("popup"), FrameId::new(4)),
             Some(popup)
         );
+    }
+
+    /// A top-level context clears its target name when it commits a document
+    /// from another origin, and keeps it when the origins match
+    /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#resetBCName>).
+    #[test]
+    fn a_cross_origin_commit_clears_a_top_level_name() {
+        let mut tree = tree();
+        tree.set_name(FrameId::MAIN, "shared".to_owned());
+        assert!(!tree.reset_name_on_cross_origin_navigation(FrameId::MAIN, true));
+        assert_eq!(tree.name(FrameId::MAIN), "shared");
+        assert!(tree.reset_name_on_cross_origin_navigation(FrameId::MAIN, false));
+        assert_eq!(tree.name(FrameId::MAIN), "");
+    }
+
+    /// An auxiliary context with a live opener is the one top-level exception:
+    /// the name survives a cross-origin commit. Without the opener, or after
+    /// the opener is gone, the reset applies
+    /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#resetBCName>).
+    #[test]
+    fn an_auxiliary_context_keeps_its_name_only_while_its_opener_is_live() {
+        let mut tree = tree();
+        let with_opener = FrameId::new(9);
+        let without_opener = FrameId::new(10);
+        let orphan = FrameId::new(11);
+        tree.add_auxiliary(FrameId::MAIN, with_opener, true, SandboxFlags::empty());
+        tree.add_auxiliary(FrameId::MAIN, without_opener, false, SandboxFlags::empty());
+        tree.add_auxiliary(FrameId::new(2), orphan, true, SandboxFlags::empty());
+        tree.set_name(with_opener, "kept".to_owned());
+        tree.set_name(without_opener, "cleared".to_owned());
+        tree.set_name(orphan, "orphan".to_owned());
+        assert!(!tree.reset_name_on_cross_origin_navigation(with_opener, false));
+        assert_eq!(tree.name(with_opener), "kept");
+        assert!(tree.reset_name_on_cross_origin_navigation(without_opener, false));
+        assert_eq!(tree.name(without_opener), "");
+        // The exemption is the opener browsing context being non-null, so a
+        // context whose opener has since been destroyed no longer qualifies.
+        tree.remove(FrameId::new(2));
+        assert!(tree.reset_name_on_cross_origin_navigation(orphan, false));
+        assert_eq!(tree.name(orphan), "");
+    }
+
+    /// A child navigable has a parent, so the reset never applies to it: its
+    /// name is the `iframe`'s `name` attribute's
+    /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#resetBCName>).
+    #[test]
+    fn a_child_navigable_keeps_its_name_across_origins() {
+        let mut tree = tree();
+        tree.set_name(FrameId::new(2), "frame".to_owned());
+        assert!(!tree.reset_name_on_cross_origin_navigation(FrameId::new(2), false));
+        assert_eq!(tree.name(FrameId::new(2)), "frame");
+    }
+
+    /// The main frame is a top-level context too, and the mount decides
+    /// whether the tab behind it is an auxiliary one with a live opener.
+    #[test]
+    fn the_main_frame_name_clears_unless_the_tab_keeps_it() {
+        let mut tree = tree();
+        tree.set_name(FrameId::new(1), "tab".to_owned());
+        tree.set_main_auxiliary_with_opener(true);
+        assert!(!tree.reset_name_on_cross_origin_navigation(FrameId::new(1), false));
+        assert_eq!(tree.name(FrameId::new(1)), "tab");
+        tree.set_main_auxiliary_with_opener(false);
+        assert!(tree.reset_name_on_cross_origin_navigation(FrameId::new(1), false));
+        assert_eq!(tree.name(FrameId::new(1)), "");
+    }
+
+    /// A name the frame does not have is not a change, so the caller never
+    /// tells the browser the tab was renamed when it was not.
+    #[test]
+    fn clearing_an_absent_name_reports_no_change() {
+        let mut tree = tree();
+        assert!(!tree.reset_name_on_cross_origin_navigation(FrameId::new(1), false));
+        tree.set_name(FrameId::new(1), String::new());
+        assert!(!tree.reset_name_on_cross_origin_navigation(FrameId::new(1), false));
+    }
+
+    /// An auxiliary context's popup set is created with it and dies with it.
+    #[test]
+    fn the_popup_sandboxing_flag_set_belongs_to_the_auxiliary_context() {
+        let mut tree = FrameTree::default();
+        let sandbox = SandboxFlags::parse(Some("allow-scripts allow-popups"));
+        tree.add_auxiliary(FrameId::MAIN, FrameId::new(9), true, sandbox);
+        assert_eq!(tree.popup_sandbox(FrameId::new(9)), sandbox);
+        assert_eq!(
+            tree.popup_sandbox(FrameId::new(10)),
+            SandboxFlags::empty(),
+            "a frame that is not the context has none"
+        );
+        tree.remove(FrameId::new(9));
+        assert_eq!(
+            tree.popup_sandbox(FrameId::new(9)),
+            SandboxFlags::empty(),
+            "removing the context drops its set"
+        );
+    }
+
+    /// A tab the browser hosts has no origin entry of its own, so its popup
+    /// set comes with the mount and must be replaceable: a later mount that
+    /// carries the empty set cannot leave the old flags behind
+    /// (<https://html.spec.whatwg.org/multipage/browsers.html#popup-sandboxing-flag-set>).
+    #[test]
+    fn the_main_frames_popup_set_comes_and_goes_with_the_mount() {
+        let mut tree = FrameTree::default();
+        let sandbox = SandboxFlags::parse(Some("allow-scripts allow-popups"));
+        tree.set_popup_sandbox(FrameId::MAIN, sandbox);
+        assert_eq!(tree.popup_sandbox(FrameId::MAIN), sandbox);
+        tree.set_popup_sandbox(FrameId::MAIN, SandboxFlags::empty());
+        assert_eq!(tree.popup_sandbox(FrameId::MAIN), SandboxFlags::empty());
     }
 }

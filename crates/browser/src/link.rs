@@ -285,6 +285,7 @@ impl RendererHandle {
             assignment,
             frame,
             head: mount.head.clone(),
+            tab: mount.tab.clone(),
         };
         let upload = if let Ok(result) = timeout(
             request_timeout(),
@@ -848,6 +849,7 @@ impl WindowRouter<'_> {
         opener: renderer::OpenerPolicy,
         source: renderer::NavigationSource,
         allow_popups: bool,
+        popup_sandbox: renderer::SandboxFlags,
     ) -> Result<(), RendererViolation> {
         let Self {
             context,
@@ -889,6 +891,7 @@ impl WindowRouter<'_> {
                 source: Some(assignment.tab),
                 opener,
                 initiator,
+                popup_sandbox,
             })
             .await
             .ok()
@@ -944,13 +947,14 @@ async fn route_window_call(
             opener,
             source,
             allow_popups,
+            popup_sandbox,
         } => {
             WindowRouter {
                 context,
                 assignment,
                 request: id,
             }
-            .open(url, target, opener, source, allow_popups)
+            .open(url, target, opener, source, allow_popups, popup_sandbox)
             .await?;
         }
         BrowsingContextCall::WindowByName { name } => {
@@ -959,6 +963,19 @@ async fn route_window_call(
                 .find_by_name(assignment.tab, &name)
                 .map(|tab| renderer::WindowId::new(tab.get()));
             send_reply(&context.responder, id, ServiceReply::Window(tab)).await?;
+        }
+        BrowsingContextCall::WindowName { name } => {
+            // The call names no target, so a renderer can only rename its own
+            // tab. The name is the target a `window.open` from any tab in the
+            // group may select
+            // (<https://html.spec.whatwg.org/multipage/document-sequences.html#the-rules-for-choosing-a-navigable>).
+            // A tab that closed while the call was in flight has already had
+            // its name removed; re-inserting it would make a dead id look live
+            // to the next lookup.
+            if context.tabs.tab(assignment.tab).is_some() {
+                context.tabs.set_name(assignment.tab, name);
+            }
+            send_reply(&context.responder, id, ServiceReply::Unit).await?;
         }
         BrowsingContextCall::WindowNavigate {
             window,

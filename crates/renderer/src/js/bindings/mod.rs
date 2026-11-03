@@ -2433,6 +2433,7 @@ mod realm_tests {
                         Some("text/html".into()),
                         None,
                     ),
+                    tab: crate::protocol::TabState::default(),
                     body: html.as_bytes().to_vec(),
                 },
             )
@@ -2477,6 +2478,7 @@ mod realm_tests {
                     Some("text/html".into()),
                     None,
                 ),
+                tab: crate::protocol::TabState::default(),
                 body: html.as_bytes().to_vec(),
             })
             .expect("mount");
@@ -2531,6 +2533,7 @@ mod realm_tests {
                         Some("text/html".into()),
                         None,
                     ),
+                    tab: crate::protocol::TabState::default(),
                     body: html.as_bytes().to_vec(),
                 },
             )

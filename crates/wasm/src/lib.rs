@@ -126,6 +126,7 @@ impl GuestTab for Tab {
                 Some("text/html; charset=utf-8".into()),
                 None,
             ),
+            tab: renderer::TabState::default(),
             body: html.into_bytes(),
         };
         renderer.mount(&mount).map_err(|error| error.to_string())?;
@@ -666,6 +667,7 @@ impl BrowsingContextHost for WasmServices {
         _opener: renderer::OpenerPolicy,
         _source: &renderer::NavigationSource,
         _allow_popups: bool,
+        _popup_sandbox: renderer::SandboxFlags,
     ) -> Option<renderer::WindowId> {
         None
     }
@@ -673,6 +675,8 @@ impl BrowsingContextHost for WasmServices {
     fn window_by_name(&self, _name: &str) -> Option<renderer::WindowId> {
         None
     }
+
+    fn set_window_name(&self, _name: &str) {}
 
     fn window_navigate(
         &self,

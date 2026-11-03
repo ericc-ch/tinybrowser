@@ -405,13 +405,32 @@ fn frame_name(ctx: Ctx<'_>, frame: f64) -> Result<String> {
 
 /// Sets the browsing context name of `frame` for `window.name`
 /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-name>).
+///
+/// The tab's main frame name also goes to the browser: it is what a
+/// `window.open` target lookup searches across tabs, and it has to survive the
+/// renderer that reported it
+/// (<https://html.spec.whatwg.org/multipage/document-sequences.html#the-rules-for-choosing-a-navigable>).
 fn set_frame_name(ctx: Ctx<'_>, frame: f64, name: String) -> Result<()> {
     let Some(frame) = protocol_id(frame) else {
         return Ok(());
     };
     let world = world(&ctx)?;
-    let shared = world.borrow().shared();
-    shared.borrow_mut().tree.set_name(FrameId::new(frame), name);
+    let frame = FrameId::new(frame);
+    let (services, changed) = {
+        let world = world.borrow();
+        let services = world.runtime.services.clone();
+        let shared_world = world.shared();
+        let mut shared = shared_world.borrow_mut();
+        let changed = shared.tree.name(frame) != name;
+        shared.tree.set_name(frame, name.clone());
+        (services, changed)
+    };
+    // The call is synchronous, so the world must not stay borrowed while it
+    // runs: a host that answered by re-entering this realm would panic on a
+    // second borrow. An unchanged name is not worth the round trip.
+    if changed && frame == FrameId::MAIN {
+        services.set_window_name(&name);
+    }
     Ok(())
 }
 

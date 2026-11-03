@@ -1617,12 +1617,14 @@ fn open_window(
             withholds: plan.withholds,
         });
     }
+    let popup_sandbox = world.borrow().sandbox.auxiliary_flags();
     let tab = services.window_open(
         plan.url.as_ref(),
         &target,
         plan.opener,
         &plan.source,
         allow_popups,
+        popup_sandbox,
     )?;
     Some(WindowOpenAnswer {
         context: OpenedContext::Tab(tab),

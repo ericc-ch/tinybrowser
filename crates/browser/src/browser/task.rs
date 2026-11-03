@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use tokio::sync::mpsc;
 
-use crate::actor::{RemoteWindowMessage, TabHandle, TabId, TabTask};
+use crate::actor::{NewTab, RemoteWindowMessage, TabHandle, TabId, TabTask};
 use crate::context::BrowserContext;
 use crate::exchange::ServerInput;
 use crate::manager::RendererProcessManager;
@@ -24,9 +24,9 @@ use super::{
 pub(crate) struct TabRegistry {
     tabs: Arc<Mutex<HashMap<TabId, TabTask>>>,
     openers: Arc<Mutex<HashMap<TabId, TabId>>>,
-    /// Target names of tabs web content opened. The browsing context group is
-    /// what `window.open`'s name lookup searches, so the names are keyed by
-    /// tab and resolved through the opener chain
+    /// Target names of tabs. The browsing context group is what
+    /// `window.open`'s name lookup searches, so the names are keyed by tab and
+    /// resolved through the opener chain; a tab with no name has no entry
     /// (<https://html.spec.whatwg.org/multipage/document-sequences.html#the-rules-for-choosing-a-navigable>).
     names: Arc<Mutex<HashMap<TabId, String>>>,
 }
@@ -54,11 +54,26 @@ impl TabRegistry {
             .map(|(id, _)| *id)
     }
 
-    fn set_name(&self, id: TabId, name: String) {
+    /// Records a tab's target name. An empty name drops the entry, so "no
+    /// entry" is the only representation of "no name" and a reset cannot leave
+    /// a name behind for a lookup to find.
+    pub(crate) fn set_name(&self, id: TabId, name: String) {
+        let mut names = self.names.lock().unwrap_or_else(PoisonError::into_inner);
+        if name.is_empty() {
+            names.remove(&id);
+        } else {
+            names.insert(id, name);
+        }
+    }
+
+    /// The target name of one tab; empty when it has none.
+    pub(crate) fn name(&self, id: TabId) -> String {
         self.names
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(id, name);
+            .get(&id)
+            .cloned()
+            .unwrap_or_default()
     }
 
     fn remove_name(&self, id: TabId) {
@@ -264,12 +279,22 @@ impl BrowserTask {
         DispatchOutcome::Continue(reply)
     }
 
-    fn create_tab(&mut self) -> Result<TabHandle, BrowserError> {
+    fn create_tab(&mut self, tab: NewTab) -> Result<TabHandle, BrowserError> {
         let raw = self.next_tab.ok_or(BrowserError::TabIdExhausted)?;
         self.next_tab = raw.checked_add(1);
         let id = TabId::new(raw);
         self.context.create_tab(id);
-        let task = TabTask::spawn(id, self.context.tab_network(), Arc::clone(&self.renderers));
+        self.tabs.set_name(id, tab.name.clone());
+        if let Some(opener) = tab.opener {
+            self.tabs.set_opener(id, opener);
+        }
+        let task = TabTask::spawn(
+            id,
+            self.context.tab_network(),
+            Arc::clone(&self.renderers),
+            self.tabs.clone(),
+            tab,
+        );
         let handle = task.handle.clone();
         self.tabs.insert(id, task);
         Ok(handle)
@@ -296,15 +321,24 @@ impl BrowserTask {
             source,
             opener,
             initiator,
+            popup_sandbox,
         } = request;
-        let handle = self.create_tab()?;
+        // A popup keeps its target name across a cross-origin navigation only
+        // while its opener browsing context is live
+        // (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#resetBCName>).
+        let opener_tab = source.filter(|_| opener == renderer::OpenerPolicy::Keep);
+        let handle = self.create_tab(NewTab {
+            name: target.new_context_name().unwrap_or_default().to_owned(),
+            opener: opener_tab,
+            popup_sandbox,
+            // The initial `about:blank` inherits the opener's origin, which is
+            // what the first navigation's target-name reset compares against
+            // (<https://html.spec.whatwg.org/multipage/browsers.html#determining-the-origin>).
+            document_origin: initiator.origin.clone(),
+        })?;
         let id = handle.id();
-        if let Some(name) = target.new_context_name() {
-            self.tabs.set_name(id, name.to_owned());
-        }
-        if let (Some(source), renderer::OpenerPolicy::Keep) = (source, opener) {
-            self.tabs.set_opener(id, source);
-            self.context.copy_session(source, id);
+        if let Some(opener_tab) = opener_tab {
+            self.context.copy_session(opener_tab, id);
         }
         // A fresh tab is already on `about:blank`, so neither a missing URL
         // nor an explicit `about:blank` needs a navigation.
@@ -339,7 +373,7 @@ impl BrowserOperation for CreateTab {
     }
 
     fn serve(self, task: &mut BrowserTask) -> Reply {
-        Reply::CreateTab(task.create_tab())
+        Reply::CreateTab(task.create_tab(NewTab::browser_created()))
     }
 }
 
@@ -477,5 +511,44 @@ impl BrowserOperation for OpenWindowOptions {
 
     fn serve(self, task: &mut BrowserTask) -> Reply {
         Reply::OpenWindow(task.open_window(self))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TabRegistry;
+    use crate::actor::TabId;
+
+    /// A name is either present or absent: an empty assignment removes it, so
+    /// a cleared name cannot be found again
+    /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#resetBCName>).
+    #[test]
+    fn an_empty_name_removes_the_entry() {
+        let tabs = TabRegistry::new();
+        let opener = TabId::new(1);
+        let popup = TabId::new(2);
+        tabs.set_opener(popup, opener);
+        tabs.set_name(popup, "peer".to_owned());
+        assert_eq!(tabs.name(popup), "peer");
+        assert_eq!(tabs.find_by_name(opener, "peer"), Some(popup));
+        tabs.set_name(popup, String::new());
+        assert_eq!(tabs.name(popup), "");
+        assert_eq!(tabs.find_by_name(opener, "peer"), None);
+    }
+
+    /// The lookup is scoped to the opener chain: a name one group holds is not
+    /// visible to a tab outside it
+    /// (<https://html.spec.whatwg.org/multipage/document-sequences.html#the-rules-for-choosing-a-navigable>).
+    #[test]
+    fn a_name_is_found_through_the_opener_chain_only() {
+        let tabs = TabRegistry::new();
+        let opener = TabId::new(1);
+        let stranger = TabId::new(2);
+        let popup = TabId::new(3);
+        tabs.set_opener(popup, opener);
+        tabs.set_name(popup, "peer".to_owned());
+        assert_eq!(tabs.find_by_name(opener, "peer"), Some(popup));
+        assert_eq!(tabs.find_by_name(popup, "peer"), Some(popup));
+        assert_eq!(tabs.find_by_name(stranger, "peer"), None);
     }
 }

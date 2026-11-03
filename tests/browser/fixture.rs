@@ -404,6 +404,17 @@ pub(crate) fn load_page(client: &mut cdp::Client, url: &str, timeout: Duration) 
         .call("Target.createTarget", &json!({"url": "about:blank"}), None)
         .expect("create");
     let target_id = created["targetId"].as_str().expect("id").to_owned();
+    let session = attach(client, &target_id);
+    client
+        .call("Page.navigate", &json!({"url": url}), Some(&session))
+        .expect("navigate");
+    wait_for_load(client, &session, timeout);
+    session
+}
+
+/// Attaches to `target_id` with a flattened session and enables `Page`, so the
+/// caller can drive that target. Returns the session id.
+pub(crate) fn attach(client: &mut cdp::Client, target_id: &str) -> String {
     let attached = client
         .call(
             "Target.attachToTarget",
@@ -415,10 +426,6 @@ pub(crate) fn load_page(client: &mut cdp::Client, url: &str, timeout: Duration) 
     client
         .call("Page.enable", &json!({}), Some(&session))
         .expect("enable Page events");
-    client
-        .call("Page.navigate", &json!({"url": url}), Some(&session))
-        .expect("navigate");
-    wait_for_load(client, &session, timeout);
     session
 }
 

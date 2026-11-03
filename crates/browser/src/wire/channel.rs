@@ -43,8 +43,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// Version 16 typed the values a navigation and a window open carry (origins,
 /// the window-open target and URL) and added the named-tab lookup and
 /// navigation calls. Version 17 put the secure-context bit on the policy
-/// container.
-pub const PROTOCOL_VERSION: u8 = 17;
+/// container. Version 18 gave a mount and a streamed response the browsing
+/// context state the browser owns (target name, opener relationship, popup
+/// sandboxing flag set) and added the tab rename call.
+pub const PROTOCOL_VERSION: u8 = 18;
 
 /// Fixed frame header size in bytes.
 pub const HEADER_BYTES: usize = 16;
@@ -529,6 +531,11 @@ mod tests {
             }),
         );
         for head in [http, local, inherited] {
+            let tab = renderer::TabState {
+                name: "peer".to_owned(),
+                auxiliary_with_opener: true,
+                popup_sandbox: renderer::SandboxFlags::parse(Some("allow-scripts allow-popups")),
+            };
             let message: crate::wire::ToRenderer = crate::exchange::Frame::Call {
                 id: crate::exchange::RequestId::new(1),
                 body: crate::wire::RendererCall::Response {
@@ -536,6 +543,7 @@ mod tests {
                         assignment: crate::wire::RendererAssignmentId::new(1),
                         frame: renderer::FrameId::MAIN,
                         head: head.clone(),
+                        tab: tab.clone(),
                     },
                 },
             };
@@ -554,6 +562,7 @@ mod tests {
                 response.head.content_type.as_deref(),
                 head.content_type.as_deref()
             );
+            assert_eq!(response.tab, tab, "the browsing-context state survives");
             match (&response.head.source, &head.source) {
                 (ResponseSource::Http(back), ResponseSource::Http(sent)) => {
                     assert_eq!(back.refresh, sent.refresh);
@@ -837,8 +846,8 @@ mod tests {
     }
 
     /// Every field of a `window.open` call crosses the wire: the source, the
-    /// target, the URL (present or absent), the opener policy, and the
-    /// sandbox bit
+    /// target, the URL (present or absent), the opener policy, the sandbox
+    /// bit, and the popup sandboxing flag set
     /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#window-open-steps>).
     #[test]
     fn a_window_open_caller_survives_the_wire() {
@@ -853,15 +862,17 @@ mod tests {
                 renderer::TargetName::Named("peer".to_owned()),
                 renderer::OpenerPolicy::NoOpener,
                 false,
+                renderer::SandboxFlags::empty(),
             ),
             (
                 None,
                 renderer::TargetName::Blank,
                 renderer::OpenerPolicy::Keep,
                 true,
+                renderer::SandboxFlags::parse(Some("allow-scripts allow-popups")),
             ),
         ];
-        for (url, target, opener, allow_popups) in cases {
+        for (url, target, opener, allow_popups, popup_sandbox) in cases {
             let call = crate::wire::ServiceCall::BrowsingContext(
                 crate::wire::BrowsingContextCall::WindowOpen {
                     url: url.clone(),
@@ -869,6 +880,7 @@ mod tests {
                     opener,
                     source: source.clone(),
                     allow_popups,
+                    popup_sandbox,
                 },
             );
             let message: crate::wire::FromRenderer = crate::exchange::Frame::Call {
@@ -889,6 +901,7 @@ mod tests {
                     opener: back_opener,
                     source: back_source,
                     allow_popups: back_allow,
+                    popup_sandbox: back_sandbox,
                 },
             ) = body.call
             else {
@@ -898,6 +911,7 @@ mod tests {
             assert_eq!(back_target, target);
             assert_eq!(back_opener, opener);
             assert_eq!(back_allow, allow_popups);
+            assert_eq!(back_sandbox, popup_sandbox);
             assert_eq!(back_source, source);
         }
     }

@@ -204,7 +204,7 @@ impl Engine {
                 let sandbox = self
                     .frames
                     .get(&parent)
-                    .map_or_else(crate::js::world::SandboxFlags::default, |document| {
+                    .map_or_else(crate::protocol::SandboxFlags::default, |document| {
                         crate::document::sandboxing_flags(&document.world(), container)
                     });
                 // `srcdoc` takes priority over `src`
@@ -407,7 +407,12 @@ impl Engine {
     /// # Errors
     ///
     /// [`TabError::UnknownFrame`] when the engine does not host the frame.
-    pub fn open_body(&mut self, frame: FrameId, head: &ResponseHead) -> Result<(), TabError> {
+    pub fn open_body(
+        &mut self,
+        frame: FrameId,
+        head: &ResponseHead,
+        tab: &crate::protocol::TabState,
+    ) -> Result<(), TabError> {
         if frame == FrameId::MAIN {
             self.init_scripts
                 .borrow_mut()
@@ -420,6 +425,7 @@ impl Engine {
         // document reports no referrer
         // (<https://html.spec.whatwg.org/multipage/document-lifecycle.html#creating-and-initializing-a-document-object>).
         document.set_document_referrer(None);
+        document.install_tab_state(tab);
         document.install_head(head, None);
         Ok(())
     }
@@ -1089,13 +1095,13 @@ impl Engine {
         }
         if tree.top_level(initiator) == chosen {
             let flag = if activated {
-                crate::js::world::SandboxFlag::TopLevelNavigationWithUserActivation
+                crate::protocol::SandboxFlag::TopLevelNavigationWithUserActivation
             } else {
-                crate::js::world::SandboxFlag::TopLevelNavigationWithoutUserActivation
+                crate::protocol::SandboxFlag::TopLevelNavigationWithoutUserActivation
             };
             return !flags.contains(flag);
         }
-        !flags.contains(crate::js::world::SandboxFlag::Navigation)
+        !flags.contains(crate::protocol::SandboxFlag::Navigation)
     }
 
     /// Installs the flags a navigation commits on `child`'s document. Local
@@ -1103,7 +1109,10 @@ impl Engine {
     /// install; an HTTP response carries the flags until its commit.
     fn install_sandbox(&mut self, child: FrameId, navigation: &FrameNavigation) {
         if let Some(document) = self.frames.get(&child) {
-            document.world().borrow_mut().sandbox = navigation.sandbox;
+            document
+                .world()
+                .borrow_mut()
+                .install_sandbox(navigation.sandbox);
         }
     }
 
@@ -2056,6 +2065,7 @@ mod navigator_tests {
                         Some("text/html".to_owned()),
                         None,
                     ),
+                    tab: crate::protocol::TabState::default(),
                     body: b"<!doctype html><title>identity</title>".to_vec(),
                 },
             )
@@ -2158,6 +2168,7 @@ mod messaging_tests {
                 Some("text/html".to_owned()),
                 None,
             ),
+            tab: crate::protocol::TabState::default(),
             body: body.as_bytes().to_vec(),
         }
     }
