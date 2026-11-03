@@ -1,10 +1,10 @@
 # WPT harness
 
-tools/wpt/cli.py is the whole harness (run | score | rerun | merge | profile |
-failures | baseline | manifest | fast | overnight | selftest). It needs a
-dev-shell Python, so call it through `nix develop --command`. Builds the
-wpt-profile binary via cargo each run; --binary PATH uses a prebuilt binary
-as-is.
+tools/wpt/cli.py is the whole harness: `python3 tools/wpt/cli.py --help`
+lists its subcommands (`run`, `score`, `fast`, `fast-harness`, and the rest).
+It needs a dev-shell Python, so call it through `nix develop --command`.
+Builds the wpt-profile binary via cargo each run; --binary PATH uses a
+prebuilt binary as-is.
 
     nix develop --command python3 tools/wpt/cli.py run dom/events/ --exclude=worker
     nix develop --command python3 tools/wpt/cli.py run --score dom/nodes/ -- --processes 4
@@ -43,9 +43,19 @@ wptserve, or renderer child. Requests are served from the checkout, the
 only replaced resource is `/resources/testharnessreport.js` (a small
 reporter the host polls), and a paused Tokio clock jumps over timer waits,
 so a hung file costs its harness budget instead of a browser round trip.
-Budgets match upstream: 5 s, or 7 s for `<meta name=timeout content=long>`.
-Reftests and testdriver files are selected but skipped: `testdriver.js`
-needs a WebDriver session, and screenshot comparison is not implemented.
+Budgets match the WebDriver lane's: 5 s, or 7 s for
+`<meta name=timeout content=long>`; both lanes read the policy in
+`tools/wpt/timeouts.py`, and cli.py passes it to the runner as
+`--normal-budget`/`--long-budget`.
+
+The selection comes from the checkout's `MANIFEST.json`, the same manifest
+the WebDriver lane uses, so "a test" means what upstream says it means:
+testharness and crashtest items, with the URL and `timeout` the manifest
+records. Multi-global tests run through wptserve's `.any.html` and
+`.window.html` wrappers, rendered from the source's `// META:` lines.
+Testdriver items are selected but skipped (`testdriver.js` needs a
+WebDriver session); reftests, worker/service-worker variants, and support
+pages are not selected, because this lane has no executor for them.
 
     nix develop --command python3 tools/wpt/cli.py fast-harness dom/nodes --jobs 8
 
@@ -53,10 +63,11 @@ needs a WebDriver session, and screenshot comparison is not implemented.
 every file a test read, so an unchanged file is reused without running it.
 The digest of the `wpt` binary (hundreds of MB with debug info) is remembered
 in `FILE.binary` and refreshed when the executable's path, size, or mtime
-changes. On dom/nodes/ (100 files) a cold run is ~6 s at 8 jobs; a warm run is
-~15 ms. A truncated file is never cached as a verdict: testharness reports
-`interrupted` when the engine cuts a script short, and the runner gives each
-file one drain with its whole budget instead of a short slice.
+changes. On dom/nodes/ (422 manifest tests) a cold run is ~11 s at 12 jobs; a
+warm run is ~100 ms. A truncated file is never cached as a verdict:
+testharness reports `interrupted` when the engine cuts a script short, and
+the runner gives each file one drain with its whole budget instead of a short
+slice.
 
 `--shard-size N` (in cli.py) runs the sorted selection in N-file processes.
 Each shard is a separate `--offset`/`--limit` slice, so an engine abort costs
@@ -68,32 +79,34 @@ flags (`--cache`, `--jobs`) pass through with their
 values. Use it for directories where layout or paint can panic (html/
 currently does): a panic in-process bypasses the harness's per-file error
 framing, and unwinding a half-torn engine can abort outright. dom/ needs no
-sharding and runs 692 files in ~25 s at 16 jobs, with 557/557 file verdicts
-matching the nightly report and 93 files skipped (testdriver/reftest). html/
-(11,252 files, 58 shards) took ~322 s of shard wall with 5 crashing files
-isolated, and 6,238/6,238 verdicts matched. fetch+xhr+url+encoding+FileAPI+
-streams (638 files) is 45 s cold and 0.6 s warm, 325/325 matched. The nightly
-report gives 8,140 s of per-test time for those three slices together.
+sharding and runs 788 manifest tests in ~26 s at 16 jobs, with 109 testdriver
+skips. html/ selects 7,895 manifest tests, so it is sharded. The parity
+counts from the older tree-walking selector are gone with it: that selector
+counted support pages and references (always PASS) and could not see
+`.any.js`/`.window.js` sources at all, so its "matched" numbers were over an
+intersection rather than the suite.
 
 A warm cache needs no sharding, so the driver tries one process first and
-only splits when it dies: html/ warm is 1.2 s at 16 jobs (3 s through the
-driver) against those 7,206 s. A file that aborts the engine cannot record
-its own verdict, so the driver marks it with `--mark-crashed` and later runs
-read it as an ordinary cached ERROR instead of bisecting again.
+only splits when it dies; on a warm cache the shards cost nothing because no
+file runs. A file that aborts the engine cannot record its own verdict, so
+the driver marks it with `--mark-crashed` and later runs read it as an
+ordinary cached ERROR instead of bisecting again.
 
 Known gap: an async listener that leaves a host object borrowed makes
 rquickjs panic with `AlreadyBorrowed` in `Class::borrow_mut`; rquickjs
 converts that panic into a script exception, so the run still finishes and
 writes its report. It is an engine re-entrancy bug to fix, not a harness one.
 
-The host serves files and their `.headers` siblings only, and `document.cookie`
-goes through the browser's own jar (`crates/cookies`). wptserve's query-param
-handlers, `.sub.` substitution files, and server-set `Set-Cookie` are not
-implemented, so a test that depends on them cannot pass here even when it
-passes in the nightly; that is why the parity numbers above are quoted per
-directory. A request that resolves to a `.py` handler is a network error
-rather than the handler's own source. Popups, workers, and WebDriver are out
-of scope: `window.open` returns null and `testdriver.js` files are skipped.
+The host serves files the way wptserve does: the content-type table comes from
+`wptserve.constants` (cli.py hands it over), headers are `wptserve`'s
+`load_headers` order (`__dir__` then the file, `.sub.headers` before
+`.headers`, templates expanded), and `.any.html`/`.window.html` documents are
+rendered from their sources. `document.cookie` goes through the browser's own
+jar (`crates/cookies`). Still unimplemented: wptserve's query-param `pipe`
+handlers, `.sub.` body substitution (a `.sub.html` is served literally),
+`.py` handlers (a network error rather than the handler's source), and
+server-set `Set-Cookie`. Popups, workers, and WebDriver are out of scope:
+`window.open` returns null and `testdriver.js` files are skipped.
 
 **The lane runs without the browser's fetch security model.** `FsServices` is
 a `NetworkHost`, and the CORS protocol, response tainting, the no-CORS request
@@ -110,8 +123,7 @@ canonical list of a --score log, baseline runs both sides in a detached
 worktree (exit 1 on new failures). Metadata-expected TIMEOUTs:
 --skip-timeout in dev only; score/overnight refuse it. overnight needs
 explicit approval. Update the docs/progress.md total after scoring.
-Timeout policy (DEFAULT/LONG/EXTRA seconds) lives at the top of
-tinybrowser_wpt.py.
+Timeout policy (DEFAULT/LONG/EXTRA seconds) lives in tools/wpt/timeouts.py.
 
 A test file whose own timers outlast DEFAULT_TIMEOUT cannot be sped up
 from the engine: `referrer-policy/css-integration/svg/` sleeps 800 ms

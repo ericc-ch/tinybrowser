@@ -213,7 +213,7 @@ pub fn binary_digest(cache: Option<&Path>) -> io::Result<String> {
         return Ok(hash.to_owned());
     }
     let bytes = std::fs::read(&path)?;
-    let hash = hex(&Sha256::digest(bytes));
+    let hash = format!("{:x}", Sha256::digest(bytes));
     if let Some(sidecar) = &sidecar {
         let _ = std::fs::write(sidecar, format!("{stamp}\n{hash}"));
     }
@@ -228,7 +228,7 @@ fn digest(root: &Path, path: &str) -> String {
         root.join(path)
     };
     match std::fs::read(&path) {
-        Ok(bytes) => hex(&Sha256::digest(bytes)),
+        Ok(bytes) => format!("{:x}", Sha256::digest(bytes)),
         Err(error) if error.kind() == io::ErrorKind::NotFound => "missing".into(),
         Err(error) => format!("unreadable:{}", error.kind() as i32),
     }
@@ -239,16 +239,6 @@ fn relative(root: &Path, path: &Path) -> String {
         |_| path.to_string_lossy().replace('\\', "/"),
         |path| path.to_string_lossy().replace('\\', "/"),
     )
-}
-
-fn hex(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(char::from(DIGITS[usize::from(byte >> 4)]));
-        out.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
-    }
-    out
 }
 
 #[cfg(test)]

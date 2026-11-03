@@ -1,5 +1,6 @@
 //! One WPT file, mounted in this process and driven on a virtual clock.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -13,25 +14,31 @@ use wpt_report::SubtestStatus;
 
 use crate::suite::{Kind, TestCase};
 
-/// Wall-clock time a test may spend before it is called hung. These are the
-/// harness budgets: `DEFAULT_TIMEOUT` + `EXTRA_TIMEOUT` (5 s) and
-/// `LONG_TIMEOUT` + `EXTRA_TIMEOUT` (7 s).
+/// Wall-clock time a test may spend before it is called hung. The driver owns
+/// the numbers: `cli.py` computes them from `tools/wpt/timeouts.py`, the same
+/// policy the `WebDriver` lane uses, and passes them as `--normal-budget` and
+/// `--long-budget`. Keeping a copy here would let the two lanes drift (#237).
 ///
 /// One drain gets the whole budget. A shorter slice would interrupt a script
 /// that is still making progress: `testharness.js` catches the engine's
 /// `interrupted` error, reports the tests that already ran, and marks the rest
 /// `NOTRUN` with a harness error — a truncated file that looks like a verdict.
-const NORMAL_BUDGET: Duration = Duration::from_secs(5);
+#[derive(Clone, Copy, Debug)]
+pub struct Budgets {
+    /// Budget for a file without `<meta name=timeout content=long>`.
+    pub normal: Duration,
+    /// Budget for a file that asks for the long timeout.
+    pub long: Duration,
+}
 
-/// Long-budget wall clock.
-const LONG_BUDGET: Duration = Duration::from_secs(7);
-
-/// The wall-clock budget for one file.
-fn budget(case: &TestCase) -> Duration {
-    if case.long_timeout {
-        LONG_BUDGET
-    } else {
-        NORMAL_BUDGET
+impl Budgets {
+    /// The wall-clock budget for one file.
+    fn for_case(self, case: &TestCase) -> Duration {
+        if case.long_timeout {
+            self.long
+        } else {
+            self.normal
+        }
     }
 }
 
@@ -72,13 +79,18 @@ pub struct Session {
     root: std::path::PathBuf,
     services: Arc<FsServices>,
     renderer: EmbeddedRenderer,
+    budgets: Budgets,
 }
 
 impl Session {
     /// Creates an engine for one worker.
     #[must_use]
-    pub fn new(root: &std::path::Path) -> Self {
-        let services = Arc::new(FsServices::new(root.to_path_buf()));
+    pub fn new(
+        root: &std::path::Path,
+        content_types: HashMap<String, String>,
+        budgets: Budgets,
+    ) -> Self {
+        let services = Arc::new(FsServices::new(root.to_path_buf(), content_types));
         let renderer = EmbeddedRenderer::new(
             Arc::clone(&services) as Arc<dyn renderer::BrowserServices>,
             net::ValidIdentity::default(),
@@ -87,6 +99,7 @@ impl Session {
             root: root.to_path_buf(),
             services,
             renderer,
+            budgets,
         }
     }
 
@@ -128,7 +141,7 @@ impl Session {
         // Every verdict depends on the file itself. Mounts record it already,
         // but a skipped kind (reftest, testdriver) never mounts, and a WPT
         // pin change to that file must still invalidate the stored SKIP.
-        let test_file = self.root.join(&case.relative);
+        let test_file = self.root.join(&case.source);
         if !inputs.contains(&test_file) {
             inputs.push(test_file);
         }
@@ -150,14 +163,24 @@ impl Session {
         // file must not be read as this one's.
         let _stale = self.renderer.take_events();
         self.services.clear();
-        // The document bytes come from `case.source`, but the file on disk is
-        // still an input: editing it must invalidate a cached verdict.
-        self.services.record_file(self.root.join(&case.relative));
+        // The mounted document may be a synthesized wrapper, but the on-disk
+        // source is still an input: editing it must invalidate a cached
+        // verdict, and its `.headers` decide the response metadata.
+        self.services.record_file(self.root.join(&case.source));
         let url = Url::parse(&format!("{BASE}{}", case.relative))
             .map_err(|error| Failure::Error(format!("bad url: {error}")))?;
-        let path = self.root.join(&case.relative);
-        let (content_type, headers) = self.services.headers_for(&path);
-        let head = ResponseHead::http(200, url, content_type, &headers);
+        let path = self.root.join(&case.source);
+        let headers = self.services.headers_for(
+            &path,
+            &crate::services::RequestContext {
+                url: &url,
+                headers: &[],
+            },
+        );
+        let content_type = headers
+            .content_type
+            .unwrap_or_else(|| case.content_type.clone());
+        let head = ResponseHead::http(200, url, Some(content_type), &headers.list);
         self.renderer
             .mount_bounded(
                 &Mount {
@@ -166,7 +189,7 @@ impl Session {
                     // no popup sandbox. `window.open` returns null too, so a
                     // file cannot open a context whose flags it would need.
                     tab: renderer::TabState::default(),
-                    body: case.source.clone(),
+                    body: case.bytes.clone(),
                 },
                 deadline.saturating_duration_since(Instant::now()),
             )
@@ -206,7 +229,7 @@ async fn run_testharness(
     virtual_time: bool,
 ) -> Result<Completed, Failure> {
     let started = Instant::now();
-    let limit = budget(case);
+    let limit = session.budgets.for_case(case);
     let deadline = started + limit;
     session.mount(case, deadline)?;
     let renderer = &mut session.renderer;
@@ -256,7 +279,7 @@ async fn run_crashtest(
     virtual_time: bool,
 ) -> Result<Completed, Failure> {
     let started = Instant::now();
-    let limit = budget(case);
+    let limit = session.budgets.for_case(case);
     let deadline = started + limit;
     session.mount(case, deadline)?;
     let renderer = &mut session.renderer;

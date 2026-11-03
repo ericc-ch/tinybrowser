@@ -29,3 +29,5 @@ sha2 = "0.10"
 # jump straight to it instead of spending the harness budget.
 tokio = { version = "1.53", default-features = false, features = ["rt", "time", "sync", "macros", "test-util"] }
 url = "2"
+# `uuid()` in `.sub.headers`: wptserve substitutes a fresh UUID v4.
+uuid = { version = "1", features = ["v4"] }

@@ -2,7 +2,9 @@
 //!
 //! Nothing is served over a socket. `testharnessreport.js` is replaced with a
 //! small reporter so the host can read the harness result without `WebDriver`'s
-//! message queue.
+//! message queue. Response metadata follows wptserve: the content-type table
+//! comes from `wptserve.constants` (passed by `cli.py`), and headers are read
+//! the way `wptserve.handlers.load_headers` reads them.
 
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
@@ -16,6 +18,9 @@ use renderer::{
     StorageHost, StorageKey, StorageKind, TargetName, WindowId,
 };
 use url::Url;
+
+use crate::template::{self, Context};
+use crate::wrapper::Wrapper;
 
 /// The origin wptserve gives ordinary test documents.
 pub const BASE: &str = "http://web-platform.test:8000/";
@@ -44,9 +49,30 @@ const REPORT: &str = r#"
 })();
 "#;
 
+/// The headers and content type wptserve answers one resource with.
+pub(crate) struct Headers {
+    /// The `Content-Type` a `.headers` file overrides, when it does.
+    pub(crate) content_type: Option<String>,
+    /// Every header, in wptserve's concatenation order with later values
+    /// replacing earlier ones of the same name.
+    pub(crate) list: Vec<(String, String)>,
+}
+
+/// The request facts a `.sub.headers` template can read.
+pub(crate) struct RequestContext<'a> {
+    /// The URL being served.
+    pub(crate) url: &'a Url,
+    /// Request headers.
+    pub(crate) headers: &'a [(String, String)],
+}
+
 /// A host that maps every URL path to a file under one checkout.
 pub struct FsServices {
     root: PathBuf,
+    /// `wptserve.constants.content_types`, as a JSON map handed over by
+    /// `cli.py`. An extension it does not name is `application/octet-stream`,
+    /// exactly like `guess_content_type`.
+    content_types: HashMap<String, String>,
     /// The engine's own jar, so `document.cookie` obeys path, domain, expiry,
     /// and `SameSite` here exactly as it does in a browser tab.
     cookies: Mutex<CookieJar>,
@@ -58,9 +84,10 @@ pub struct FsServices {
 impl FsServices {
     /// Creates a host rooted at `root`.
     #[must_use]
-    pub fn new(root: PathBuf) -> Self {
+    pub fn new(root: PathBuf, content_types: HashMap<String, String>) -> Self {
         Self {
             root,
+            content_types,
             cookies: Mutex::new(CookieJar::default()),
             storage: Mutex::new(HashMap::new()),
             read: Mutex::new(Vec::new()),
@@ -108,10 +135,87 @@ impl FsServices {
         self.record(path);
     }
 
-    /// Reads one resource's `.headers` sibling, recording it as an input.
-    pub(crate) fn headers_for(&self, file: &Path) -> (Option<String>, Vec<(String, String)>) {
-        let path = self.record(PathBuf::from(format!("{}.headers", file.display())));
-        read_headers(file, &path)
+    /// The content type wptserve's `guess_content_type` returns for `file`.
+    pub(crate) fn content_type_for(&self, file: &Path) -> String {
+        file.extension()
+            .and_then(|extension| extension.to_str())
+            .and_then(|extension| self.content_types.get(extension))
+            .cloned()
+            .unwrap_or_else(|| "application/octet-stream".to_owned())
+    }
+
+    /// Reads the headers wptserve sends for `file`.
+    pub(crate) fn headers_for(&self, file: &Path, request: &RequestContext<'_>) -> Headers {
+        let mut list = Vec::new();
+        // Directory headers apply to the whole directory, then the file's own
+        // headers follow
+        // (`wptserve/handlers.py::load_headers`).
+        if let Some(directory) = file.parent() {
+            self.load_headers(&directory.join("__dir__"), request, &mut list);
+        }
+        self.load_headers(file, request, &mut list);
+        let content_type = list
+            .iter()
+            .rev()
+            .find(|(name, _)| name == "content-type")
+            .map(|(_, value)| value.clone());
+        // The response carries one `Content-Type`, set from the field above;
+        // leaving the raw header in the list would send it twice.
+        list.retain(|(name, _)| name != "content-type");
+        Headers { content_type, list }
+    }
+
+    /// Appends one `__dir__` or resource header block.
+    ///
+    /// A `.sub.headers` sibling wins over `.headers`, and its templates are
+    /// expanded against the request. An expression this harness cannot expand
+    /// is a visible error: dropping the header would change the page silently.
+    fn load_headers(
+        &self,
+        base: &Path,
+        request: &RequestContext<'_>,
+        list: &mut Vec<(String, String)>,
+    ) {
+        let sub = path_with_suffix(base, ".sub.headers");
+        let plain = path_with_suffix(base, ".headers");
+        // Both candidates are inputs, whether or not they exist: creating one
+        // later must invalidate a cached verdict.
+        self.record(sub.clone());
+        self.record(plain.clone());
+        let (path, expand) = if sub.is_file() {
+            (sub, true)
+        } else if plain.is_file() {
+            (plain, false)
+        } else {
+            return;
+        };
+        let Ok(bytes) = std::fs::read(&path) else {
+            return;
+        };
+        let text = if expand {
+            let context = Context {
+                url: request.url,
+                headers: request.headers,
+            };
+            match template::substitute(&String::from_utf8_lossy(&bytes), &context) {
+                Ok(text) => text,
+                Err(error) => {
+                    eprintln!("wpt-harness: {}: {error}", path.display());
+                    return;
+                }
+            }
+        } else {
+            String::from_utf8_lossy(&bytes).into_owned()
+        };
+        for line in text.lines() {
+            if line.is_empty() {
+                continue;
+            }
+            let Some((name, value)) = line.split_once(':') else {
+                continue;
+            };
+            set_header(list, name.trim(), value.trim());
+        }
     }
 
     fn serve(&self, request: &DialRequest) -> Result<DialOutcome, DialFailure> {
@@ -146,65 +250,63 @@ impl FsServices {
         {
             return Err(DialFailure::Connect);
         }
+        let context = RequestContext {
+            url: &request.url,
+            headers: &request.headers,
+        };
+        // `.any.html` and `.window.html` are synthesized from their script.
+        if let Some((wrapper, source)) = Wrapper::for_url(&path) {
+            let file = self.record(self.root.join(&source));
+            let body = std::fs::read(&file).map_err(|_| DialFailure::Connect)?;
+            let headers = self.headers_for(&file, &context);
+            let js_url = &request.url.path()[..request.url.path().len() - ".html".len()];
+            let html = wrapper.render(&body, &format!("{js_url}.js"));
+            return Ok(DialOutcome::basic(
+                200,
+                request.url.clone(),
+                Some(
+                    headers
+                        .content_type
+                        .unwrap_or_else(|| "text/html".to_owned()),
+                ),
+                headers.list,
+                html.into_bytes(),
+            ));
+        }
         let file = self.record(self.root.join(relative));
         let body = std::fs::read(&file).map_err(|_| DialFailure::Connect)?;
-        // `.headers` is wptserve's per-resource header file.
-        let (content_type, headers) = self.headers_for(&file);
+        let headers = self.headers_for(&file, &context);
         Ok(DialOutcome::basic(
             200,
             request.url.clone(),
-            content_type,
-            headers,
+            Some(
+                headers
+                    .content_type
+                    .unwrap_or_else(|| self.content_type_for(&file)),
+            ),
+            headers.list,
             body,
         ))
     }
 }
 
-/// Reads the header list from `headers` for a resource at `file`.
-fn read_headers(file: &Path, headers: &Path) -> (Option<String>, Vec<(String, String)>) {
-    let mut list = Vec::new();
-    let mut content_type = content_type(file);
-    if let Ok(text) = std::fs::read_to_string(headers) {
-        for line in text.lines() {
-            let Some((name, value)) = line.split_once(':') else {
-                continue;
-            };
-            let name = name.trim().to_ascii_lowercase();
-            let value = value.trim().to_owned();
-            if name == "content-type" {
-                content_type = Some(value.clone());
-            }
-            list.push((name, value));
-        }
-    }
-    (content_type, list)
+/// Appends `suffix` to a path that has no extension of its own, such as
+/// `dir/__dir__`.
+fn path_with_suffix(base: &Path, suffix: &str) -> PathBuf {
+    PathBuf::from(format!("{}{suffix}", base.display()))
 }
 
-/// The content type a static file reports.
-fn content_type(path: &Path) -> Option<String> {
-    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
-    let value = match extension.as_str() {
-        "html" | "htm" => "text/html",
-        "xhtml" => "application/xhtml+xml",
-        "js" | "mjs" => "text/javascript",
-        "css" => "text/css",
-        "json" => "application/json",
-        "xml" => "application/xml",
-        "svg" => "image/svg+xml",
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
-        "ico" => "image/x-icon",
-        "woff" => "font/woff",
-        "woff2" => "font/woff2",
-        "ttf" => "font/ttf",
-        "otf" => "font/otf",
-        "wasm" => "application/wasm",
-        "txt" => "text/plain",
-        _ => "application/octet-stream",
-    };
-    Some(value.to_owned())
+/// Sets one header, replacing an earlier value of the same name.
+///
+/// wptserve's `ResponseHeaders.set` overwrites, so a file's header wins over
+/// the directory's and only one value is sent.
+fn set_header(list: &mut Vec<(String, String)>, name: &str, value: &str) {
+    let name = name.to_ascii_lowercase();
+    if let Some(entry) = list.iter_mut().find(|(existing, _)| *existing == name) {
+        value.clone_into(&mut entry.1);
+    } else {
+        list.push((name, value.to_owned()));
+    }
 }
 
 impl NetworkHost for FsServices {
@@ -359,19 +461,28 @@ impl MessagingHost for FsServices {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::path::PathBuf;
 
     use renderer::{DialFailure, DialOutcome};
 
-    use super::FsServices;
+    use super::{FsServices, RequestContext};
 
     fn root(name: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
             "wpt-harness-services-{name}-{}",
             std::process::id()
         ));
+        let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("dir")).expect("root created");
         root
+    }
+
+    fn services(name: &str) -> FsServices {
+        FsServices::new(
+            root(name),
+            HashMap::from([("html".to_owned(), "text/html".to_owned())]),
+        )
     }
 
     fn outcome(services: &FsServices, path: &str) -> Result<DialOutcome, DialFailure> {
@@ -384,16 +495,27 @@ mod tests {
         ))
     }
 
+    fn headers(services: &FsServices, url: &str) -> super::Headers {
+        let url = url::Url::parse(url).expect("URL");
+        services.headers_for(
+            &services.root.join("dir/data.txt"),
+            &RequestContext {
+                url: &url,
+                headers: &[],
+            },
+        )
+    }
+
     #[test]
     fn a_static_file_is_served_and_a_handler_is_not() {
-        let root = root("handler");
+        let services = services("handler");
+        let root = services.root.clone();
         std::fs::write(root.join("dir/data.txt"), b"from a file").expect("file written");
         std::fs::write(
             root.join("dir/handler.py"),
             b"def main(request, response): ...",
         )
         .expect("handler written");
-        let services = FsServices::new(root.clone());
 
         let served = outcome(&services, "/dir/data.txt").expect("static file");
         assert!(
@@ -409,6 +531,72 @@ mod tests {
         assert!(
             outcome(&services, "/dir/missing.txt").is_err(),
             "an absent file is a network error"
+        );
+        std::fs::remove_dir_all(&root).expect("root removed");
+    }
+
+    #[test]
+    fn content_types_and_header_files_follow_wptserve() {
+        let services = services("headers");
+        let root = services.root.clone();
+        std::fs::write(root.join("dir/data.txt"), b"x").expect("file");
+        // Directory headers apply to every file below the directory.
+        std::fs::write(
+            root.join("dir/__dir__.headers"),
+            "X-Content-Type-Options: nosniff\n",
+        )
+        .expect("dir headers");
+        // A `.sub.headers` sibling wins over `.headers`, and expands.
+        std::fs::write(root.join("dir/data.txt.headers"), "X-Plain: yes\n").expect("headers");
+        std::fs::write(
+            root.join("dir/data.txt.sub.headers"),
+            "Access-Control-Allow-Origin: {{location[server]}}\n",
+        )
+        .expect("sub headers");
+        let headers = headers(&services, "http://web-platform.test:8000/dir/data.txt");
+        assert_eq!(
+            headers.list,
+            vec![
+                ("x-content-type-options".to_owned(), "nosniff".to_owned()),
+                (
+                    "access-control-allow-origin".to_owned(),
+                    "http://web-platform.test:8000".to_owned()
+                ),
+            ],
+            "the .sub.headers sibling replaces the plain one"
+        );
+        assert_eq!(headers.content_type, None);
+        // The table is wptserve's: `txt` is text/plain, unknown is binary.
+        assert_eq!(
+            services.content_type_for(std::path::Path::new("a.txt")),
+            "application/octet-stream",
+            "only extensions the passed table names are known"
+        );
+        std::fs::remove_dir_all(&root).expect("root removed");
+    }
+
+    #[test]
+    fn an_any_wrapper_is_served_from_its_script() {
+        let services = services("wrapper");
+        let root = services.root.clone();
+        std::fs::write(
+            root.join("dir/multi.any.js"),
+            "// META: global=window\ntest(() => {}, 'x');\n",
+        )
+        .expect("source");
+        let served = outcome(&services, "/dir/multi.any.html").expect("wrapper");
+        let renderer::ResponseBody::Bytes(bytes) = served.body else {
+            panic!("a wrapper has a byte body");
+        };
+        let html = String::from_utf8(bytes).expect("HTML");
+        assert!(html.contains("self.GLOBAL"));
+        assert!(html.contains("<script src=\"/dir/multi.any.js\"></script>"));
+        assert!(
+            services
+                .take_inputs()
+                .iter()
+                .any(|path| path.ends_with("dir/multi.any.js")),
+            "the wrapped script is a cache input"
         );
         std::fs::remove_dir_all(&root).expect("root removed");
     }

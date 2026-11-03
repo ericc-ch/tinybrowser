@@ -56,6 +56,8 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, TypeVar
 
+from timeouts import DEFAULT_TIMEOUT, EXTRA_TIMEOUT, LONG_TIMEOUT
+
 ROOT = Path(__file__).resolve().parents[2]
 CLI = Path(__file__).resolve()
 
@@ -1564,16 +1566,6 @@ def build_binary(options: Options) -> Path:
     return build_profile_binary("tinybrowser")
 
 
-def build_fast_binary() -> Path:
-    """Builds and returns the native test262 runner."""
-    return build_profile_binary("wpt-fast")
-
-
-def build_harness_binary() -> Path:
-    """Builds and returns the in-process testharness runner."""
-    return build_profile_binary("wpt-harness")
-
-
 def build_profile_binary(name: str) -> Path:
     out = subprocess.run(
         [str(ROOT / "tools" / "binary-path"), "--profile", "wpt", name],
@@ -1880,7 +1872,7 @@ def fast_main(options: Options, argv: list[str]) -> int:
     test262 = wpt / "third_party" / "test262"
     if not test262.is_dir():
         return die("fast", f"no test262 suite at {test262}", 1)
-    binary = build_fast_binary()
+    binary = build_profile_binary("wpt-fast")
     command = [str(binary), "--test262-root", str(test262), *argv]
     eprint("wpt: " + " ".join(command))
     try:
@@ -1913,16 +1905,99 @@ def fast_harness_main(options: Options, argv: list[str]) -> int:
     wpt = Path(os.path.realpath(wpt))
     if check_pin(wpt, options) != 0:
         return 1
-    binary = build_harness_binary()
+    binary = build_profile_binary("wpt-harness")
+    if ensure_manifest(wpt, options) != 0:
+        return 1
+    venv = Path(options.venv) if options.venv else wpt / "_venv3"
+    ensure_venv(wpt, venv, options)
+    content_types = wptserve_content_types(wpt, venv)
+    if content_types is None:
+        return 1
+    policy = [*harness_budget_flags(), "--content-types", content_types]
     shard_size, argv = take_shard_size(argv)
     if shard_size is None:
-        command = [str(binary), "--wpt-root", str(wpt), *argv]
+        command = [
+            str(binary),
+            "--wpt-root",
+            str(wpt),
+            *policy,
+            *argv,
+        ]
         eprint("wpt: " + " ".join(command))
         try:
             return subprocess.run(command, cwd=str(ROOT), check=False).returncode
         except OSError as error:
             return die("fast-harness", f"cannot run {binary}: {error}")
-    return fast_harness_shards(binary, wpt, shard_size, argv)
+    return fast_harness_shards(binary, wpt, shard_size, argv, policy)
+
+
+def harness_budget_flags() -> list[str]:
+    """The runner's wall-clock budgets, from the one timeout policy.
+
+    The in-process lane must abandon a file where the WebDriver lane does, so
+    the numbers come from `tools/wpt/timeouts.py` and travel on the command
+    line instead of being a second copy in the Rust runner.
+    """
+    normal = DEFAULT_TIMEOUT + EXTRA_TIMEOUT
+    long = LONG_TIMEOUT + EXTRA_TIMEOUT
+    return ["--normal-budget", str(normal), "--long-budget", str(long)]
+
+
+def ensure_manifest(wpt: Path, options: Options) -> int:
+    """Builds `MANIFEST.json` when the stamp says the tree moved on.
+
+    The fast lanes select tests from the manifest, so they need the same
+    freshness check the `run` lane does. Building it here keeps the walk in the
+    venv python, where upstream's manifest package and its requirements live.
+    """
+    manifest = wpt / "MANIFEST.json"
+    if manifest_is_current(wpt, manifest):
+        eprint("wpt: manifest is current, skipping update")
+        return 0
+    venv = Path(options.venv) if options.venv else wpt / "_venv3"
+    ensure_venv(wpt, venv, options)
+    exe = venv_python(venv)
+    child = [str(exe), str(CLI), "_manifest", *inner_flags(wpt, options), "--"]
+    try:
+        return subprocess.run(child, cwd=str(wpt), check=False).returncode
+    except OSError as error:
+        eprint(f"wpt: cannot run {exe}: {error}")
+        return 1
+
+
+def wptserve_content_types(wpt: Path, venv: Path) -> str | None:
+    """wptserve's extension-to-content-type map, as compact JSON.
+
+    The runner serves files, so it must guess content types exactly as the
+    WebDriver lane's wptserve does. Reading the table from the source keeps one
+    copy; `None` means the table could not be read, and the caller must refuse
+    to run rather than serve everything as binary.
+    """
+    code = (
+        "import json,sys;"
+        "sys.path.insert(0, '.');"
+        "import tools.localpaths;"
+        "from wptserve.constants import content_types;"
+        "print(json.dumps(content_types, separators=(',', ':')))"
+    )
+    exe = venv_python(venv)
+    try:
+        out = subprocess.run(
+            [str(exe), "-c", code],
+            cwd=str(wpt),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    except OSError as error:
+        eprint(f"wpt: cannot read wptserve content types: {error}")
+        return None
+    if out.returncode != 0:
+        eprint(out.stderr.decode(errors="replace").rstrip())
+        eprint("wpt: cannot read wptserve content types")
+        return None
+    table = out.stdout.decode(errors="replace").strip()
+    return table or None
 
 
 def take_shard_size(argv: list[str]) -> tuple[int | None, list[str]]:
@@ -2015,12 +2090,15 @@ def split_harness_args(argv: list[str]) -> HarnessArgs:
     return args
 
 
-def harness_selection(binary: Path, wpt: Path, args: HarnessArgs) -> list[str]:
+def harness_selection(
+    binary: Path, wpt: Path, args: HarnessArgs, policy: list[str]
+) -> list[str]:
     """The sorted wptreport ids the same selection would run."""
     command = [
         str(binary),
         "--wpt-root",
         str(wpt),
+        *policy,
         *args.paths,
         "--offset",
         str(args.offset),
@@ -2045,7 +2123,7 @@ def harness_selection(binary: Path, wpt: Path, args: HarnessArgs) -> list[str]:
 
 
 def fast_harness_shards(
-    binary: Path, wpt: Path, shard_size: int, argv: list[str]
+    binary: Path, wpt: Path, shard_size: int, argv: list[str], policy: list[str]
 ) -> int:
     """Runs the selection in chunks and bisects any chunk that crashes."""
     args = split_harness_args(argv)
@@ -2056,7 +2134,7 @@ def fast_harness_shards(
         )
     if not args.paths:
         return die("fast-harness", "--shard-size needs at least one test path")
-    ids = harness_selection(binary, wpt, args)
+    ids = harness_selection(binary, wpt, args, policy)
     if not ids:
         return die("fast-harness", "no tests selected")
     with tempfile.TemporaryDirectory(prefix="wpt-harness-shards-") as scratch:
@@ -2066,7 +2144,7 @@ def fast_harness_shards(
         reports: list[Path] = []
         if args.cache is not None:
             single = run_one_harness(
-                binary, wpt, args, ids, scratch_path / "single.json"
+                binary, wpt, args, ids, scratch_path / "single.json", policy
             )
             if single is not None:
                 reports = [single]
@@ -2081,6 +2159,7 @@ def fast_harness_shards(
                 max(1, shard_size),
                 scratch_path,
                 1,
+                policy,
             )
         if not reports:
             return die("fast-harness", "no shard produced a report")
@@ -2107,13 +2186,19 @@ def fast_harness_shards(
 
 
 def run_one_harness(
-    binary: Path, wpt: Path, args: HarnessArgs, ids: list[str], out: Path
+    binary: Path,
+    wpt: Path,
+    args: HarnessArgs,
+    ids: list[str],
+    out: Path,
+    policy: list[str],
 ) -> Path | None:
     """Runs the whole selection in one process; None means it died."""
     command = [
         str(binary),
         "--wpt-root",
         str(wpt),
+        *policy,
         *args.paths,
         "--offset",
         str(args.offset),
@@ -2132,12 +2217,15 @@ def run_one_harness(
     return out if code == 0 and out.exists() else None
 
 
-def mark_crashed(binary: Path, wpt: Path, cache: Path, test_id: str) -> None:
+def mark_crashed(
+    binary: Path, wpt: Path, cache: Path, test_id: str, policy: list[str]
+) -> None:
     """Stores an ERROR verdict so a later run does not retry a known crash."""
     command = [
         str(binary),
         "--wpt-root",
         str(wpt),
+        *policy,
         "--cache",
         str(cache),
         "--mark-crashed",
@@ -2159,6 +2247,7 @@ def run_shard_range(
     shard_size: int,
     scratch: Path,
     depth: int,
+    policy: list[str],
 ) -> list[Path]:
     """Runs one slice; on a crash, halves it instead of losing the slice.
 
@@ -2178,6 +2267,7 @@ def run_shard_range(
             str(binary),
             "--wpt-root",
             str(wpt),
+            *policy,
             *args.paths,
             "--offset",
             str(args.offset + offset),
@@ -2216,7 +2306,7 @@ def run_shard_range(
             )
             eprint(f"wpt: fast-harness: engine crashed on /{ids[offset]}")
             if args.cache is not None:
-                mark_crashed(binary, wpt, args.cache, ids[offset])
+                mark_crashed(binary, wpt, args.cache, ids[offset], policy)
             reports.append(broken)
             offset += 1
             continue
@@ -2233,6 +2323,7 @@ def run_shard_range(
                 shard_size,
                 scratch,
                 depth + 1,
+                policy,
             )
         )
         reports.extend(
@@ -2246,6 +2337,7 @@ def run_shard_range(
                 shard_size,
                 scratch,
                 depth + 1,
+                policy,
             )
         )
         offset += size

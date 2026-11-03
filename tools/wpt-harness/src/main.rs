@@ -13,11 +13,14 @@ mod cache;
 mod engine;
 mod services;
 mod suite;
+mod template;
+mod wrapper;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use cache::Cache;
 use engine::Outcome;
@@ -37,6 +40,8 @@ struct Options {
     offset: usize,
     mark_crashed: Option<String>,
     virtual_time: bool,
+    budgets: engine::Budgets,
+    content_types: HashMap<String, String>,
 }
 
 fn main() {
@@ -81,7 +86,13 @@ fn main() {
         }
         exit(0);
     }
-    let cases = match suite::select(&options.root, &options.paths, options.offset, options.limit) {
+    let cases = match suite::select(
+        &options.root,
+        &options.paths,
+        options.offset,
+        options.limit,
+        &options.content_types,
+    ) {
         Ok(cases) => cases,
         Err(error) => {
             eprintln!("wpt-harness: cannot read suite: {error}");
@@ -181,7 +192,14 @@ fn run_selected(options: &Options, cases: &[TestCase]) -> (Vec<Outcome>, usize) 
         eprintln!("wpt-harness: {cached} cached, {} to run", pending.len());
     }
     let selected: Vec<TestCase> = pending.iter().map(|index| cases[*index].clone()).collect();
-    let fresh = run_all(&options.root, &selected, options.jobs, options.virtual_time);
+    let fresh = run_all(
+        &options.root,
+        &selected,
+        options.jobs,
+        options.virtual_time,
+        options.budgets,
+        &options.content_types,
+    );
     for (index, outcome) in pending.into_iter().zip(fresh) {
         slots[index] = Some(outcome);
     }
@@ -220,6 +238,8 @@ fn run_all(
     cases: &[TestCase],
     jobs: usize,
     virtual_time: bool,
+    budgets: engine::Budgets,
+    content_types: &HashMap<String, String>,
 ) -> Vec<Outcome> {
     if cases.is_empty() {
         return Vec::new();
@@ -250,7 +270,7 @@ fn run_all(
                     // files is faster, but a page can leave a `QuickJS` class
                     // cell borrowed, and the next mount then panics inside
                     // rquickjs. A file's own engine cannot see that state.
-                    let mut session = engine::Session::new(root);
+                    let mut session = engine::Session::new(root, content_types.clone(), budgets);
                     // Layout, paint, and the bindings can panic on a hostile
                     // page. A panic is this file's ERROR, not the end of the
                     // run; the engine that saw it is abandoned rather than
@@ -337,13 +357,17 @@ Runs WPT testharness and crashtest files in-process.
   --limit N         stop after N selected files
   --offset N        skip the first N selected files (shards)
   --mark-crashed ID store an ERROR verdict for ID in --cache and exit
+  --normal-budget S wall-clock seconds before a normal file is TIMEOUT
+  --long-budget S  wall-clock seconds before a long-timeout file is TIMEOUT
+  --content-types JSON  wptserve's extension-to-content-type map
   --real-time       use the wall clock instead of the paused clock
   --verbose         print failing tests and the ten slowest files
   --list            print the selected files and exit
   -h, --help        show this help
 
 PATH is relative to the WPT root, such as dom/nodes or dom/events/foo.html.
-Reftests are selected but skipped until screenshot comparison lands.";
+Tests come from MANIFEST.json, which `cli.py manifest` builds and stamps;
+reftests and generated worker wrappers are not selected.";
 
 /// Parses the command line.
 /// Takes the next argument as a path.
@@ -367,6 +391,14 @@ fn parse_args() -> Result<Options, String> {
         offset: 0,
         mark_crashed: None,
         virtual_time: true,
+        // Replaced by the required flags below. Zero is never a real budget:
+        // `for_case` would time out before mounting, and the flag parser
+        // rejects it.
+        budgets: engine::Budgets {
+            normal: Duration::ZERO,
+            long: Duration::ZERO,
+        },
+        content_types: HashMap::new(),
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -403,6 +435,15 @@ fn parse_args() -> Result<Options, String> {
             "--mark-crashed" => {
                 options.mark_crashed = Some(args.next().ok_or("--mark-crashed needs a test id")?);
             }
+            "--normal-budget" => {
+                options.budgets.normal = seconds_arg(&mut args, "--normal-budget")?;
+            }
+            "--long-budget" => options.budgets.long = seconds_arg(&mut args, "--long-budget")?,
+            "--content-types" => {
+                let raw = args.next().ok_or("--content-types needs a JSON map")?;
+                options.content_types = serde_json::from_str(&raw)
+                    .map_err(|error| format!("--content-types is not a JSON map: {error}"))?;
+            }
             "--real-time" => options.virtual_time = false,
             "--verbose" => options.verbose = true,
             "--list" => options.list = true,
@@ -413,5 +454,27 @@ fn parse_args() -> Result<Options, String> {
     if options.paths.is_empty() && options.mark_crashed.is_none() {
         return Err("pass at least one test path".into());
     }
+    if options.budgets.normal.is_zero() || options.budgets.long.is_zero() {
+        return Err("pass --normal-budget and --long-budget in seconds \
+             (cli.py computes them from tools/wpt/timeouts.py)"
+            .into());
+    }
+    if options.content_types.is_empty() {
+        return Err("pass --content-types with wptserve's extension map \
+             (cli.py reads it from wptserve.constants)"
+            .into());
+    }
     Ok(options)
+}
+
+/// Takes the next argument as a positive number of seconds.
+fn seconds_arg(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<Duration, String> {
+    let raw = args.next().ok_or_else(|| format!("{flag} needs seconds"))?;
+    let seconds: f64 = raw
+        .parse()
+        .map_err(|_| format!("{flag} needs seconds, got {raw}"))?;
+    Duration::try_from_secs_f64(seconds)
+        .ok()
+        .filter(|duration| !duration.is_zero())
+        .ok_or_else(|| format!("{flag} needs a positive number of seconds, got {raw}"))
 }

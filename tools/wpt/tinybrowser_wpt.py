@@ -32,16 +32,7 @@ from wptrunner.executors.executorwebdriver import (
 from wptrunner.products import Product
 from wptrunner import wpttest
 
-# ── WPT timeout policy — tweak these numbers, nothing else ───────────────────
-# The runner abandons a test at (budget + EXTRA_TIMEOUT) seconds and reports
-# TIMEOUT. Normal files get DEFAULT_TIMEOUT; files declaring
-# `<meta name=timeout content=long>` get LONG_TIMEOUT in its place. Slow and
-# hanging are the same failure here, so both budgets sit far below the page's
-# own clock (testharness.js: 10 s normal / 60 s long) — the runner kill has to
-# land first or that clock stays the binding one.
-DEFAULT_TIMEOUT = 3  # seconds; upstream 10
-LONG_TIMEOUT = 5  # seconds; upstream 60
-EXTRA_TIMEOUT = 2  # seconds; upstream 5
+from timeouts import DEFAULT_TIMEOUT, EXTRA_TIMEOUT, LONG_TIMEOUT
 
 wpttest.Test.default_timeout = DEFAULT_TIMEOUT
 wpttest.Test.long_timeout = LONG_TIMEOUT
