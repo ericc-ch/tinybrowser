@@ -509,8 +509,6 @@ impl<'js> html_marquee_element_generated::HTMLMarqueeElement<'js> for JsNode {
     }
 }
 
-impl html_audio_element_generated::HTMLAudioElement<'_> for JsNode {}
-
 impl JsNode {
     // https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-naturalwidth
     pub(super) fn natural_width(&self, ctx: Ctx<'_>) -> Result<u32> {

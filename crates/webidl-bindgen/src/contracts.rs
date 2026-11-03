@@ -459,12 +459,7 @@ fn lower(
         secure_context,
         contract: None,
     };
-    interface.contract = Some(lower_members(
-        database,
-        &declaration,
-        implementation,
-        &mut interface,
-    )?);
+    interface.contract = lower_members(database, &declaration, implementation, &mut interface)?;
     if matches!(interface.kind, InterfaceKind::Partial)
         && (interface.constructor.is_some() || !matches!(interface.properties, PropertyHooks::None))
     {
@@ -532,12 +527,7 @@ fn lower_mixin(
         parent: None,
         members: mixin.members.clone(),
     };
-    interface.contract = Some(lower_members(
-        database,
-        &declaration,
-        implementation,
-        &mut interface,
-    )?);
+    interface.contract = lower_members(database, &declaration, implementation, &mut interface)?;
     add_referenced_definitions(database, &mut interface)?;
     Ok(interface)
 }
@@ -569,7 +559,7 @@ fn lower_members(
     declaration: &crate::database::Interface<'_>,
     implementation: &Implementation,
     interface: &mut model::Interface,
-) -> Result<TokenStream, Error> {
+) -> Result<Option<TokenStream>, Error> {
     let mut remaining = implementation.methods.clone();
     let mut methods = Vec::new();
     let mut getters = Vec::new();
@@ -698,15 +688,18 @@ fn lower_members(
     interface.properties =
         infer_property_hooks(declaration, &getters, &mut remaining, &mut methods)?;
     ensure_no_extra_methods(&remaining)?;
-    let name = format_ident!("{}", declaration.name);
     // A fully generated contract (such as `[Reflect]`-only members) has no
-    // trait methods; the empty trait still marks the implementation.
-    let allow = if methods.is_empty() {
-        quote! { #[allow(dead_code, reason = "fully generated contracts have no trait methods")] }
-    } else {
-        quote! {}
-    };
-    Ok(quote! { #allow pub(crate) trait #name<'js> { #(#methods)* } })
+    // trait methods: the generator supplies the whole dispatch and there is
+    // nothing an implementation could fill in. An empty trait would be an item
+    // with no reader, so it is not emitted at all, and the implementation has
+    // no trait to name either.
+    if methods.is_empty() {
+        return Ok(None);
+    }
+    let name = format_ident!("{}", declaration.name);
+    Ok(Some(
+        quote! { pub(crate) trait #name<'js> { #(#methods)* } },
+    ))
 }
 
 /// Reject implementation methods that no IDL member consumed.

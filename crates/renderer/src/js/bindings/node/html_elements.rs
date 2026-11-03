@@ -98,36 +98,6 @@ impl<'js> html_area_element_generated::HTMLAreaElement<'js> for JsNode {
     }
 }
 
-impl html_body_element_generated::HTMLBodyElement<'_> for JsNode {}
-
-impl htmlbr_element_generated::HTMLBRElement<'_> for JsNode {}
-
-impl html_table_caption_element_generated::HTMLTableCaptionElement<'_> for JsNode {}
-
-impl html_data_element_generated::HTMLDataElement<'_> for JsNode {}
-
-impl html_details_element_generated::HTMLDetailsElement<'_> for JsNode {}
-
-impl html_dialog_element_generated::HTMLDialogElement<'_> for JsNode {}
-
-impl html_directory_element_generated::HTMLDirectoryElement<'_> for JsNode {}
-
-impl html_div_element_generated::HTMLDivElement<'_> for JsNode {}
-
-impl htmld_list_element_generated::HTMLDListElement<'_> for JsNode {}
-
-impl html_font_element_generated::HTMLFontElement<'_> for JsNode {}
-
-impl html_frame_set_element_generated::HTMLFrameSetElement<'_> for JsNode {}
-
-impl html_head_element_generated::HTMLHeadElement<'_> for JsNode {}
-
-impl html_heading_element_generated::HTMLHeadingElement<'_> for JsNode {}
-
-impl htmlhr_element_generated::HTMLHRElement<'_> for JsNode {}
-
-impl html_html_element_generated::HTMLHtmlElement<'_> for JsNode {}
-
 impl<'js> htmlli_element_generated::HTMLLIElement<'js> for JsNode {
     // `value` is a plain long defaulting to zero
     // (<https://html.spec.whatwg.org/multipage/grouping-content.html#dom-li-value>).
@@ -143,10 +113,6 @@ impl<'js> htmlli_element_generated::HTMLLIElement<'js> for JsNode {
         set_attribute_sync(ctx, self.handle.0, "value", &value.to_string())
     }
 }
-
-impl html_menu_element_generated::HTMLMenuElement<'_> for JsNode {}
-
-impl html_mod_element_generated::HTMLModElement<'_> for JsNode {}
 
 impl<'js> htmlo_list_element_generated::HTMLOListElement<'js> for JsNode {
     // `start` defaults to 1
@@ -164,10 +130,6 @@ impl<'js> htmlo_list_element_generated::HTMLOListElement<'js> for JsNode {
     }
 }
 
-impl html_paragraph_element_generated::HTMLParagraphElement<'_> for JsNode {}
-
-impl html_picture_element_generated::HTMLPictureElement<'_> for JsNode {}
-
 impl<'js> html_pre_element_generated::HTMLPreElement<'js> for JsNode {
     // `width` is a plain long defaulting to zero
     // (<https://html.spec.whatwg.org/multipage/obsolete.html#dom-pre-width>).
@@ -183,12 +145,6 @@ impl<'js> html_pre_element_generated::HTMLPreElement<'js> for JsNode {
         set_attribute_sync(ctx, self.handle.0, "width", &value.to_string())
     }
 }
-
-impl html_quote_element_generated::HTMLQuoteElement<'_> for JsNode {}
-
-impl html_span_element_generated::HTMLSpanElement<'_> for JsNode {}
-
-impl html_style_element_generated::HTMLStyleElement<'_> for JsNode {}
 
 impl<'js> html_table_cell_element_generated::HTMLTableCellElement<'js> for JsNode {
     // `colSpan` parses 1..1000, defaulting to 1
@@ -260,12 +216,6 @@ impl<'js> html_table_col_element_generated::HTMLTableColElement<'js> for JsNode 
     }
 }
 
-impl html_time_element_generated::HTMLTimeElement<'_> for JsNode {}
-
-impl html_title_element_generated::HTMLTitleElement<'_> for JsNode {}
-
-impl htmlu_list_element_generated::HTMLUListElement<'_> for JsNode {}
-
 impl<'js> html_base_element_generated::HTMLBaseElement<'js> for JsNode {
     // Unlike generic URL reflection, an absent `href` falls back to the
     // document base URL rather than the empty string
@@ -327,8 +277,6 @@ impl<'js> html_link_element_generated::HTMLLinkElement<'js> for JsNode {
     }
 }
 
-impl html_embed_element_generated::HTMLEmbedElement<'_> for JsNode {}
-
 impl<'js> html_script_element_generated::HTMLScriptElement<'js> for JsNode {
     // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-referrerpolicy
     fn get_referrer_policy(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
@@ -351,8 +299,6 @@ impl<'js> html_script_element_generated::HTMLScriptElement<'js> for JsNode {
     }
 }
 
-impl html_source_element_generated::HTMLSourceElement<'_> for JsNode {}
-
 impl<'js> html_track_element_generated::HTMLTrackElement<'js> for JsNode {
     // `kind` defaults to `subtitles`; unknown values read `metadata`
     // (<https://html.spec.whatwg.org/multipage/media.html#dom-track-kind>).
@@ -372,10 +318,6 @@ impl<'js> html_track_element_generated::HTMLTrackElement<'js> for JsNode {
         set_attribute_sync(ctx, self.handle.0, "kind", &value.to_string()?)
     }
 }
-
-impl html_meta_element_generated::HTMLMetaElement<'_> for JsNode {}
-
-impl html_map_element_generated::HTMLMapElement<'_> for JsNode {}
 
 impl<'js> html_object_element_generated::HTMLObjectElement<'js> for JsNode {
     /// <https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form>
@@ -427,10 +369,6 @@ impl<'js> html_object_element_generated::HTMLObjectElement<'js> for JsNode {
         set_attribute_sync(ctx, self.handle.0, "codebase", &value.to_string()?)
     }
 }
-
-impl html_param_element_generated::HTMLParamElement<'_> for JsNode {}
-
-impl html_slot_element_generated::HTMLSlotElement<'_> for JsNode {}
 
 impl<'js> html_table_element_generated::HTMLTableElement<'js> for JsNode {
     /// <https://html.spec.whatwg.org/multipage/tables.html#dom-table-tbodies>

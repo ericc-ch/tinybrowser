@@ -505,20 +505,12 @@ impl<'js> html_field_set_element_generated::HTMLFieldSetElement<'js> for JsNode 
     }
 }
 
-impl html_opt_group_element_generated::HTMLOptGroupElement<'_> for JsNode {}
-
 impl<'js> html_output_element_generated::HTMLOutputElement<'js> for JsNode {
     /// <https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form>
     fn get_form(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         self.form(ctx.clone())
     }
 }
-
-impl html_data_list_element_generated::HTMLDataListElement<'_> for JsNode {}
-
-impl html_label_element_generated::HTMLLabelElement<'_> for JsNode {}
-
-impl html_legend_element_generated::HTMLLegendElement<'_> for JsNode {}
 
 impl JsNode {
     // https://html.spec.whatwg.org/multipage/input.html#dom-input-value

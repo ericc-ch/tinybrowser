@@ -147,7 +147,9 @@ fn member_tables(interface: &Interface) -> TokenStream {
 /// further check.
 fn receiver_check(interface: &Interface, rust: &proc_macro2::Ident) -> TokenStream {
     let name = &interface.name;
-    if matches!(interface.kind, InterfaceKind::Partial) && interface.contract.is_some() {
+    // A partial binding has no class of its own, so it always checks the brand
+    // the shared class installed, whether or not the contract has members.
+    if matches!(interface.kind, InterfaceKind::Partial) {
         quote! { host::SharedClass::require_interface(&*receiver, &ctx, #name)?; }
     } else if rust == "JsNode" && interface.name != "Node" {
         quote! { host::require_node_interface(&ctx, receiver.node_id(), #name)?; }
