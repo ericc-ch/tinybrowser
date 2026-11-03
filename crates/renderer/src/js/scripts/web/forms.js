@@ -3,37 +3,10 @@
 // Rust binding (docs/engines.md), so this file only reads
 // attributes and the `value` IDL attribute.
 (function() {
-  // Rules for parsing integers, capped at the 32-bit range
-  // (<https://infra.spec.whatwg.org/#rules-for-parsing-integers>).
-  const parseInteger = value => {
-    const text = String(value);
-    let i = 0;
-    while (i < text.length && ' \t\n\f\r'.includes(text[i])) i++;
-    let sign = 1;
-    if (text[i] === '-') { sign = -1; i++; }
-    else if (text[i] === '+') { i++; }
-    const start = i;
-    let result = 0;
-    while (i < text.length && text[i] >= '0' && text[i] <= '9') {
-      result = result * 10 + (text.charCodeAt(i) - 48);
-      if (result > 2147483648) return null;
-      i++;
-    }
-    if (i === start) return null;
-    result *= sign;
-    if (result < -2147483648 || result > 2147483647) return null;
-    // Normalize `-0` to `+0`: SameValue distinguishes them.
-    return result === 0 ? 0 : result;
-  };
-
-  // Rules for parsing non-negative integers: signed parsing with negatives
-  // rejected, so `-0` still yields `0`
+  // Rules for parsing non-negative integers live in the engine's one
+  // microsyntax implementation
   // (<https://infra.spec.whatwg.org/#rules-for-parsing-non-negative-integers>).
-  const parseNonNegative = value => {
-    const parsed = parseInteger(value);
-    if (parsed === null || parsed < 0) return null;
-    return parsed;
-  };
+  const parseNonNegative = value => host.__tbParseNonNegativeInteger(String(value));
 
   // ASCII whitespace stripping only: Unicode `trim()` would strip NBSP and
   // friends that the infra grammars must reject
@@ -353,106 +326,12 @@
     return !expression.test(element.value);
   };
 
-  // Value-as-number scales for the date-like states, in each state's step
-  // unit: days for date, months for month, weeks for week, seconds for time
-  // and datetime-local
-  // (<https://html.spec.whatwg.org/multipage/input.html#value-as-a-number>).
-  const daysFromCivil = (year, month, day) => {
-    const y = year - (month <= 2 ? 1 : 0);
-    const era = Math.floor((y >= 0 ? y : y - 399) / 400);
-    const yearOfEra = y - era * 400;
-    const dayOfYear = Math.floor((153 * (month + (month > 2 ? -3 : 9)) + 2) / 5) + day - 1;
-    const dayOfEra = yearOfEra * 365
-      + Math.floor(yearOfEra / 4) - Math.floor(yearOfEra / 100) + dayOfYear;
-    return era * 146097 + dayOfEra - 719468;
-  };
-  // Monday is 0 ... Sunday is 6; 1970-01-01 was a Thursday.
-  const weekdayFromDays = days => (((days % 7) + 10) % 7);
-  const isLeapYear = year =>
-    year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
-  const daysInMonth = (year, month) => {
-    if (month === 2) return isLeapYear(year) ? 29 : 28;
-    return [4, 6, 9, 11].includes(month) ? 30 : 31;
-  };
-  // A valid date string requires year > 0, a month in 1..=12, and a day
-  // present in that month
-  // (<https://html.spec.whatwg.org/multipage/common-microsyntaxes.html#valid-date-string>).
-  const parseDate = value => {
-    const match = /^(\d{4,})-(\d{2})-(\d{2})$/.exec(value);
-    if (!match) return null;
-    const year = +match[1];
-    const month = +match[2];
-    const day = +match[3];
-    if (year === 0 || month < 1 || month > 12) return null;
-    if (day < 1 || day > daysInMonth(year, month)) return null;
-    return daysFromCivil(year, month, day);
-  };
-  const parseMonth = value => {
-    const match = /^(\d{4,})-(\d{2})$/.exec(value);
-    if (!match) return null;
-    const year = +match[1];
-    const month = +match[2];
-    if (year === 0 || month < 1 || month > 12) return null;
-    return (year - 1970) * 12 + month - 1;
-  };
-  const epochMonday = (() => {
-    const januaryFirst = daysFromCivil(1970, 1, 1);
-    return januaryFirst - weekdayFromDays(januaryFirst);
-  })();
-  // The ISO week number of December 28, which is always in the last week.
-  const weeksInYear = year => {
-    const days = daysFromCivil(year, 12, 28);
-    const januaryFourth = daysFromCivil(year, 1, 4);
-    const mondayOfWeekOne = januaryFourth - weekdayFromDays(januaryFourth);
-    return Math.floor((days - mondayOfWeekOne) / 7) + 1;
-  };
-  const parseWeek = value => {
-    const match = /^(\d{4,})-W(\d{2})$/.exec(value);
-    if (!match) return null;
-    const year = +match[1];
-    const week = +match[2];
-    if (year === 0 || week < 1 || week > weeksInYear(year)) return null;
-    const januaryFourth = daysFromCivil(year, 1, 4);
-    const mondayOfWeekOne = januaryFourth - weekdayFromDays(januaryFourth);
-    return (mondayOfWeekOne - epochMonday) / 7 + week - 1;
-  };
-  const parseTime = value => {
-    const match = /^(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?$/.exec(value);
-    if (!match) return null;
-    const hour = +match[1];
-    const minute = +match[2];
-    const second = +(match[3] || 0);
-    if (hour > 23 || minute > 59 || second > 59) return null;
-    const fraction = match[4] || '';
-    return hour * 3600 + minute * 60 + second
-      + (+fraction) / 10 ** fraction.length;
-  };
-  const parseLocalDateTime = value => {
-    const match = /^(\d{4,}-\d{2}-\d{2})[T ](\d{2}:\d{2}(?::\d{2}(?:\.\d{1,3})?)?)$/.exec(value);
-    if (!match) return null;
-    const days = parseDate(match[1]);
-    const seconds = parseTime(match[2]);
-    return days === null || seconds === null ? null : days * 86400 + seconds;
-  };
-  const parseValue = (type, value) => {
-    if (value === null || value === '') return null;
-    switch (type) {
-      case 'number':
-      case 'range': {
-        const number = Number(value);
-        return Number.isFinite(number) ? number : null;
-      }
-      case 'date': return parseDate(value);
-      case 'month': return parseMonth(value);
-      case 'week': return parseWeek(value);
-      case 'time': return parseTime(value);
-      case 'datetime-local': return parseLocalDateTime(value);
-      default: return null;
-    }
-  };
-  const STEP_DEFAULT = {
-    date: 1, month: 1, week: 1, time: 60, 'datetime-local': 60, number: 1, range: 1,
-  };
+  // The value interpreted in its state's step unit (days, months, weeks, or
+  // seconds), or `null` when the string is not valid in that state. The engine
+  // owns the one copy of the microsyntax grammar
+  // (<https://html.spec.whatwg.org/multipage/input.html#dom-input-valueasnumber>).
+  const parseValue = (type, value) =>
+    value === null ? null : host.__tbValueInUnits(type, value);
   const valueAsNumber = element => parseValue(inputType(element), element.value);
   const rangeUnderflow = element => {
     const value = valueAsNumber(element);
@@ -474,82 +353,16 @@
     if (min !== null && min > max) return value > max && value < min;
     return value > max;
   };
-  // Parses a decimal string into an exact `BigInt` scaled by a power of ten,
-  // plus its rounded `number`
-  // (<https://html.spec.whatwg.org/multipage/common-microsyntaxes.html#rules-for-parsing-floating-point-number-values>):
-  // trailing garbage is ignored and a `.` may be followed directly by the
-  // exponent (`1.e2` is 100). A value that rounds to infinity is an error; one that
-  // rounds to zero is zero, which also keeps the `BigInt` power bounded by
-  // the input length.
-  const parseDecimal = text => {
-    const match = /^([+-]?)(\d*)(?:\.(\d*))?(?:[eE]([+-]?\d+))?/.exec(text);
-    const integer = match[2];
-    const fraction = match[3] || '';
-    if (integer === '' && fraction === '') return null;
-    const exponent = match[4] || '0';
-    const number = Number(`${match[1]}${integer || '0'}.${fraction || '0'}e${exponent}`) + 0;
-    if (!Number.isFinite(number)) return null;
-    if (number === 0) return { value: 0n, scale: 0, number };
-    const sign = match[1] === '-' ? -1n : 1n;
-    let value = BigInt(integer + fraction) * sign;
-    let scale = fraction.length - Number(exponent);
-    if (scale < 0) {
-      value *= 10n ** BigInt(-scale);
-      scale = 0;
-    }
-    return { value, scale, number };
-  };
-  const atScale = (decimal, scale) => decimal.value * 10n ** BigInt(scale - decimal.scale);
-  // A `step` attribute parsed by the floating-point rules alone:
-  // `Number()` would also accept "0x10", "Infinity", and "1e999"
-  // (infinite), none of which are valid step values; anything unparseable
-  // or non-positive falls back to the default step.
+  // A `step` attribute by the engine's floating-point grammar: anything
+  // unparseable or non-positive falls back to the default step
+  // (<https://html.spec.whatwg.org/multipage/input.html#the-step-attribute>).
   const parseStep = (raw, fallback) => {
     if (raw === null) return fallback;
-    const parsed = parseDecimal(asciiTrim(raw));
-    if (parsed === null) return fallback;
-    return parsed.number > 0 ? parsed.number : fallback;
+    const parsed = host.__tbParseFloat(asciiTrim(raw));
+    return parsed !== null && parsed > 0 ? parsed : fallback;
   };
 
-  const stepMismatch = element => {
-    const type = inputType(element);
-    const fallback = STEP_DEFAULT[type];
-    if (fallback === undefined) return false;
-    const rawStep = element.getAttribute('step');
-    if (rawStep !== null && __tbAsciiLower(asciiTrim(rawStep)) === 'any') return false;
-    if (type === 'number' || type === 'range') {
-      // Exact decimal arithmetic: a very small step with a large value loses
-      // the fraction in f64
-      // (<https://html.spec.whatwg.org/multipage/input.html#the-step-attribute>).
-      const value = parseDecimal(element.value);
-      if (value === null) return false;
-      let step = rawStep === null ? null : parseDecimal(asciiTrim(rawStep));
-      if (step === null || step.value <= 0n) step = { value: 1n, scale: 0 };
-      // The step base is the min attribute, else the value attribute, else 0.
-      let base = null;
-      const minText = element.getAttribute('min');
-      if (minText !== null) base = parseDecimal(asciiTrim(minText));
-      if (base === null) {
-        const valueText = element.getAttribute('value');
-        if (valueText !== null) base = parseDecimal(asciiTrim(valueText));
-      }
-      if (base === null) base = { value: 0n, scale: 0 };
-      const scale = Math.max(value.scale, base.scale, step.scale);
-      return (atScale(value, scale) - atScale(base, scale)) % atScale(step, scale) !== 0n;
-    }
-    // The date-like states work in their `parseValue` unit (days, months,
-    // weeks, or seconds), which is the step scale factor's unit.
-    const value = parseValue(type, element.value);
-    if (value === null) return false;
-    const step = parseStep(rawStep, fallback);
-    // The step base is the min attribute, else the value attribute, else 0.
-    let base = parseValue(type, element.getAttribute('min'));
-    if (base === null) base = parseValue(type, element.getAttribute('value'));
-    if (base === null) base = 0;
-    const remainder = Math.abs((value - base) % step);
-    if (remainder === 0) return false;
-    return Math.min(remainder, step - remainder) > step * 1e-9;
-  };
+  const stepMismatch = element => host.__tbStepMismatch(element);
 
   const FLAGS = {
     valueMissing,
@@ -1406,6 +1219,23 @@
     return { year: year + (month <= 2 ? 1 : 0), month, day };
   };
   const pad = (number, width) => String(number).padStart(width, '0');
+  // Days since 1970-01-01 for a civil date, the inverse of `civilFromDays`
+  // (<https://howardhinnant.github.io/date_algorithms.html#days_from_civil>).
+  const daysFromCivil = (year, month, day) => {
+    const y = year - (month <= 2 ? 1 : 0);
+    const era = Math.floor((y >= 0 ? y : y - 399) / 400);
+    const yearOfEra = y - era * 400;
+    const dayOfYear = Math.floor((153 * (month + (month > 2 ? -3 : 9)) + 2) / 5) + day - 1;
+    const dayOfEra = yearOfEra * 365
+      + Math.floor(yearOfEra / 4) - Math.floor(yearOfEra / 100) + dayOfYear;
+    return era * 146097 + dayOfEra - 719468;
+  };
+  // Monday is 0 ... Sunday is 6; 1970-01-01 was a Thursday.
+  const weekdayFromDays = days => (((days % 7) + 10) % 7);
+  // The Monday of the week containing 1970-01-01, three days before day zero,
+  // is the week-numbering origin
+  // (<https://html.spec.whatwg.org/multipage/common-microsyntaxes.html#week-number-of-the-last-day>).
+  const epochMonday = -3;
   // Date objects stop at 275760-09-13; a valueAsNumber outside that range
   // serializes to the empty string
   // (<https://html.spec.whatwg.org/multipage/input.html#dom-input-valueasnumber>).
@@ -1441,38 +1271,11 @@
   };
 
   // The input's value as a number in each state's scale, or NaN
-  // (<https://html.spec.whatwg.org/multipage/input.html#value-as-a-number>).
+  // (<https://html.spec.whatwg.org/multipage/input.html#dom-input-valueasnumber>).
+  // The engine owns the single grammar and the per-state unit.
   const valueAsNumberOf = element => {
-    const type = inputType(element);
-    const value = element.value;
-    if (value === '') return NaN;
-    switch (type) {
-      case 'number': case 'range': {
-        const number = Number(value);
-        return Number.isNaN(number) ? NaN : number;
-      }
-      case 'date': {
-        const days = parseDate(value);
-        return days === null ? NaN : days * 86400000;
-      }
-      case 'month': {
-        const index = parseMonth(value);
-        return index === null ? NaN : index;
-      }
-      case 'week': {
-        const weeks = parseWeek(value);
-        return weeks === null ? NaN : (epochMonday + weeks * 7) * 86400000;
-      }
-      case 'time': {
-        const seconds = parseTime(value);
-        return seconds === null ? NaN : seconds * 1000;
-      }
-      case 'datetime-local': {
-        const seconds = parseLocalDateTime(value);
-        return seconds === null ? NaN : seconds * 1000;
-      }
-      default: return NaN;
-    }
+    const value = host.__tbValueAsNumber(inputType(element), element.value);
+    return value === null ? NaN : value;
   };
 
   const whole = value => Math.abs(value - Math.round(value)) < 1e-9;
@@ -1517,22 +1320,18 @@
   const valueAsDateOf = element => {
     const type = inputType(element);
     if (!DATE_VALUE_TYPES.has(type) || element.value === '') return null;
+    const units = host.__tbValueInUnits(type, element.value);
+    if (units === null) return null;
     let milliseconds = NaN;
     if (type === 'date') {
-      const days = parseDate(element.value);
-      if (days !== null) milliseconds = days * 86400000;
+      milliseconds = units * 86400000;
     } else if (type === 'month') {
-      const index = parseMonth(element.value);
-      if (index !== null) {
-        const months = index + 1970 * 12;
-        milliseconds = daysFromCivil(Math.floor(months / 12), (months % 12) + 1, 1) * 86400000;
-      }
+      const months = units + 1970 * 12;
+      milliseconds = daysFromCivil(Math.floor(months / 12), (months % 12) + 1, 1) * 86400000;
     } else if (type === 'week') {
-      const weeks = parseWeek(element.value);
-      if (weeks !== null) milliseconds = (epochMonday + weeks * 7) * 86400000;
+      milliseconds = (epochMonday + units * 7) * 86400000;
     } else {
-      const seconds = parseTime(element.value);
-      if (seconds !== null) milliseconds = seconds * 1000;
+      milliseconds = units * 1000;
     }
     return Number.isNaN(milliseconds) ? null : new Date(milliseconds);
   };
@@ -1580,12 +1379,18 @@
   // (<https://html.spec.whatwg.org/multipage/input.html#dom-input-stepup>).
   const stepBy = (element, count, direction) => {
     const type = inputType(element);
-    const fallback = STEP_DEFAULT[type];
-    if (fallback === undefined) {
+    // The engine owns the per-state default-step table, so `stepUp` and the
+    // validity flag cannot disagree about which states step or by how much
+    // (<https://html.spec.whatwg.org/multipage/input.html#the-step-attribute>).
+    const fallback = host.__tbDefaultStep(type);
+    if (fallback === null) {
       throw new DOMException('stepUp is not applicable', 'InvalidStateError');
     }
     const raw = element.getAttribute('step');
-    if (raw !== null && __tbAsciiLower(asciiTrim(raw)) === 'any') {
+    // The step attribute's `any` keyword is an ASCII case-insensitive match on
+    // the attribute value, not a trimmed token
+    // (<https://html.spec.whatwg.org/multipage/input.html#the-step-attribute>).
+    if (raw !== null && __tbAsciiLower(raw) === 'any') {
       throw new DOMException('step is any', 'InvalidStateError');
     }
     const step = parseStep(raw, fallback);
@@ -1622,11 +1427,8 @@
       // so 1.2 - 0.3 serializes as 0.9
       // (<https://html.spec.whatwg.org/multipage/input.html#dom-input-stepdown>).
       const text = raw === null ? String(fallback) : asciiTrim(raw);
-      const match = /^[+-]?(\d*)(?:\.(\d*))?(?:[eE]([+-]?\d+))?$/.exec(text);
-      const fraction = match === null ? 0 : (match[2] || '').length;
-      const exponent = match === null ? 0 : Number(match[3] || 0);
-      const scale = Math.max(0, fraction - exponent);
-      if (scale <= 20) value = Number(value.toFixed(scale));
+      const scale = host.__tbDecimalScale(text);
+      if (scale === null || scale <= 20) value = Number(value.toFixed(scale ?? 0));
     }
     element.value = formatValueInUnit(type, value);
   };
@@ -1870,11 +1672,11 @@
     Object.defineProperty(globalThis.HTMLProgressElement.prototype, 'position', {
       get() {
         if (!this.hasAttribute('value')) return -1;
-        const value = parseDecimal(asciiTrim(this.getAttribute('value')));
-        const maximum = parseDecimal(asciiTrim(this.getAttribute('max')));
+        const value = host.__tbParseFloat(asciiTrim(this.getAttribute('value')));
+        const maximum = host.__tbParseFloat(asciiTrim(this.getAttribute('max')));
         if (value === null) return 0;
-        const max = maximum === null || maximum.number <= 0 ? 1 : maximum.number;
-        return Math.min(Math.max(value.number / max, 0), 1);
+        const max = maximum === null || maximum <= 0 ? 1 : maximum;
+        return Math.min(Math.max(value / max, 0), 1);
       },
       configurable: true,
     });

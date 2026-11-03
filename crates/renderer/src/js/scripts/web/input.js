@@ -163,7 +163,7 @@
   // A number control's exposed value is sanitized to empty while the user has
   // typed only a partial number (`1e`), but the editor must remember that
   // partial text so the next keystroke can complete it
-  // (<https://html.spec.whatwg.org/multipage/input.html#the-number-state-(type=number)>).
+  // (<https://html.spec.whatwg.org/multipage/input.html#number-state-(type=number)>).
   const numberBuffer = new WeakMap();
   const badInputs = host.slots('tinybrowser.number.badinput');
   const editText = element =>
@@ -193,11 +193,14 @@
     else internalCaret.set(element, position);
   };
   // A number control may hold a partial number while the user types
-  // (`-`, `1.`, `1e+`). Anything else is rejected instead of corrupting the
-  // value into something `valueAsNumber` cannot read
-  // (<https://html.spec.whatwg.org/multipage/input.html#the-number-state-(type=number)>).
-  const numberPrefix = /^[+-]?(?:\d+\.?\d*|\.\d+)?(?:[eE][+-]?\d*)?$/;
-  const completeNumber = /^[+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?$/;
+  // (`-`, `1.`, `1e+`). The engine classifies the edit buffer against its one
+  // floating-point grammar; anything else is rejected instead of corrupting
+  // the value into something `valueAsNumber` cannot read
+  // (<https://html.spec.whatwg.org/multipage/input.html#number-state-(type=number)>).
+  const NUMBER_INVALID = 0;
+  const NUMBER_EMPTY = 1;
+  const NUMBER_COMPLETE = 3;
+  const NUMBER_TRAILING_DOT = 4;
   // A programmatic value assignment starts a fresh edit at the new end.
   const inputValue = Object.getOwnPropertyDescriptor(globalThis.HTMLInputElement.prototype, 'value');
   Object.defineProperty(globalThis.HTMLInputElement.prototype, 'value', {
@@ -265,22 +268,23 @@
     if (element.tagName === 'INPUT' && element.type === 'number') {
       const buffer = editText(element);
       const value = buffer.slice(0, start) + text + buffer.slice(end);
-      if (value !== '' && !numberPrefix.test(value)) return;
+      const state = host.__tbNumberBufferState(value);
+      if (state === NUMBER_INVALID) return;
       numberBuffer.set(element, value);
       // A trailing dot parses as the integer before it, so `1.` exposes `1`
       // rather than bad input. Other incomplete buffers expose the empty
       // string and set `badInput`. A leading `+` stays in the edit buffer but
       // is dropped from the sanitized value, which the number state does not
       // accept
-      // (<https://html.spec.whatwg.org/multipage/input.html#the-number-state-(type=number)>).
+      // (<https://html.spec.whatwg.org/multipage/input.html#number-state-(type=number)>).
       let exposed = '';
-      if (completeNumber.test(value)) {
+      if (state === NUMBER_COMPLETE) {
         exposed = value.startsWith('+') ? value.slice(1) : value;
         badInputs.delete(element);
-      } else if (/^[+-]?\d+\.$/.test(value)) {
+      } else if (state === NUMBER_TRAILING_DOT) {
         exposed = value.startsWith('+') ? value.slice(1, -1) : value.slice(0, -1);
         badInputs.delete(element);
-      } else if (value === '') {
+      } else if (state === NUMBER_EMPTY) {
         badInputs.delete(element);
       } else {
         badInputs.add(element);

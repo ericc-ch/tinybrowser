@@ -217,6 +217,112 @@ pub(crate) struct Time {
     pub(crate) millis: u64,
 }
 
+/// Days since 1970-01-01 for a proleptic Gregorian date (Howard Hinnant's
+/// `days_from_civil`). The microsyntax allows any year above zero, so the
+/// arithmetic is i128: a huge year must not overflow and panic.
+fn days_from_civil(year: u64, month: u64, day: u64) -> i128 {
+    let year = i128::from(year);
+    let month = i128::from(month);
+    let day = i128::from(day);
+    let year = year - i128::from(month <= 2);
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let month_index = month + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * month_index + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
+/// Days since the epoch for a valid date string
+/// (<https://html.spec.whatwg.org/multipage/common-microsyntaxes.html#valid-date-string>).
+pub(crate) fn date_value(value: &str) -> Option<i128> {
+    let mut parts = value.split('-');
+    let year = parts.next().and_then(parse_year)?;
+    let month = parts.next().and_then(parse_two_digits)?;
+    let day = parts.next().and_then(parse_two_digits)?;
+    if parts.next().is_some() || !(1..=12).contains(&month) {
+        return None;
+    }
+    if !(1..=days_in_month(year, month)).contains(&day) {
+        return None;
+    }
+    Some(days_from_civil(year, month, day))
+}
+
+/// Months since 1970-01 for a valid month string
+/// (<https://html.spec.whatwg.org/multipage/common-microsyntaxes.html#valid-month-string>).
+pub(crate) fn month_value(value: &str) -> Option<i128> {
+    let mut parts = value.split('-');
+    let year = parts.next().and_then(parse_year)?;
+    let month = parts.next().and_then(parse_two_digits)?;
+    if parts.next().is_some() || !(1..=12).contains(&month) {
+        return None;
+    }
+    Some((i128::from(year) - 1970) * 12 + i128::from(month) - 1)
+}
+
+/// The Monday of the week containing 1970-01-01, as days since the epoch.
+const EPOCH_MONDAY: i128 = -3;
+
+/// The weekday of a count of days since the epoch, with Monday as 0
+/// (1970-01-01 was a Thursday).
+fn weekday_from_days(days: i128) -> i128 {
+    ((days % 7) + 10) % 7
+}
+
+/// Weeks since [`EPOCH_MONDAY`] for a valid week string
+/// (<https://html.spec.whatwg.org/multipage/common-microsyntaxes.html#valid-week-string>).
+pub(crate) fn week_value(value: &str) -> Option<i128> {
+    let (year, rest) = value.split_once('-')?;
+    let week = rest.strip_prefix('W').and_then(parse_two_digits)?;
+    let year = parse_year(year)?;
+    let weeks = if january_first_weekday(year) == 3
+        || (is_leap_year(year) && january_first_weekday(year) == 2)
+    {
+        53
+    } else {
+        52
+    };
+    if !(1..=weeks).contains(&week) {
+        return None;
+    }
+    let january_fourth = days_from_civil(year, 1, 4);
+    let monday_of_week_one = january_fourth - weekday_from_days(january_fourth);
+    Some((monday_of_week_one - EPOCH_MONDAY) / 7 + i128::from(week) - 1)
+}
+
+/// Seconds since midnight for a valid time string, with any millisecond
+/// fraction
+/// (<https://html.spec.whatwg.org/multipage/common-microsyntaxes.html#valid-time-string>).
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "all four fields are at most 59 or 999, far below 2^53"
+)]
+pub(crate) fn time_value(value: &str) -> Option<f64> {
+    let time = valid_time(value)?;
+    Some(
+        time.hour as f64 * 3600.0
+            + time.minute as f64 * 60.0
+            + time.second as f64
+            + time.millis as f64 / 1000.0,
+    )
+}
+
+/// Days since the epoch (with a fractional part) for a valid local date and
+/// time string
+/// (<https://html.spec.whatwg.org/multipage/common-microsyntaxes.html#valid-local-date-and-time-string>).
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "f64 represents any day count the microsyntax allows"
+)]
+pub(crate) fn local_datetime_value(value: &str) -> Option<f64> {
+    let separator = value.find(['T', ' '])?;
+    let (date, rest) = value.split_at(separator);
+    let days = date_value(date)?;
+    let seconds = time_value(&rest[1..])?;
+    Some(days as f64 * 86_400.0 + seconds)
+}
+
 /// A valid time string: `hh:mm`, optional `:ss`, and a fraction only after
 /// the seconds component
 /// (<https://html.spec.whatwg.org/multipage/common-microsyntaxes.html#valid-time-string>).
@@ -294,6 +400,68 @@ pub(crate) fn normalized_time(time: Time) -> String {
     format!("{:02}:{:02}{seconds}{fraction}", time.hour, time.minute)
 }
 
+/// The decimal scale authored in a whole-string floating-point literal: the
+/// fraction digit count minus the exponent, clamped at zero. Step rounding
+/// uses it to snap binary noise back to the step's decimal place.
+pub(crate) fn authored_decimal_scale(text: &str) -> Option<u32> {
+    let bytes = text.as_bytes();
+    let mut position = 0;
+    if bytes
+        .get(position)
+        .is_some_and(|byte| *byte == b'+' || *byte == b'-')
+    {
+        position += 1;
+    }
+    while bytes.get(position).is_some_and(u8::is_ascii_digit) {
+        position += 1;
+    }
+    let mut fraction_digits = 0_i64;
+    if bytes.get(position) == Some(&b'.') {
+        position += 1;
+        while bytes.get(position).is_some_and(u8::is_ascii_digit) {
+            fraction_digits += 1;
+            position += 1;
+        }
+    }
+    let mut exponent = 0_i64;
+    if bytes
+        .get(position)
+        .is_some_and(|byte| *byte == b'e' || *byte == b'E')
+    {
+        position += 1;
+        let negative = match bytes.get(position) {
+            Some(b'-') => {
+                position += 1;
+                true
+            }
+            Some(b'+') => {
+                position += 1;
+                false
+            }
+            _ => false,
+        };
+        let start = position;
+        while bytes.get(position).is_some_and(u8::is_ascii_digit) {
+            exponent = exponent
+                .saturating_mul(10)
+                .saturating_add(i64::from(bytes[position] - b'0'));
+            position += 1;
+        }
+        if position == start {
+            return None;
+        }
+        if negative {
+            exponent = -exponent;
+        }
+    }
+    if position != bytes.len() {
+        return None;
+    }
+    // A scale beyond u32 is treated as "too large to round", not as malformed:
+    // the caller skips rounding beyond 20 anyway.
+    Some(u32::try_from(fraction_digits.saturating_sub(exponent).max(0)).unwrap_or(u32::MAX))
+}
+
 /// An exact decimal parsed from a floating-point attribute. Step alignment is
 /// defined over decimal numbers, not binary floats, so `0.1 + 0.2` must not
 /// produce `0.30000000000000004`
@@ -332,7 +500,7 @@ impl Decimal {
     }
 
     /// The signed mantissa at `scale`, or `None` when it does not fit i128.
-    fn mantissa_at(&self, scale: u32) -> Option<i128> {
+    pub(crate) fn mantissa_at(&self, scale: u32) -> Option<i128> {
         let zeros = scale.checked_sub(self.scale)?;
         let zeros = usize::try_from(zeros).ok()?;
         let mut text = String::with_capacity(self.digits.len() + zeros);
@@ -340,6 +508,11 @@ impl Decimal {
         text.extend(std::iter::repeat_n('0', zeros));
         let magnitude = text.parse::<i128>().ok()?;
         Some(if self.negative { -magnitude } else { magnitude })
+    }
+
+    /// The decimal scale (digits after the point) of the normalized value.
+    pub(crate) fn scale(&self) -> u32 {
+        self.scale
     }
 
     fn from_mantissa(mantissa: i128, scale: u32) -> Self {
@@ -585,4 +758,84 @@ pub(crate) fn range_default(minimum: &Decimal, maximum: &Decimal) -> Decimal {
         return minimum.clone();
     };
     Decimal::from_mantissa(half_scaled, scale)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        authored_decimal_scale, date_value, local_datetime_value, month_value, time_value,
+        week_value,
+    };
+
+    /// The epoch, a leap day, and a year far past the Date range (the
+    /// microsyntax allows any year above zero, so this must not overflow).
+    #[test]
+    fn a_date_value_is_days_since_the_epoch() {
+        assert_eq!(date_value("1970-01-01"), Some(0));
+        assert_eq!(date_value("1970-01-02"), Some(1));
+        assert_eq!(date_value("1969-12-31"), Some(-1));
+        assert_eq!(date_value("2016-02-29"), Some(16_860));
+        assert_eq!(date_value("0000-01-01"), None);
+        assert_eq!(date_value("2019-02-29"), None);
+        // The microsyntax allows any year above zero, so a huge one must stay
+        // a number rather than overflow the day arithmetic.
+        assert!(date_value("30000000000000000-01-01").is_some());
+    }
+
+    /// Month arithmetic counts from 1970-01 and rejects a bad month.
+    #[test]
+    fn a_month_value_is_months_since_1970_01() {
+        assert_eq!(month_value("1970-01"), Some(0));
+        assert_eq!(month_value("1970-02"), Some(1));
+        assert_eq!(month_value("1969-12"), Some(-1));
+        assert_eq!(month_value("2019-13"), None);
+        assert!(month_value("30000000000000000-12").is_some());
+    }
+
+    /// Week 53 exists only in years that have it, and week 1 starts on the
+    /// Monday of the week containing January 4.
+    #[test]
+    fn a_week_value_is_weeks_since_the_epoch_monday() {
+        assert_eq!(week_value("1970-W01"), Some(0));
+        assert_eq!(week_value("1970-W02"), Some(1));
+        assert_eq!(week_value("2015-W53"), Some(2_400));
+        assert_eq!(week_value("2016-W53"), None);
+        assert_eq!(week_value("2020-W53"), Some(2_661));
+        assert_eq!(week_value("2021-W53"), None);
+    }
+
+    /// Seconds keep the fraction only after the seconds component.
+    #[test]
+    fn a_time_value_is_seconds_since_midnight() {
+        assert_eq!(time_value("00:00"), Some(0.0));
+        assert_eq!(time_value("01:02"), Some(3_720.0));
+        assert_eq!(time_value("01:02:03.5"), Some(3_723.5));
+        assert_eq!(time_value("24:00"), None);
+        assert_eq!(time_value("01:02.5"), None);
+    }
+
+    /// A local date-time accepts `T` or a space and combines the two units.
+    #[test]
+    fn a_local_datetime_value_combines_days_and_seconds() {
+        assert_eq!(local_datetime_value("1970-01-01T00:00"), Some(0.0));
+        assert_eq!(local_datetime_value("1970-01-02 01:00"), Some(90_000.0));
+        assert_eq!(local_datetime_value("1970-01-01T24:00"), None);
+    }
+
+    /// The authored scale is the fraction minus the exponent, clamped at zero.
+    #[test]
+    fn an_authored_decimal_scale_counts_decimal_places() {
+        assert_eq!(authored_decimal_scale("1"), Some(0));
+        assert_eq!(authored_decimal_scale("1.20"), Some(2));
+        assert_eq!(authored_decimal_scale("1e2"), Some(0));
+        assert_eq!(authored_decimal_scale("1.2e2"), Some(0));
+        assert_eq!(authored_decimal_scale("1.2e-2"), Some(3));
+        // A scale past u32 means "too large to round", not "malformed".
+        assert_eq!(
+            authored_decimal_scale("1e-99999999999999999999"),
+            Some(u32::MAX)
+        );
+        assert_eq!(authored_decimal_scale("1px"), None);
+        assert_eq!(authored_decimal_scale("1e"), None);
+    }
 }

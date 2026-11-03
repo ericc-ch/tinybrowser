@@ -13,11 +13,82 @@ use style::device::Device;
 
 use crate::Parsed;
 use crate::dom::microsyntaxes::{
-    format_number, valid_date, valid_float, valid_local_datetime, valid_month, valid_time,
-    valid_week,
+    date_value, format_number, local_datetime_value, month_value, time_value, valid_date,
+    valid_float, valid_local_datetime, valid_month, valid_time, valid_week, week_value,
 };
 use crate::dom::parse::parse_double;
 use crate::dom::tree::{BlitzId, attr};
+
+/// The value interpreted in its state's step unit: days for `date`, months for
+/// `month`, weeks for `week`, seconds for `time`/`datetime-local`, and the
+/// number itself for `number`/`range`. Stepping and step mismatch work in that
+/// unit
+/// (<https://html.spec.whatwg.org/multipage/input.html#the-step-attribute>).
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "f64 represents any day, month, or week count the microsyntax allows"
+)]
+pub(crate) fn value_in_units(kind: InputType, text: &str) -> Option<f64> {
+    match kind {
+        InputType::Number | InputType::Range => parse_double(text),
+        InputType::Date => date_value(text).map(|days| days as f64),
+        InputType::Month => month_value(text).map(|months| months as f64),
+        InputType::Week => week_value(text).map(|weeks| weeks as f64),
+        InputType::Time => time_value(text),
+        InputType::DatetimeLocal => local_datetime_value(text),
+        InputType::Hidden
+        | InputType::Text
+        | InputType::Search
+        | InputType::Tel
+        | InputType::Url
+        | InputType::Email
+        | InputType::Password
+        | InputType::Color
+        | InputType::Checkbox
+        | InputType::Radio
+        | InputType::File
+        | InputType::Submit
+        | InputType::Image
+        | InputType::Reset
+        | InputType::Button => None,
+    }
+}
+
+/// The value as a number in `valueAsNumber`'s unit: milliseconds for the
+/// date-like states that name an instant, months for `month`, and the number
+/// itself for `number`/`range`
+/// (<https://html.spec.whatwg.org/multipage/input.html#dom-input-valueasnumber>).
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "f64 represents any day, month, or week count the microsyntax allows"
+)]
+pub(crate) fn value_as_number(kind: InputType, text: &str) -> Option<f64> {
+    match kind {
+        InputType::Number | InputType::Range => parse_double(text),
+        InputType::Date => date_value(text).map(|days| days as f64 * 86_400_000.0),
+        InputType::Month => month_value(text).map(|months| months as f64),
+        // 1970-01-01 was a Thursday, so the epoch Monday is three days before
+        // day zero.
+        InputType::Week => week_value(text).map(|weeks| (weeks * 7 - 3) as f64 * 86_400_000.0),
+        InputType::Time => time_value(text).map(|seconds| seconds * 1000.0),
+        InputType::DatetimeLocal => local_datetime_value(text).map(|seconds| seconds * 1000.0),
+        InputType::Hidden
+        | InputType::Text
+        | InputType::Search
+        | InputType::Tel
+        | InputType::Url
+        | InputType::Email
+        | InputType::Password
+        | InputType::Color
+        | InputType::Checkbox
+        | InputType::Radio
+        | InputType::File
+        | InputType::Submit
+        | InputType::Image
+        | InputType::Reset
+        | InputType::Button => None,
+    }
+}
 
 /// One state of the `type` content attribute. An unknown keyword uses the
 /// Text state (<https://html.spec.whatwg.org/multipage/input.html#attr-input-type>).
@@ -181,6 +252,15 @@ pub(crate) fn raw_value(parsed: &Parsed, node: BlitzId, kind: InputType) -> Stri
         return attr(base, node, "value").unwrap_or("").to_owned();
     }
     element.form_state.value().to_owned()
+}
+
+/// The current value slot of an input, for algorithms that already hold the
+/// document. Only the `ValueMode::Current` states reach stepping and validity,
+/// and their slot is kept sanitized.
+fn value_slot(base: &BaseDocument, node: BlitzId) -> String {
+    base.get_node(node)
+        .and_then(|target| target.data.downcast_element())
+        .map_or_else(String::new, |element| element.form_state.value().to_owned())
 }
 
 /// The current value of an input, dispatched by the value IDL attribute's
@@ -394,6 +474,193 @@ fn step_base_from_attributes(base: &BaseDocument, node: BlitzId) -> f64 {
         .unwrap_or(0.0)
 }
 
+/// The default step, in the state's `value_in_units` unit
+/// (<https://html.spec.whatwg.org/multipage/input.html#the-step-attribute>).
+pub(crate) fn default_step(kind: InputType) -> Option<f64> {
+    match kind {
+        InputType::Number
+        | InputType::Range
+        | InputType::Date
+        | InputType::Month
+        | InputType::Week => Some(1.0),
+        InputType::Time | InputType::DatetimeLocal => Some(60.0),
+        _ => None,
+    }
+}
+
+/// The floating-point step-mismatch test, for date-like values and for the
+/// number/range operands that do not fit the exact path's i128 mantissa.
+fn step_mismatch_f64(value: f64, step: f64, step_base: f64) -> bool {
+    if step <= 0.0 {
+        return false;
+    }
+    let remainder = ((value - step_base) % step).abs();
+    if remainder == 0.0 {
+        return false;
+    }
+    remainder.min(step - remainder) > step * 1e-9
+}
+
+/// Whether the input suffers from a step mismatch
+/// (<https://html.spec.whatwg.org/multipage/input.html#the-step-attribute>).
+pub(crate) fn step_mismatch(base: &BaseDocument, node: BlitzId) -> bool {
+    let Some(kind) = input_type(base, node) else {
+        return false;
+    };
+    let Some(fallback) = default_step(kind) else {
+        return false;
+    };
+    let raw_step = attr(base, node, "step");
+    // The `any` keyword is an ASCII case-insensitive match on the attribute
+    // value, not a trimmed token
+    // (<https://html.spec.whatwg.org/multipage/input.html#the-step-attribute>).
+    if raw_step.is_some_and(|step| step.eq_ignore_ascii_case("any")) {
+        return false;
+    }
+    if kind == InputType::Number || kind == InputType::Range {
+        // Exact decimal arithmetic: a very small step with a large value loses
+        // the fraction in f64
+        // (<https://html.spec.whatwg.org/multipage/input.html#the-step-attribute>).
+        let Some(value) = crate::dom::microsyntaxes::parse_decimal(&value_slot(base, node)) else {
+            return false;
+        };
+        let step = raw_step
+            .and_then(crate::dom::microsyntaxes::parse_decimal)
+            .filter(|step| !step.is_negative() && !step.is_zero())
+            .unwrap_or_else(|| crate::dom::microsyntaxes::Decimal::from_integer(1));
+        // The step base is the min attribute, else the value attribute, else
+        // zero.
+        let step_base = attr(base, node, "min")
+            .and_then(crate::dom::microsyntaxes::parse_decimal)
+            .or_else(|| {
+                attr(base, node, "value").and_then(crate::dom::microsyntaxes::parse_decimal)
+            })
+            .unwrap_or_else(crate::dom::microsyntaxes::Decimal::zero);
+        let scale = value.scale().max(step_base.scale()).max(step.scale());
+        let (Some(value_at), Some(step_base_at), Some(step_at)) = (
+            value.mantissa_at(scale),
+            step_base.mantissa_at(scale),
+            step.mantissa_at(scale),
+        ) else {
+            // An operand past i128 still gets an answer, with the same
+            // floating-point tolerance the date-like path uses.
+            return step_mismatch_f64(value.to_f64(), step.to_f64(), step_base.to_f64());
+        };
+        return step_at != 0 && (value_at - step_base_at) % step_at != 0;
+    }
+    // The date-like states work in their step unit, which is also the step
+    // scale factor's unit, so the fallback step is a plain number of units.
+    let Some(value) = value_in_units(kind, &value_slot(base, node)) else {
+        return false;
+    };
+    let step = raw_step
+        .and_then(parse_double)
+        .filter(|step| *step > 0.0)
+        .unwrap_or(fallback);
+    // The step base is the min attribute, else the value attribute, else zero.
+    let mut step_base = attr(base, node, "min").and_then(|text| value_in_units(kind, text));
+    if step_base.is_none() {
+        step_base = attr(base, node, "value").and_then(|text| value_in_units(kind, text));
+    }
+    let step_base = step_base.unwrap_or(0.0);
+    let remainder = ((value - step_base) % step).abs();
+    if remainder == 0.0 {
+        return false;
+    }
+    remainder.min(step - remainder) > step * 1e-9
+}
+
+/// How a partially typed number buffer relates to the floating-point grammar
+/// a `number` control accepts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NumberBufferState {
+    /// Not a prefix of a number: reject the edit.
+    Invalid,
+    /// An empty buffer: no value and no bad input.
+    Empty,
+    /// A legal prefix that is still incomplete (`-`, `1e+`): expose an empty
+    /// value and set bad input.
+    Partial,
+    /// A complete number: expose it as the value.
+    Complete,
+    /// Digits followed by a dot: expose the digits and clear bad input.
+    TrailingDot,
+}
+
+/// Classifies an in-progress `number` edit buffer. The grammar is the HTML
+/// floating-point grammar plus the partial forms a user types on the way to
+/// one (`<https://html.spec.whatwg.org/multipage/input.html#number-state-(type=number)>`).
+pub(crate) fn number_buffer_state(text: &str) -> NumberBufferState {
+    if text.is_empty() {
+        return NumberBufferState::Empty;
+    }
+    let bytes = text.as_bytes();
+    let mut position = 0;
+    if matches!(bytes[0], b'+' | b'-') {
+        position += 1;
+    }
+    let integer_start = position;
+    while bytes.get(position).is_some_and(u8::is_ascii_digit) {
+        position += 1;
+    }
+    let integer_digits = position - integer_start;
+    let mut fraction_digits = 0;
+    let mut saw_dot = false;
+    if bytes.get(position) == Some(&b'.') {
+        saw_dot = true;
+        position += 1;
+        let fraction_start = position;
+        while bytes.get(position).is_some_and(u8::is_ascii_digit) {
+            position += 1;
+        }
+        fraction_digits = position - fraction_start;
+    }
+    // The mantissa is complete when it is `digits` with an optional fraction,
+    // or a leading dot with at least one digit. A trailing dot and a bare
+    // `digits.` are not complete numbers
+    // (<https://html.spec.whatwg.org/multipage/common-microsyntaxes.html#valid-floating-point-number>).
+    let mantissa_complete = if integer_digits > 0 {
+        !saw_dot || fraction_digits > 0
+    } else {
+        saw_dot && fraction_digits > 0
+    };
+    let trailing_dot = integer_digits > 0 && saw_dot && fraction_digits == 0;
+    if position == bytes.len() {
+        return if trailing_dot {
+            NumberBufferState::TrailingDot
+        } else if mantissa_complete {
+            NumberBufferState::Complete
+        } else if saw_dot {
+            // A dot with no digit anywhere is not a number prefix.
+            NumberBufferState::Invalid
+        } else {
+            // A bare sign is a legal prefix.
+            NumberBufferState::Partial
+        };
+    }
+    if !matches!(bytes[position], b'e' | b'E') {
+        return NumberBufferState::Invalid;
+    }
+    position += 1;
+    if matches!(bytes.get(position), Some(b'+' | b'-')) {
+        position += 1;
+    }
+    let exponent_start = position;
+    while bytes.get(position).is_some_and(u8::is_ascii_digit) {
+        position += 1;
+    }
+    if position != bytes.len() {
+        return NumberBufferState::Invalid;
+    }
+    // An exponent is a legal prefix on its own (`1e`, `e`, `+e`), but only a
+    // complete mantissa followed by exponent digits is a complete number.
+    if position > exponent_start && mantissa_complete {
+        NumberBufferState::Complete
+    } else {
+        NumberBufferState::Partial
+    }
+}
+
 /// Applies the state's algorithm after flushing pending device changes, for
 /// callers that mutate the document (attribute changes, IDL setters).
 pub(crate) fn sanitize_with_device(
@@ -529,4 +796,101 @@ pub(crate) fn sync_sanitized_value(document: &mut crate::documents::BlitzDocumen
         .base
         .mutate()
         .set_value(node, sanitized, Dirtiness::Keep);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        InputType, NumberBufferState, number_buffer_state, value_as_number, value_in_units,
+    };
+
+    /// The number edit buffer accepts exactly the partial forms the old
+    /// regexes did: a complete number, a legal prefix, `digits.`, or empty.
+    #[test]
+    fn a_number_buffer_is_classified_by_the_engine_grammar() {
+        use NumberBufferState::{Complete, Empty, Invalid, Partial, TrailingDot};
+        let state = number_buffer_state;
+        assert_eq!(state(""), Empty);
+        assert_eq!(state("+"), Partial);
+        assert_eq!(state("-"), Partial);
+        assert_eq!(state("."), Invalid);
+        assert_eq!(state("+."), Invalid);
+        assert_eq!(state("1."), TrailingDot);
+        assert_eq!(state("-1."), TrailingDot);
+        assert_eq!(state("1.e2"), Partial);
+        assert_eq!(state("1.e+2"), Partial);
+        assert_eq!(state(".5"), Complete);
+        assert_eq!(state(".5e2"), Complete);
+        assert_eq!(state("1.0"), Complete);
+        assert_eq!(state("1e"), Partial);
+        assert_eq!(state("1e+"), Partial);
+        assert_eq!(state("1e2"), Complete);
+        assert_eq!(state("e"), Partial);
+        assert_eq!(state("e2"), Partial);
+        assert_eq!(state("+e"), Partial);
+        assert_eq!(state("--1"), Invalid);
+        assert_eq!(state("1.2.3"), Invalid);
+        assert_eq!(state("1px"), Invalid);
+        assert_eq!(state(" 1"), Invalid);
+        assert_eq!(state("1 "), Invalid);
+    }
+
+    /// The per-state default step is the one `stepUp` and the validity flag
+    /// share.
+    #[test]
+    fn a_default_step_covers_exactly_the_stepping_states() {
+        use super::default_step;
+        assert_eq!(default_step(InputType::Number), Some(1.0));
+        assert_eq!(default_step(InputType::Range), Some(1.0));
+        assert_eq!(default_step(InputType::Date), Some(1.0));
+        assert_eq!(default_step(InputType::Month), Some(1.0));
+        assert_eq!(default_step(InputType::Week), Some(1.0));
+        assert_eq!(default_step(InputType::Time), Some(60.0));
+        assert_eq!(default_step(InputType::DatetimeLocal), Some(60.0));
+        assert_eq!(default_step(InputType::Text), None);
+        assert_eq!(default_step(InputType::Color), None);
+    }
+
+    /// The floating-point mismatch test ignores rounding noise at the edges of
+    /// a step but still sees a genuine fraction.
+    #[test]
+    fn a_step_mismatch_tolerates_only_rounding_noise() {
+        use super::step_mismatch_f64;
+        assert!(!step_mismatch_f64(0.3, 0.1, 0.0));
+        assert!(!step_mismatch_f64(0.0, 0.1, 0.0));
+        assert!(step_mismatch_f64(0.35, 0.1, 0.0));
+        assert!(!step_mismatch_f64(0.0, 0.0, 0.0));
+    }
+
+    /// The step unit is days, months, weeks, or seconds per state.
+    #[test]
+    fn a_value_in_units_uses_the_state_unit() {
+        assert_eq!(value_in_units(InputType::Date, "1970-01-02"), Some(1.0));
+        assert_eq!(value_in_units(InputType::Month, "1970-02"), Some(1.0));
+        assert_eq!(value_in_units(InputType::Week, "1970-W02"), Some(1.0));
+        assert_eq!(value_in_units(InputType::Time, "01:00"), Some(3_600.0));
+        assert_eq!(
+            value_in_units(InputType::DatetimeLocal, "1970-01-02T00:00"),
+            Some(86_400.0)
+        );
+        assert_eq!(value_in_units(InputType::Number, "1.5"), Some(1.5));
+        assert_eq!(value_in_units(InputType::Text, "1"), None);
+    }
+
+    /// `valueAsNumber` reports milliseconds for instants, months for `month`.
+    #[test]
+    fn a_value_as_number_uses_the_states_unit() {
+        assert_eq!(
+            value_as_number(InputType::Date, "1970-01-02"),
+            Some(86_400_000.0)
+        );
+        assert_eq!(value_as_number(InputType::Month, "1970-02"), Some(1.0));
+        assert_eq!(
+            value_as_number(InputType::Week, "1970-W02"),
+            Some(345_600_000.0)
+        );
+        assert_eq!(value_as_number(InputType::Time, "01:00"), Some(3_600_000.0));
+        assert_eq!(value_as_number(InputType::Number, "1.5"), Some(1.5));
+        assert_eq!(value_as_number(InputType::Date, "2019-02-29"), None);
+    }
 }

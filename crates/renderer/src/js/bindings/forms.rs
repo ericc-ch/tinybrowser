@@ -13,12 +13,26 @@
 
 use super::{focus, host_node_id, owning_world, world, world_for_node};
 use crate::dom::forms::{self, PendingEntry, encode_form, trim_label, urlencode_form};
+use crate::dom::input::{
+    InputType, NumberBufferState, number_buffer_state, step_mismatch, value_as_number,
+    value_in_units,
+};
 use crate::dom::tree::{NodeId, is_html_element};
 use crate::js::{FrameNavigation, World};
 use rquickjs::prelude::Opt;
-use rquickjs::{Array, Ctx, Exception, Object, Persistent, Result, TypedArray, Value};
+use rquickjs::{Array, Ctx, Exception, IntoJs, Object, Persistent, Result, TypedArray, Value};
 use std::cell::RefCell;
 use std::rc::Rc;
+
+/// A host result where `None` is JS `null`. rquickjs maps a bare `Option::None`
+/// to `undefined`, but the shims use `null` for "no value" and compare with
+/// `=== null`.
+fn optional<'js, T: IntoJs<'js>>(value: Option<T>, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+    match value {
+        Some(value) => value.into_js(ctx),
+        None => Ok(Value::new_null(ctx.clone())),
+    }
+}
 
 /// Host functions the `FormData` and form-submission shims call.
 pub(super) fn install(_ctx: &Ctx<'_>, globals: &Object<'_>) -> Result<()> {
@@ -59,7 +73,109 @@ pub(super) fn install(_ctx: &Ctx<'_>, globals: &Object<'_>) -> Result<()> {
         "__tbSameOriginWithTop",
         rquickjs::prelude::Func::from(same_origin_with_top),
     )?;
+    globals.set("__tbParseFloat", rquickjs::prelude::Func::from(parse_float))?;
+    globals.set(
+        "__tbParseNonNegativeInteger",
+        rquickjs::prelude::Func::from(parse_non_negative_integer_js),
+    )?;
+    globals.set(
+        "__tbValueInUnits",
+        rquickjs::prelude::Func::from(value_in_units_js),
+    )?;
+    globals.set(
+        "__tbValueAsNumber",
+        rquickjs::prelude::Func::from(value_as_number_js),
+    )?;
+    globals.set(
+        "__tbStepMismatch",
+        rquickjs::prelude::Func::from(step_mismatch_js),
+    )?;
+    globals.set(
+        "__tbDecimalScale",
+        rquickjs::prelude::Func::from(decimal_scale_js),
+    )?;
+    globals.set(
+        "__tbDefaultStep",
+        rquickjs::prelude::Func::from(default_step_js),
+    )?;
+    globals.set(
+        "__tbNumberBufferState",
+        rquickjs::prelude::Func::from(number_buffer_state_js),
+    )?;
     Ok(())
+}
+
+/// The floating-point grammar over an owned string, with `null` for a parse
+/// failure.
+fn parse_float(ctx: Ctx<'_>, value: String) -> Result<Value<'_>> {
+    optional(crate::dom::parse::parse_double(&value), &ctx)
+}
+
+/// The non-negative integer rules over an owned string, with `null` for a parse
+/// failure.
+fn parse_non_negative_integer_js(ctx: Ctx<'_>, value: String) -> Result<Value<'_>> {
+    optional(crate::dom::parse::parse_non_negative_integer(&value), &ctx)
+}
+
+/// The authored decimal scale of a step literal, or `null` when it is not one.
+fn decimal_scale_js(ctx: Ctx<'_>, value: String) -> Result<Value<'_>> {
+    optional(
+        crate::dom::microsyntaxes::authored_decimal_scale(&value),
+        &ctx,
+    )
+}
+
+/// The state's default step in its step unit, or `null` when the state does
+/// not step.
+fn default_step_js(ctx: Ctx<'_>, type_name: String) -> Result<Value<'_>> {
+    optional(
+        crate::dom::input::default_step(InputType::from_attribute(Some(&type_name))),
+        &ctx,
+    )
+}
+
+/// The input state for a `type` keyword, as the IDL `type` attribute spells
+/// it. An unknown keyword is the Text state, which has no value in any
+/// stepping unit.
+fn input_kind(type_name: &str) -> InputType {
+    InputType::from_attribute(Some(type_name))
+}
+
+/// The value interpreted in its state's step unit, or `null` for an invalid
+/// value or a state that does not step.
+fn value_in_units_js(ctx: Ctx<'_>, type_name: String, text: String) -> Result<Value<'_>> {
+    optional(value_in_units(input_kind(&type_name), &text), &ctx)
+}
+
+/// The value as `valueAsNumber` reports it, or `null` for an invalid value or
+/// a state that has no numeric value.
+fn value_as_number_js(ctx: Ctx<'_>, type_name: String, text: String) -> Result<Value<'_>> {
+    optional(value_as_number(input_kind(&type_name), &text), &ctx)
+}
+
+/// Whether the input suffers from a step mismatch.
+fn step_mismatch_js<'js>(ctx: Ctx<'js>, element: Value<'js>) -> Result<bool> {
+    let Some(id) = host_node_id(&ctx, &element) else {
+        return Ok(false);
+    };
+    let world = world(&ctx)?;
+    let world = world.borrow();
+    let Some(parsed) = world.document(id) else {
+        return Ok(false);
+    };
+    Ok(step_mismatch(&parsed.document.base, id.node))
+}
+
+/// The number edit buffer state as `[0, 1, 2, 3, 4]` for invalid, empty,
+/// partial, complete, and trailing-dot, in the order the JS shim reads them.
+fn number_buffer_state_js(text: String) -> u8 {
+    match number_buffer_state(&text) {
+        NumberBufferState::Invalid => 0,
+        NumberBufferState::Empty => 1,
+        NumberBufferState::Partial => 2,
+        NumberBufferState::Complete => 3,
+        NumberBufferState::TrailingDot => 4,
+    }
 }
 
 /// Whether the calling realm is same origin with its top-level traversable.
@@ -183,14 +299,14 @@ pub(super) fn form_plan<'js>(
     ctx: Ctx<'js>,
     form: Value<'js>,
     submitter: Opt<Value<'js>>,
-) -> Result<Option<Array<'js>>> {
+) -> Result<Value<'js>> {
     let Some(id) = host_node_id(&ctx, &form) else {
-        return Ok(None);
+        return Ok(Value::new_null(ctx));
     };
     let world = world(&ctx)?;
     let world = world.borrow();
     let Some(parsed) = world.document(id) else {
-        return Ok(None);
+        return Ok(Value::new_null(ctx));
     };
     let submitter = submitter.0.and_then(|value| host_node_id(&ctx, &value));
     // A submitter from another document cannot override this form's attributes;
@@ -201,14 +317,14 @@ pub(super) fn form_plan<'js>(
         .base
         .plan_form_submission(id.node, submitter.map(|submitter| submitter.node))
     else {
-        return Ok(None);
+        return Ok(Value::new_null(ctx.clone()));
     };
-    let array = Array::new(ctx)?;
+    let array = Array::new(ctx.clone())?;
     array.set(0, plan.action.to_string())?;
     array.set(1, plan.method.as_str())?;
     array.set(2, plan.enctype.as_str())?;
     array.set(3, plan.target.unwrap_or_default())?;
-    Ok(Some(array))
+    Ok(array.into_value())
 }
 
 /// Appends one `[name, File]` pair per file a script assigned to a `type=file`
