@@ -838,15 +838,18 @@ fn run_activation(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
                 return Ok(());
             };
             let form_value = wrap_node(ctx, form)?;
-            let Some(form_object) = form_value.as_object() else {
-                return Ok(());
-            };
             let button_value = wrap_node(ctx, node)?;
+            // Call the engine's internal algorithm, not the page-visible
+            // `HTMLFormElement` method: a page that replaces `reset` or
+            // `requestSubmit` must not intercept native button activation
+            // (<https://html.spec.whatwg.org/multipage/input.html#submit-button-state-(type=submit)>,
+            // <https://html.spec.whatwg.org/multipage/input.html#reset-button-state-(type=reset)>).
+            let host = crate::js::bridge::object(ctx)?;
             match activation {
                 Activation::Submit => {
-                    if let Ok(function) = form_object.get::<_, Function>("requestSubmit")
+                    if let Ok(function) = host.get::<_, Function>("__tbRequestSubmit")
                         && function
-                            .call::<_, ()>((This(form_object.clone()), button_value))
+                            .call::<_, ()>((This(host.clone()), form_value, button_value))
                             .is_err()
                     {
                         // Clear the exception the page's handler threw.
@@ -854,10 +857,8 @@ fn run_activation(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
                     }
                 }
                 Activation::Reset => {
-                    if let Ok(function) = form_object.get::<_, Function>("reset")
-                        && function
-                            .call::<_, ()>((This(form_object.clone()),))
-                            .is_err()
+                    if let Ok(function) = host.get::<_, Function>("__tbResetForm")
+                        && function.call::<_, ()>((This(host), form_value)).is_err()
                     {
                         let _ = ctx.catch();
                     }

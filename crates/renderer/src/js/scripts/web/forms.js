@@ -1218,42 +1218,52 @@
   // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#form-submission-algorithm>).
   const formsFiringSubmission = host.slots('tb-form-firing-submission');
 
+  // The internal submit algorithm. Native activation calls this through
+  // `host.__tbRequestSubmit`, so a page that replaces
+  // `HTMLFormElement.prototype.requestSubmit` cannot intercept a button click
+  // (<https://html.spec.whatwg.org/multipage/input.html#submit-button-state-(type=submit)>).
+  const requestSubmitInternal = (form, submitter) => {
+    if (!host.__tbFormCanSubmit(form)) return;
+    if (formsFiringSubmission.has(form)) return;
+    if (submitter !== undefined && submitter !== null) {
+      const tag = submitter.tagName;
+      const isSubmit = tag === 'BUTTON'
+        ? submitter.type === 'submit'
+        : tag === 'INPUT' && (submitter.type === 'submit' || submitter.type === 'image');
+      if (!isSubmit) {
+        throw new TypeError('submitter must be a submit button');
+      }
+      if (submitter.form !== form) {
+        throw new DOMException('submitter must belong to this form', 'NotFoundError');
+      }
+    }
+    // Interactive validation runs before the submit event and can stop the
+    // submission; a submitter's `formnovalidate` skips it
+    // (<https://html.spec.whatwg.org/multipage/forms.html#interactively-validate-the-constraints>).
+    const noValidate = form.noValidate
+      || (submitter !== undefined && submitter !== null && submitter.formNoValidate);
+    formsFiringSubmission.add(form);
+    try {
+      if (!noValidate && !form.checkValidity()) return;
+      const event = new SubmitEvent('submit', {
+        submitter: submitter === undefined ? null : submitter,
+        bubbles: true,
+        cancelable: true,
+      });
+      if (!form.dispatchEvent(event)) return;
+      runSubmission(form, submitter);
+    } finally {
+      formsFiringSubmission.delete(form);
+    }
+  };
+  Object.defineProperty(host, '__tbRequestSubmit', {
+    value: requestSubmitInternal,
+    writable: false, enumerable: false, configurable: false,
+  });
+
   // <https://html.spec.whatwg.org/multipage/forms.html#dom-form-requestsubmit>
   Object.defineProperty(globalThis.HTMLFormElement.prototype, 'requestSubmit', {
-    value: function(submitter) {
-      if (!host.__tbFormCanSubmit(this)) return;
-      if (formsFiringSubmission.has(this)) return;
-      if (submitter !== undefined && submitter !== null) {
-        const tag = submitter.tagName;
-        const isSubmit = tag === 'BUTTON'
-          ? submitter.type === 'submit'
-          : tag === 'INPUT' && (submitter.type === 'submit' || submitter.type === 'image');
-        if (!isSubmit) {
-          throw new TypeError('submitter must be a submit button');
-        }
-        if (submitter.form !== this) {
-          throw new DOMException('submitter must belong to this form', 'NotFoundError');
-        }
-      }
-      // Interactive validation runs before the submit event and can stop the
-      // submission; a submitter's `formnovalidate` skips it
-      // (<https://html.spec.whatwg.org/multipage/forms.html#interactively-validate-the-constraints>).
-      const noValidate = this.noValidate
-        || (submitter !== undefined && submitter !== null && submitter.formNoValidate);
-      formsFiringSubmission.add(this);
-      try {
-        if (!noValidate && !this.checkValidity()) return;
-        const event = new SubmitEvent('submit', {
-          submitter: submitter === undefined ? null : submitter,
-          bubbles: true,
-          cancelable: true,
-        });
-        if (!this.dispatchEvent(event)) return;
-        runSubmission(this, submitter);
-      } finally {
-        formsFiringSubmission.delete(this);
-      }
-    },
+    value: function(submitter) { return requestSubmitInternal(this, submitter); },
     writable: true,
     enumerable: true,
     configurable: true,
@@ -1808,19 +1818,30 @@
         configurable: true,
       },
     });
-    const nativeFormReset = globalThis.HTMLFormElement.prototype.reset;
+  }
+  const nativeFormReset = globalThis.HTMLFormElement.prototype.reset;
+  // The internal reset algorithm. Native activation calls this through
+  // `host.__tbResetForm`, so a page that replaces
+  // `HTMLFormElement.prototype.reset` cannot intercept a reset button
+  // (<https://html.spec.whatwg.org/multipage/input.html#reset-button-state-(type=reset)>).
+  const resetFormInternal = form => {
+    nativeFormReset.call(form);
+    for (const output of form.querySelectorAll('output')) {
+      const state = outputState(output);
+      // In value mode the stored default is restored; otherwise the
+      // current text already is the default value.
+      if (!state.valueMode) state.defaultValue = output.textContent;
+      state.valueMode = false;
+      output.textContent = state.defaultValue;
+    }
+  };
+  Object.defineProperty(host, '__tbResetForm', {
+    value: resetFormInternal,
+    writable: false, enumerable: false, configurable: false,
+  });
+  if (globalThis.HTMLOutputElement) {
     Object.defineProperty(globalThis.HTMLFormElement.prototype, 'reset', {
-      value: function() {
-        nativeFormReset.call(this);
-        for (const output of this.querySelectorAll('output')) {
-          const state = outputState(output);
-          // In value mode the stored default is restored; otherwise the
-          // current text already is the default value.
-          if (!state.valueMode) state.defaultValue = output.textContent;
-          state.valueMode = false;
-          output.textContent = state.defaultValue;
-        }
-      },
+      value: function() { resetFormInternal(this); },
       writable: true, enumerable: true, configurable: true,
     });
   }
