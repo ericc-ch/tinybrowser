@@ -126,9 +126,16 @@ fn push(root: &Path, path: &Path, files: &mut Vec<String>) -> io::Result<()> {
 /// Decides which executor a file needs from its own markup.
 fn classify(source: &str) -> Kind {
     let lower = source.to_ascii_lowercase();
-    let reftest = ["rel=\"match\"", "rel='match'", "rel=match", "rel=\"mismatch\"", "rel='mismatch'", "rel=mismatch"]
-        .iter()
-        .any(|marker| lower.contains(marker));
+    let reftest = [
+        "rel=\"match\"",
+        "rel='match'",
+        "rel=match",
+        "rel=\"mismatch\"",
+        "rel='mismatch'",
+        "rel=mismatch",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker));
     if reftest {
         return Kind::Reftest;
     }
@@ -148,7 +155,9 @@ fn classify(source: &str) -> Kind {
 fn declares_long_timeout(source: &str) -> bool {
     let lower = source.to_ascii_lowercase();
     lower.contains("timeout")
-        && (lower.contains("content=long") || lower.contains("content=\"long\"") || lower.contains("content='long'"))
+        && (lower.contains("content=long")
+            || lower.contains("content=\"long\"")
+            || lower.contains("content='long'"))
 }
 
 /// The default checkout location, relative to the repository root.
@@ -188,8 +197,9 @@ mod tests {
         assert!(declares_long_timeout(
             "<meta content=\"long\" name=\"timeout\">"
         ));
-        assert!(!declares_long_timeout("<meta name=timeout content=default>"));
+        assert!(!declares_long_timeout(
+            "<meta name=timeout content=default>"
+        ));
         assert!(!declares_long_timeout("<p>long</p>"));
     }
 }
-

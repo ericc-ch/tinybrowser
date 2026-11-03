@@ -61,16 +61,19 @@ file one drain with its whole budget instead of a short slice.
 `--shard-size N` (in cli.py) runs the sorted selection in N-file processes.
 Each shard is a separate `--offset`/`--limit` slice, so an engine abort costs
 one shard instead of the run; a shard that exits non-zero is bisected until
-the single crashing file is found, and that file is recorded as ERROR. Use it
-for directories where layout or paint can panic (html/ currently does): a
-panic in-process bypasses the harness's per-file error framing, and unwinding
-a half-torn engine can abort outright. dom/ needs no sharding and runs 692
-files in ~25 s at 16 jobs, with 557/557 file verdicts matching the nightly
-report and 93 files skipped (testdriver/reftest). html/ (11,252 files, 58
-shards) took ~322 s of shard wall with 5 crashing files isolated, and
-6,238/6,238 verdicts matched. fetch+xhr+url+encoding+FileAPI+streams (638
-files) is 45 s cold and 0.6 s warm, 325/325 matched. The nightly report
-gives 8,140 s of per-test time for those three slices together.
+the single crashing file is found, and that file is recorded as ERROR. The
+driver owns the window: a `--offset`/`--limit` on the command line slices the
+selection once and every shard's slice stays inside it, and the other runner
+flags (`--cache`, `--jobs`, `--deps`/`--changed`) pass through with their
+values. Use it for directories where layout or paint can panic (html/
+currently does): a panic in-process bypasses the harness's per-file error
+framing, and unwinding a half-torn engine can abort outright. dom/ needs no
+sharding and runs 692 files in ~25 s at 16 jobs, with 557/557 file verdicts
+matching the nightly report and 93 files skipped (testdriver/reftest). html/
+(11,252 files, 58 shards) took ~322 s of shard wall with 5 crashing files
+isolated, and 6,238/6,238 verdicts matched. fetch+xhr+url+encoding+FileAPI+
+streams (638 files) is 45 s cold and 0.6 s warm, 325/325 matched. The nightly
+report gives 8,140 s of per-test time for those three slices together.
 
 A warm cache needs no sharding, so the driver tries one process first and
 only splits when it dies: html/ warm is 1.2 s at 16 jobs (3 s through the
@@ -102,6 +105,14 @@ Known gap: an async listener that leaves a host object borrowed makes
 rquickjs panic with `AlreadyBorrowed` in `Class::borrow_mut`; rquickjs
 converts that panic into a script exception, so the run still finishes and
 writes its report. It is an engine re-entrancy bug to fix, not a harness one.
+
+The host serves files and their `.headers` siblings only, and `document.cookie`
+goes through the browser's own jar (`crates/cookies`). wptserve's query-param
+handlers, `.sub.` substitution files, and server-set `Set-Cookie` are not
+implemented, so a test that depends on them cannot pass here even when it
+passes in the nightly; that is why the parity numbers above are quoted per
+directory. Popups, workers, and WebDriver are out of scope: `window.open`
+returns null and `testdriver.js` files are skipped.
 
 A conformance change is a failure-list diff: failures prints the
 canonical list of a --score log, baseline runs both sides in a detached

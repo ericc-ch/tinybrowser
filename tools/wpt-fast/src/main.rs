@@ -69,7 +69,11 @@ fn main() {
     }
     if options.list {
         for case in cases {
-            println!("{}{}", case.relative, if case.strict { " (strict)" } else { "" });
+            println!(
+                "{}{}",
+                case.relative,
+                if case.strict { " (strict)" } else { "" }
+            );
         }
         return;
     }
@@ -290,7 +294,9 @@ fn parse_args() -> Result<Options, String> {
                 );
             }
             other if other.starts_with('-') => return Err(format!("unknown flag {other}")),
-            other => options.filters.push(other.trim_start_matches('/').to_owned()),
+            other => options
+                .filters
+                .push(other.trim_start_matches('/').to_owned()),
         }
     }
     Ok(options)

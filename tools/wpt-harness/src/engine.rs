@@ -95,13 +95,12 @@ pub struct Outcome {
     pub inputs: Vec<std::path::PathBuf>,
 }
 
-/// One worker's engine, reused across files.
+/// One file's engine and the in-memory host that serves the checkout.
 ///
-/// Building an engine costs ~100 ms (`QuickJS` runtime, DOM, layout), which is
-/// far more than most files cost to run. A browser tab navigates from test to
-/// test, so mounting the next file on the same engine is the honest model:
-/// `mount_frame` installs a fresh realm and document, and the host state that
-/// a test may touch (cookies, storage) is cleared before each mount.
+/// A file gets its own engine instead of a reused one: a page can leave a
+/// `QuickJS` class cell borrowed, and the next mount then panics inside
+/// rquickjs. A file's own engine cannot see that state. The price is one
+/// runtime, document, and layout tree per file.
 pub struct Session {
     root: std::path::PathBuf,
     services: Arc<FsServices>,
@@ -133,7 +132,9 @@ impl Session {
         let outcome = match case.kind {
             Kind::Testharness => run_testharness(self, case, virtual_time).await,
             Kind::Crashtest => run_crashtest(self, case, virtual_time).await,
-            Kind::Reftest => Err(Failure::Skip("reftest comparison is not implemented".into())),
+            Kind::Reftest => Err(Failure::Skip(
+                "reftest comparison is not implemented".into(),
+            )),
             Kind::Testdriver => Err(Failure::Skip(
                 "testdriver requires a WebDriver session".into(),
             )),

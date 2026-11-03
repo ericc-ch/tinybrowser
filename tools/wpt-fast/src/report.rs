@@ -85,15 +85,7 @@ pub fn compare(baseline: &Path, outcomes: &[Outcome]) -> io::Result<Comparison> 
         let Some(id) = result.get("test").and_then(Value::as_str) else {
             continue;
         };
-        let status = result
-            .get("subtests")
-            .and_then(Value::as_array)
-            .and_then(|subtests| subtests.first())
-            .and_then(|subtest| subtest.get("status"))
-            .and_then(Value::as_str)
-            .or_else(|| result.get("status").and_then(Value::as_str))
-            .unwrap_or("SKIP");
-        previous.insert(id.to_owned(), status.to_owned());
+        previous.insert(id.to_owned(), verdict(result).to_owned());
     }
     let mut comparison = Comparison {
         regressions: Vec::new(),
@@ -127,11 +119,35 @@ pub fn compare(baseline: &Path, outcomes: &[Outcome]) -> io::Result<Comparison> 
     Ok(comparison)
 }
 
+/// The file-level verdict one report entry records.
+///
+/// A test262 entry keeps the overall `OK`/`SKIP` status and puts the verdict in
+/// its single subtest, so an entry fails when any subtest is neither `PASS` nor
+/// `SKIP`. `tools/wpt/cli.py`'s `failing_tests` reads the same rule, which is
+/// what makes a baseline written by one reader usable by the other.
+fn verdict(result: &Value) -> &str {
+    let status = result
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("SKIP");
+    let mut passed = matches!(status, "OK" | "PASS");
+    if let Some(subtests) = result.get("subtests").and_then(Value::as_array) {
+        for subtest in subtests {
+            match subtest.get("status").and_then(Value::as_str) {
+                Some("PASS") => passed = true,
+                Some("SKIP") | None => {}
+                Some(_) => return "FAIL",
+            }
+        }
+    }
+    if passed { "PASS" } else { "SKIP" }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
-    use super::{compare, Status};
+    use super::{Status, compare};
 
     use crate::runner::Outcome;
 
@@ -146,10 +162,8 @@ mod tests {
 
     #[test]
     fn a_diff_separates_regressions_from_fixes() {
-        let path = std::env::temp_dir().join(format!(
-            "wpt-fast-compare-test-{}.json",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("wpt-fast-compare-test-{}.json", std::process::id()));
         std::fs::write(
             &path,
             r#"{"results":[
@@ -157,6 +171,7 @@ mod tests {
                 {"test":"b","subtests":[{"status":"FAIL"}]},
                 {"test":"c","subtests":[{"status":"SKIP"}]},
                 {"test":"d","subtests":[{"status":"PASS"}]},
+                {"test":"mixed","subtests":[{"status":"PASS"},{"status":"FAIL"}]},
                 {"test":"gone","subtests":[{"status":"PASS"}]}
             ]}"#,
         )
@@ -166,6 +181,7 @@ mod tests {
             outcome("b", Status::Pass),
             outcome("c", Status::Pass),
             outcome("d", Status::Skip),
+            outcome("mixed", Status::Fail),
             outcome("new", Status::Fail),
         ];
         let comparison = compare(&path, &outcomes).expect("compared");

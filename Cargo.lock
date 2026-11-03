@@ -4287,6 +4287,7 @@ dependencies = [
 name = "wpt-harness"
 version = "0.1.0"
 dependencies = [
+ "cookies",
  "net",
  "percent-encoding",
  "renderer",

@@ -6,8 +6,10 @@
 
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::time::SystemTime;
 
+use cookies::{CookieJar, CookieOp, InitiatorKind, RetrievalKind};
 use renderer::{
     BrowsingContextHost, DialCancellation, DialCompletion, DialFailure, DialOutcome, DialRequest,
     FrameId, MessagingHost, NetworkHost, OpenerPolicy, PostedMessage, StorageChange, StorageError,
@@ -45,7 +47,9 @@ const REPORT: &str = r#"
 /// A host that maps every URL path to a file under one checkout.
 pub struct FsServices {
     root: PathBuf,
-    cookies: Mutex<HashMap<String, String>>,
+    /// The engine's own jar, so `document.cookie` obeys path, domain, expiry,
+    /// and `SameSite` here exactly as it does in a browser tab.
+    cookies: Mutex<CookieJar>,
     storage: Mutex<HashMap<(bool, StorageKey, String), String>>,
     /// Every path this host read or tried to read for the current file.
     read: Mutex<Vec<PathBuf>>,
@@ -57,7 +61,7 @@ impl FsServices {
     pub fn new(root: PathBuf) -> Self {
         Self {
             root,
-            cookies: Mutex::new(HashMap::new()),
+            cookies: Mutex::new(CookieJar::default()),
             storage: Mutex::new(HashMap::new()),
             read: Mutex::new(Vec::new()),
         }
@@ -65,14 +69,11 @@ impl FsServices {
 
     /// Drops cookies and storage between files.
     ///
-    /// A worker keeps one engine and navigates it from test to test, so state
-    /// a file leaves behind must not reach the next one. Upstream also clears
-    /// browser state between tests.
+    /// A worker builds a fresh engine per file, so state a file leaves behind
+    /// must not reach the next one. Upstream also clears browser state between
+    /// tests.
     pub fn clear(&self) {
-        self.cookies
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clear();
+        self.jar().clear();
         self.storage
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -81,6 +82,10 @@ impl FsServices {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clear();
+    }
+
+    fn jar(&self) -> MutexGuard<'_, CookieJar> {
+        self.cookies.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Records one path as an input and returns it.
@@ -95,12 +100,7 @@ impl FsServices {
     /// Takes the paths read since the last [`Self::clear`].
     #[must_use]
     pub fn take_inputs(&self) -> Vec<PathBuf> {
-        std::mem::take(
-            &mut *self
-                .read
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner),
-        )
+        std::mem::take(&mut *self.read.lock().unwrap_or_else(PoisonError::into_inner))
     }
 
     /// Records `path` as an input without reading it.
@@ -204,19 +204,29 @@ impl NetworkHost for FsServices {
     }
 
     fn cookies_for(&self, url: &Url) -> String {
-        self.cookies
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(&url.origin().ascii_serialization())
-            .cloned()
-            .unwrap_or_default()
+        self.jar().cookie_string(cookie_op(url))
     }
 
     fn set_cookie(&self, value: &str, url: &Url) {
-        self.cookies
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(url.origin().ascii_serialization(), value.to_owned());
+        let _stored = self.jar().store(value, cookie_op(url));
+    }
+}
+
+/// One `document.cookie` operation for `url`.
+///
+/// `now` is the wall clock, not the paused one: expiry is a property of the
+/// cookie, and a WPT file should not be able to observe it as time travel.
+/// The document is its own initiator, so a request with no initiator context
+/// (same-site) is the honest description of a script-set cookie.
+fn cookie_op(url: &Url) -> CookieOp<'_> {
+    CookieOp {
+        url,
+        now: SystemTime::now(),
+        kind: RetrievalKind::NonHttp,
+        initiator_kind: InitiatorKind::Fetch,
+        method_is_safe: true,
+        initiator: None,
+        cross_site_redirect: false,
     }
 }
 

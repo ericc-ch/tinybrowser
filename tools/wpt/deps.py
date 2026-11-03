@@ -82,13 +82,18 @@ def profile_name(relative: str) -> str:
     return f"{safe}-{digest:016x}.profraw"
 
 
-def sources_for(
-    binary: Path, profraw: Path, tools: Path, scratch: Path
-) -> list[str]:
+def sources_for(binary: Path, profraw: Path, tools: Path, scratch: Path) -> list[str]:
     """Repository files the test executed."""
     merged = scratch / (profraw.stem + ".profdata")
     merge = subprocess.run(
-        [str(tools / "llvm-profdata"), "merge", "-sparse", str(profraw), "-o", str(merged)],
+        [
+            str(tools / "llvm-profdata"),
+            "merge",
+            "-sparse",
+            str(profraw),
+            "-o",
+            str(merged),
+        ],
         capture_output=True,
         text=True,
     )
@@ -203,8 +208,7 @@ def build(args: argparse.Namespace) -> int:
         return 2
     print(f"deps: {len(tests)} tests, {args.jobs} at a time", file=sys.stderr)
     batches = [
-        tests[index : index + args.batch]
-        for index in range(0, len(tests), args.batch)
+        tests[index : index + args.batch] for index in range(0, len(tests), args.batch)
     ]
     print(f"deps: {len(batches)} batches of up to {args.batch}", file=sys.stderr)
     with tempfile.TemporaryDirectory(
@@ -217,9 +221,7 @@ def build(args: argparse.Namespace) -> int:
                 pool.submit(run_batch, binary, wpt, batch, tools, scratch)
                 for batch in batches
             ]
-            for index, future in enumerate(
-                concurrent.futures.as_completed(futures), 1
-            ):
+            for index, future in enumerate(concurrent.futures.as_completed(futures), 1):
                 tests_map.update(future.result())
                 if index % 25 == 0:
                     print(f"deps: {index}/{len(batches)} batches", file=sys.stderr)

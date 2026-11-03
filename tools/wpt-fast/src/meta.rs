@@ -230,7 +230,10 @@ negative:
         assert!(meta.is_only_strict());
         assert!(meta.is_async());
         assert_eq!(meta.includes, ["assert.js", "propertyHelper.js"]);
-        assert_eq!(meta.negative.as_ref().map(|negative| negative.phase), Some(Phase::Parse));
+        assert_eq!(
+            meta.negative.as_ref().map(|negative| negative.phase),
+            Some(Phase::Parse)
+        );
         assert_eq!(
             meta.negative
                 .as_ref()
@@ -257,10 +260,14 @@ flags:
 
     #[test]
     fn bare_carriage_returns_are_line_breaks() {
-        let source = "/*---\rflags: [module]\rnegative:\r  phase: early\r  type: TypeError\r---*/\r";
+        let source =
+            "/*---\rflags: [module]\rnegative:\r  phase: early\r  type: TypeError\r---*/\r";
         let meta = parse(source);
         assert!(meta.is_module());
-        assert_eq!(meta.negative.as_ref().map(|negative| negative.phase), Some(Phase::Early));
+        assert_eq!(
+            meta.negative.as_ref().map(|negative| negative.phase),
+            Some(Phase::Early)
+        );
         assert_eq!(
             meta.negative
                 .as_ref()

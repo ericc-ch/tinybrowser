@@ -102,15 +102,7 @@ pub fn compare(baseline: &Path, outcomes: &[Outcome]) -> io::Result<Comparison> 
         let Some(id) = result.get("test").and_then(Value::as_str) else {
             continue;
         };
-        let status = result
-            .get("subtests")
-            .and_then(Value::as_array)
-            .and_then(|subtests| subtests.first())
-            .and_then(|subtest| subtest.get("status"))
-            .and_then(Value::as_str)
-            .or_else(|| result.get("status").and_then(Value::as_str))
-            .unwrap_or("SKIP");
-        previous.insert(id.to_owned(), status.to_owned());
+        previous.insert(id.to_owned(), verdict(result).to_owned());
     }
     let mut comparison = Comparison {
         regressions: Vec::new(),
@@ -142,6 +134,37 @@ pub fn compare(baseline: &Path, outcomes: &[Outcome]) -> io::Result<Comparison> 
         }
     }
     Ok(comparison)
+}
+
+/// The file-level verdict one report entry records.
+///
+/// A testharness entry keeps the overall `OK` status and reports the verdict in
+/// its subtests, so an entry fails when any subtest is neither `PASS` nor
+/// `SKIP`. Reading one fixed subtest instead would call a file whose later
+/// subtest fails a pass, and every later run would report the same false
+/// regression. `tools/wpt/cli.py`'s `failing_tests` reads the same rule, which
+/// is what makes a baseline written by one reader usable by the other.
+fn verdict(result: &Value) -> &str {
+    let status = result
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("SKIP");
+    // A file-level timeout or crash outranks its subtests: the file stopped
+    // part-way, so the subtests it reported are a prefix, not a verdict.
+    if matches!(status, "TIMEOUT" | "ERROR" | "CRASH") {
+        return status;
+    }
+    let mut passed = matches!(status, "OK" | "PASS");
+    if let Some(subtests) = result.get("subtests").and_then(Value::as_array) {
+        for subtest in subtests {
+            match subtest.get("status").and_then(Value::as_str) {
+                Some("PASS") => passed = true,
+                Some("SKIP") | None => {}
+                Some(_) => return "FAIL",
+            }
+        }
+    }
+    if passed { "PASS" } else { "SKIP" }
 }
 
 #[cfg(test)]
@@ -176,6 +199,7 @@ mod tests {
                 {"test":"a","subtests":[{"status":"PASS"}]},
                 {"test":"b","subtests":[{"status":"FAIL"}]},
                 {"test":"c","subtests":[{"status":"SKIP"}]},
+                {"test":"mixed","subtests":[{"status":"PASS"},{"status":"FAIL"}]},
                 {"test":"gone","subtests":[{"status":"PASS"}]}
             ]}"#,
         )
@@ -184,6 +208,7 @@ mod tests {
             outcome("a", Status::Fail),
             outcome("b", Status::Pass),
             outcome("c", Status::Pass),
+            outcome("mixed", Status::Fail),
             outcome("new", Status::Fail),
         ];
         let comparison = compare(&path, &outcomes).expect("compared");

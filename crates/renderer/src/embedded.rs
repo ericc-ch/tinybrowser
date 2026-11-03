@@ -45,8 +45,7 @@ impl EmbeddedRenderer {
     /// The engine rejected the mount.
     pub fn mount(&mut self, mount: &Mount) -> Result<(), TabError> {
         self.engine.mount_frame(FrameId::MAIN, mount)?;
-        let _yielded =
-            self.drain_until(std::time::Instant::now() + crate::TURN_SCRIPT_BUDGET);
+        let _yielded = self.drain_until(std::time::Instant::now() + crate::TURN_SCRIPT_BUDGET);
         Ok(())
     }
 

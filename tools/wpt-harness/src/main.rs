@@ -85,13 +85,14 @@ fn main() {
         }
         exit(0);
     }
-    let mut cases = match suite::select(&options.root, &options.paths, options.offset, options.limit) {
-        Ok(cases) => cases,
-        Err(error) => {
-            eprintln!("wpt-harness: cannot read suite: {error}");
-            std::process::exit(2);
-        }
-    };
+    let mut cases =
+        match suite::select(&options.root, &options.paths, options.offset, options.limit) {
+            Ok(cases) => cases,
+            Err(error) => {
+                eprintln!("wpt-harness: cannot read suite: {error}");
+                std::process::exit(2);
+            }
+        };
     apply_selection(&options, &mut cases);
     if cases.is_empty() {
         eprintln!("wpt-harness: no tests selected");
@@ -122,7 +123,10 @@ fn main() {
                 }
             }
             Err(error) => {
-                eprintln!("wpt-harness: cannot compare {}: {error}", baseline.display());
+                eprintln!(
+                    "wpt-harness: cannot compare {}: {error}",
+                    baseline.display()
+                );
                 std::process::exit(2);
             }
         }
@@ -154,10 +158,7 @@ fn apply_selection(options: &Options, cases: &mut Vec<TestCase>) {
     match select_changed(map, changed) {
         Ok(Some(selected)) => {
             cases.retain(|case| selected.contains(&case.id()));
-            eprintln!(
-                "wpt-harness: dependency map selected {} tests",
-                cases.len()
-            );
+            eprintln!("wpt-harness: dependency map selected {} tests", cases.len());
         }
         Ok(None) => {
             eprintln!("wpt-harness: a changed file has no recorded test; running everything");
@@ -239,12 +240,7 @@ fn run_selected(options: &Options, cases: &[TestCase]) -> (Vec<Outcome>, usize) 
         eprintln!("wpt-harness: {cached} cached, {} to run", pending.len());
     }
     let selected: Vec<TestCase> = pending.iter().map(|index| cases[*index].clone()).collect();
-    let fresh = run_all(
-        &options.root,
-        &selected,
-        options.jobs,
-        options.virtual_time,
-    );
+    let fresh = run_all(&options.root, &selected, options.jobs, options.virtual_time);
     for (index, outcome) in pending.into_iter().zip(fresh) {
         slots[index] = Some(outcome);
     }
@@ -319,11 +315,9 @@ fn run_all(
                     // run; the engine that saw it is abandoned rather than
                     // dropped, because dropping a half-torn heap can panic
                     // again during unwinding.
-                    let result = std::panic::catch_unwind(
-                        std::panic::AssertUnwindSafe(|| {
-                            runtime.block_on(session.run(case, virtual_time))
-                        }),
-                    );
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        runtime.block_on(session.run(case, virtual_time))
+                    }));
                     let outcome = result.unwrap_or_else(|_| {
                         Box::leak(Box::new(session));
                         Outcome {
@@ -335,7 +329,8 @@ fn run_all(
                             duration: started.elapsed(),
                             inputs: Vec::new(),
                         }
-                    });                    if sender.send((index, outcome)).is_err() {
+                    });
+                    if sender.send((index, outcome)).is_err() {
                         break;
                     }
                 }
@@ -459,7 +454,8 @@ fn path_arg(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<PathB
         .ok_or_else(|| format!("{flag} needs a path"))
 }
 
-fn parse_args() -> Result<Options, String> {    let mut options = Options {
+fn parse_args() -> Result<Options, String> {
+    let mut options = Options {
         root: suite::default_root(),
         paths: Vec::new(),
         jobs: std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
@@ -510,10 +506,7 @@ fn parse_args() -> Result<Options, String> {    let mut options = Options {
                     .map_err(|_| "--offset needs a number")?;
             }
             "--mark-crashed" => {
-                options.mark_crashed = Some(
-                    args.next()
-                        .ok_or("--mark-crashed needs a test id")?,
-                );
+                options.mark_crashed = Some(args.next().ok_or("--mark-crashed needs a test id")?);
             }
             "--real-time" => options.virtual_time = false,
             "--verbose" => options.verbose = true,

@@ -63,10 +63,7 @@ impl TestCase {
     /// diff cannot match a single test.
     #[must_use]
     pub fn wpt_id(&self) -> String {
-        let stem = self
-            .relative
-            .strip_suffix(".js")
-            .unwrap_or(&self.relative);
+        let stem = self.relative.strip_suffix(".js").unwrap_or(&self.relative);
         let suffix = if self.strict {
             ".test262.strict.html"
         } else {
@@ -234,7 +231,7 @@ fn run_file(runtime: &Runtime, harness: &Harness, case: &TestCase) -> Verdict {
     if let Some(failure) = failure {
         return classify_failure(&case.meta, &failure);
     }
-    finish_async(runtime, &case.meta, &async_result)
+    finish(runtime, &case.meta, &async_result)
 }
 
 /// Runs a `flags: [module]` file through `QuickJS`'s module loader.
@@ -253,14 +250,14 @@ fn run_module(runtime: &Runtime, harness: &Harness, case: &TestCase) -> Verdict 
         if failure.is_some() {
             return;
         }
-        let promise = match Module::evaluate(ctx.clone(), case.relative.clone(), case.source.clone())
-        {
-            Ok(promise) => promise,
-            Err(error) => {
-                failure = Some(failure_from_error(&ctx, error));
-                return;
-            }
-        };
+        let promise =
+            match Module::evaluate(ctx.clone(), case.relative.clone(), case.source.clone()) {
+                Ok(promise) => promise,
+                Err(error) => {
+                    failure = Some(failure_from_error(&ctx, error));
+                    return;
+                }
+            };
         let settled = promise.finish::<()>();
         while ctx.execute_pending_job() {}
         if let Err(error) = settled {
@@ -270,7 +267,7 @@ fn run_module(runtime: &Runtime, harness: &Harness, case: &TestCase) -> Verdict 
     if let Some(failure) = failure {
         return classify_failure(&case.meta, &failure);
     }
-    finish_async(runtime, &case.meta, &async_result)
+    finish(runtime, &case.meta, &async_result)
 }
 
 /// Installs the host and runs the harness scripts a test is built on.
@@ -288,7 +285,10 @@ fn prepare(
             return Some(Failure::Host(format!("missing harness {name}")));
         };
         if let Err(error) = eval(ctx, source) {
-            return Some(Failure::Host(format!("harness {name}: {}", error.message())));
+            return Some(Failure::Host(format!(
+                "harness {name}: {}",
+                error.message()
+            )));
         }
     }
     for include in &case.meta.includes {
@@ -314,22 +314,38 @@ fn prepare(
     None
 }
 
-/// Applies the async result after a test that declared `async`.
-fn finish_async(
+/// Applies the async result after a test that finished its body.
+fn finish(
     runtime: &Runtime,
     meta: &Meta,
     async_result: &Rc<RefCell<Option<Result<(), String>>>>,
 ) -> Verdict {
     if !meta.is_async() {
-        return Verdict::Pass;
+        return completed(meta);
     }
     if let Err(error) = drain_jobs(runtime) {
         return Verdict::Fail(format!("pending job: {error}"));
     }
     match async_result.borrow_mut().take() {
-        Some(Ok(())) => Verdict::Pass,
+        Some(Ok(())) => completed(meta),
         Some(Err(error)) => Verdict::Fail(error),
         None => Verdict::Fail("async test never called $DONE".into()),
+    }
+}
+
+/// The verdict for a test body that ran to the end without raising.
+///
+/// A `negative:` test exists to make the engine throw, so completing is the
+/// same failure test262's own harness reports as "expected exception was not
+/// thrown". `$DONOTEVALUATE` covers the tests that police themselves from
+/// inside the file; the frontmatter covers the rest.
+fn completed(meta: &Meta) -> Verdict {
+    match &meta.negative {
+        Some(negative) => Verdict::Fail(format!(
+            "expected {} but the test completed",
+            negative.error_type.as_deref().unwrap_or("an exception")
+        )),
+        None => Verdict::Pass,
     }
 }
 
@@ -478,9 +494,27 @@ fn drain_jobs(runtime: &Runtime) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use crate::meta::Meta;
+    use crate::meta::{Meta, Negative, Phase};
 
-    use super::TestCase;
+    use super::{TestCase, Verdict, completed};
+
+    #[test]
+    fn a_negative_test_that_completes_is_a_failure() {
+        let meta = Meta {
+            negative: Some(Negative {
+                error_type: Some("TypeError".into()),
+                phase: Phase::Early,
+            }),
+            ..Meta::default()
+        };
+        match completed(&meta) {
+            Verdict::Fail(message) => {
+                assert_eq!(message, "expected TypeError but the test completed");
+            }
+            Verdict::Pass | Verdict::Skip(_) => panic!("a negative test must not pass"),
+        }
+        assert!(matches!(completed(&Meta::default()), Verdict::Pass));
+    }
 
     #[test]
     fn the_wpt_id_replaces_the_js_extension() {

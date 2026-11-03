@@ -48,8 +48,8 @@ impl Loader for SuiteLoader {
         {
             return Err(Error::new_loading(name));
         }
-        let source = std::fs::read_to_string(self.root.join(name))
-            .map_err(|_| Error::new_loading(name))?;
+        let source =
+            std::fs::read_to_string(self.root.join(name)).map_err(|_| Error::new_loading(name))?;
         Module::declare(ctx.clone(), name.to_owned(), source)
     }
 }
