@@ -111,8 +111,19 @@ goes through the browser's own jar (`crates/cookies`). wptserve's query-param
 handlers, `.sub.` substitution files, and server-set `Set-Cookie` are not
 implemented, so a test that depends on them cannot pass here even when it
 passes in the nightly; that is why the parity numbers above are quoted per
-directory. Popups, workers, and WebDriver are out of scope: `window.open`
-returns null and `testdriver.js` files are skipped.
+directory. A request that resolves to a `.py` handler is a network error
+rather than the handler's own source. Popups, workers, and WebDriver are out
+of scope: `window.open` returns null and `testdriver.js` files are skipped.
+
+**The lane runs without the browser's fetch security model.** `FsServices` is
+a `NetworkHost`, and the CORS protocol, response tainting, the no-CORS request
+guards, redirect policy, and the browser-side cache live in `crates/browser`
+and `crates/net`, which this process never loads. Every URL is a same-origin
+`200` from the checkout, so a file that asserts a cross-origin `fetch` fails
+with `TypeError`, or that a `no-cors` response is `opaque`, gets the wrong
+answer here whichever way the engine behaves. Those files are skipped or
+should be; the `--score` parity numbers exclude them. Running the lane over the
+real fetch core with an in-memory transport is tracked by #233.
 
 A conformance change is a failure-list diff: failures prints the
 canonical list of a --score log, baseline runs both sides in a detached

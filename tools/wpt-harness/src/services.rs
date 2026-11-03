@@ -136,6 +136,16 @@ impl FsServices {
         {
             return Err(DialFailure::Connect);
         }
+        // wptserve executes a `.py` handler for such a path. Serving the
+        // handler's own source instead would hand a test a 200 body no browser
+        // ever sees, so the resource is a network error in this lane until the
+        // handlers are implemented.
+        if relative
+            .extension()
+            .is_some_and(|extension| extension == "py")
+        {
+            return Err(DialFailure::Connect);
+        }
         let file = self.record(self.root.join(relative));
         let body = std::fs::read(&file).map_err(|_| DialFailure::Connect)?;
         // `.headers` is wptserve's per-resource header file.
@@ -351,4 +361,61 @@ impl BrowsingContextHost for FsServices {
 
 impl MessagingHost for FsServices {
     fn broadcast_post(&self, _origin: &StorageKey, _name: &str, _payload: &str, _channel: u64) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use renderer::{DialFailure, DialOutcome};
+
+    use super::FsServices;
+
+    fn root(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "wpt-harness-services-{name}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(root.join("dir")).expect("root created");
+        root
+    }
+
+    fn outcome(services: &FsServices, path: &str) -> Result<DialOutcome, DialFailure> {
+        let url =
+            url::Url::parse(&format!("http://web-platform.test:8000{path}")).expect("test URL");
+        services.serve(&renderer::DialRequest::new(
+            renderer::RequestPolicy::Image { crossorigin: None },
+            &url,
+            &url.origin(),
+        ))
+    }
+
+    #[test]
+    fn a_static_file_is_served_and_a_handler_is_not() {
+        let root = root("handler");
+        std::fs::write(root.join("dir/data.txt"), b"from a file").expect("file written");
+        std::fs::write(
+            root.join("dir/handler.py"),
+            b"def main(request, response): ...",
+        )
+        .expect("handler written");
+        let services = FsServices::new(root.clone());
+
+        let served = outcome(&services, "/dir/data.txt").expect("static file");
+        assert!(
+            matches!(&served.body, renderer::ResponseBody::Bytes(bytes) if bytes == b"from a file")
+        );
+
+        // Serving the handler's source would hand a test a 200 that no browser
+        // ever sees for that URL.
+        assert!(
+            outcome(&services, "/dir/handler.py").is_err(),
+            "a wptserve handler is a network error, not its own source"
+        );
+        assert!(
+            outcome(&services, "/dir/missing.txt").is_err(),
+            "an absent file is a network error"
+        );
+        std::fs::remove_dir_all(&root).expect("root removed");
+    }
 }
