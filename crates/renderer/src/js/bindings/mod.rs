@@ -1880,10 +1880,13 @@ mod realm_tests {
                 r"
                 var ctx = document.getElementById('c').getContext('2d');
                 ctx.font = '40px serif';
+                // Blink: a measured alignment and the same option alignment
+                // cancel, so the first cluster starts at the text origin.
                 ctx.textAlign = 'center';
                 var tm = ctx.measureText('E');
                 var width = tm.width;
                 var frozen = tm.getTextClusters()[0].x;
+                var right = tm.getTextClusters({align: 'right'})[0].x;
                 ctx.textAlign = 'left';
                 var later = tm.getTextClusters()[0].x;
 
@@ -1899,21 +1902,27 @@ mod realm_tests {
                 catch (e) { rejected = e instanceof TypeError; }
 
                 [
-                  Math.abs(frozen - width / 2) < 0.5,
+                  Math.abs(frozen) < 0.5,
+                  Math.abs(right - width / 2) < 0.5,
                   frozen === later,
                   reentered,
-                  rejected,
+                  typeof ctx.fillTextCluster === 'function' && rejected,
                   typeof TextCluster === 'function',
                   typeof TextMetrics === 'function',
                   tm instanceof TextMetrics,
                   tm.getTextClusters()[0] instanceof TextCluster,
                   TextCluster.prototype.hasOwnProperty('begin'),
                   TextCluster.prototype.hasOwnProperty('align'),
+                  Object.prototype.toString.call(tm) === '[object TextMetrics]',
+                  TextMetrics.name === 'TextMetrics',
                 ].join(',');
                 ",
             )
             .expect("canvas metrics");
-        assert_eq!(outcome, "true,true,true,true,true,true,true,true,true,true");
+        assert_eq!(
+            outcome,
+            "true,true,true,true,true,true,true,true,true,true,true,true,true"
+        );
     }
 
     #[test]

@@ -14,8 +14,9 @@ mod text;
 pub(crate) use state::{Canvas2D, ColorMatrix, Gradient, Pattern, Rect, SourceImage, StyleValue};
 
 use base64::Engine as _;
+use rquickjs::atom::PredefinedAtom;
 use rquickjs::function::This;
-use rquickjs::object::Accessor;
+use rquickjs::object::{Accessor, Property};
 use rquickjs::prelude::{Func, Opt, Rest};
 use rquickjs::{
     Array, Class, Coerced, Ctx, Exception, FromJs, Function, Object, Result, TypedArray, Value,
@@ -60,8 +61,8 @@ impl<'js> rquickjs::class::Trace<'js> for JsTextCluster {
 }
 
 /// One `measureText()` result. The class owns the shaping through an `Rc`, so
-/// the shaping is freed when the script drops the metrics object and every
-/// cluster it returned instead of accumulating on the context.
+/// the shaping is released when `QuickJS` collects the metrics object and every
+/// cluster it returned instead of living in a context-wide map.
 #[derive(rquickjs::JsLifetime)]
 #[rquickjs::class(rename = "TextMetrics")]
 pub(crate) struct JsTextMetrics {
@@ -397,8 +398,13 @@ fn install_text_metrics_objects(ctx: &Ctx<'_>) -> Result<()> {
 /// instance creation looks up.
 fn install_interface_object<'js>(ctx: &Ctx<'js>, name: &str, prototype: Object<'js>) -> Result<()> {
     let ctor = Function::new(ctx.clone(), illegal_constructor)?;
+    ctor.prop("name", Property::from(name).configurable())?;
     ctor.set("prototype", prototype.clone())?;
     prototype.set("constructor", ctor.clone())?;
+    prototype.prop(
+        PredefinedAtom::SymbolToStringTag,
+        Property::from(name).configurable(),
+    )?;
     ctx.globals().set(name, ctor)?;
     world(ctx)?
         .borrow_mut()
@@ -2993,7 +2999,8 @@ fn draw_text_cluster<'js>(
             cluster.baseline,
         )
     };
-    let options = read_text_options(options.0.as_ref())?;
+    let ctx = this.0.ctx();
+    let options = read_text_options(ctx, options.0.as_ref())?;
     let cluster = &record.shaped.clusters[index];
     let Some(path) = cluster.path.as_ref() else {
         return Ok(());
@@ -3007,16 +3014,23 @@ fn draw_text_cluster<'js>(
         .as_deref()
         .and_then(state::TextBaseline::parse)
         .unwrap_or(cluster_baseline);
-    // The option `x`/`y` members move the cluster from its recorded position,
-    // exactly as drawing the whole text at a shifted anchor would.
-    let dx = options.x.unwrap_or(0.0);
-    let dy = options.y.unwrap_or(0.0);
-    let tx = f32_of(x + dx)
-        + alignment_offset(&record.shaped, align)
-        + cluster.offset * record.shaped.scale_x;
-    let ty = f32_of(y + dy) + baseline_offset(&record.shaped, baseline);
-    let ctx = this.0.ctx();
     let scale_x = record.shaped.scale_x;
+    let advance = cluster.advance * scale_x;
+    // Blink replaces the cluster's recorded position with an explicit option and
+    // otherwise uses it as-is. That position was computed from the *measured*
+    // alignment, so drawing adds this call's alignment delta on top.
+    let cluster_x = f64::from(
+        cluster.offset * scale_x + align_delta(advance, cluster_align)
+            - -alignment_offset(&record.shaped, record.align),
+    );
+    let cluster_y = f64::from(
+        baseline_offset(&record.shaped, record.baseline)
+            - baseline_offset(&record.shaped, cluster_baseline),
+    );
+    let offset_x = options.x.unwrap_or(cluster_x);
+    let offset_y = options.y.unwrap_or(cluster_y);
+    let tx = f32_of(x + offset_x) + alignment_offset_width(advance, align);
+    let ty = f32_of(y + offset_y) + baseline_offset(&record.shaped, baseline);
     with_canvas(ctx, &this.0, |canvas| {
         if stroke {
             canvas.stroke_text_path(path, tx, ty, scale_x);
@@ -3039,13 +3053,24 @@ fn draw_text(
 
 /// Horizontal shift from the text anchor to the alignment point. Negative
 /// shifts move the string left for `center` and `right`.
-fn alignment_offset(shaped: &text::ShapedText, align: text::ResolvedAlign) -> f32 {
-    let width = shaped.width * shaped.scale_x;
+fn alignment_offset_width(width: f32, align: text::ResolvedAlign) -> f32 {
     match align {
         text::ResolvedAlign::Center => -width / 2.0,
         text::ResolvedAlign::Right => -width,
         text::ResolvedAlign::Left => 0.0,
     }
+}
+
+fn alignment_offset(shaped: &text::ShapedText, align: text::ResolvedAlign) -> f32 {
+    alignment_offset_width(shaped.width * shaped.scale_x, align)
+}
+
+/// Blink's `getTextAlignDelta`: the distance from the anchor to the text
+/// origin, positive in the inline direction. It is the negation of
+/// [`alignment_offset_width`], which is the shift applied at draw time
+/// (<https://source.chromium.org/chromium/chromium/src/+/main:third_party/blink/renderer/core/html/canvas/text_metrics.cc>).
+fn align_delta(width: f32, align: text::ResolvedAlign) -> f32 {
+    -alignment_offset_width(width, align)
 }
 
 /// Vertical shift from the top of the line box to the requested baseline.
@@ -3189,7 +3214,7 @@ struct TextOptions {
     y: Option<f64>,
 }
 
-fn read_text_options(value: Option<&Value<'_>>) -> Result<TextOptions> {
+fn read_text_options<'js>(ctx: &Ctx<'js>, value: Option<&Value<'js>>) -> Result<TextOptions> {
     let mut options = TextOptions::default();
     let Some(object) = value.and_then(Value::as_object) else {
         return Ok(options);
@@ -3198,6 +3223,25 @@ fn read_text_options(value: Option<&Value<'_>>) -> Result<TextOptions> {
     options.baseline = object.get::<_, Option<String>>("baseline")?;
     options.x = object.get::<_, Option<f64>>("x")?;
     options.y = object.get::<_, Option<f64>>("y")?;
+    // WebIDL enum conversion throws `TypeError` for a value outside the enum;
+    // a silently ignored typo would measure at a different alignment than the
+    // page asked for.
+    if let Some(align) = &options.align
+        && !matches!(
+            align.as_str(),
+            "start" | "end" | "left" | "right" | "center"
+        )
+    {
+        return Err(Exception::throw_type(ctx, "invalid CanvasTextAlign value"));
+    }
+    if let Some(baseline) = &options.baseline
+        && state::TextBaseline::parse(baseline).is_none()
+    {
+        return Err(Exception::throw_type(
+            ctx,
+            "invalid CanvasTextBaseline value",
+        ));
+    }
     Ok(options)
 }
 
@@ -3279,9 +3323,12 @@ fn no_ink() -> text::ClusterInk {
     }
 }
 
-/// The union of the ink of every cluster that overlaps `[start, end)`. A
-/// partial range inside a ligature includes the whole ligature glyph, because
-/// a glyph cannot be split between clusters.
+/// The union of the ink of every cluster whose start index falls in
+/// `[start, end)`. Blink attributes each glyph to its cluster's start
+/// character, so a range that excludes a ligature's start contributes no ink;
+/// this follows that rule rather than intersecting the cluster's span. The
+/// WPT reference shapes a space-padded copy of the range, which is a third
+/// answer this engine does not reproduce (the suite only measures `ABCDE`).
 fn range_ink(record: &text::TextMetricsRecord, start: usize, end: usize) -> text::ClusterInk {
     if start >= end {
         return no_ink();
@@ -3291,7 +3338,8 @@ fn range_ink(record: &text::TextMetricsRecord, start: usize, end: usize) -> text
         .clusters
         .iter()
         .filter(|cluster| {
-            (cluster.utf16_start as usize) < end && (cluster.utf16_end as usize) > start
+            let start_of_cluster = cluster.utf16_start as usize;
+            start_of_cluster >= start && start_of_cluster < end
         })
         .filter_map(|cluster| cluster.ink)
         .reduce(text::ClusterInk::union)
@@ -3314,7 +3362,7 @@ fn get_text_clusters<'js>(
             (&args.0[..], args.0.get(2))
         };
     let (start, end) = text_range(ctx, &record.text, range_args, true, false)?;
-    let options = read_text_options(options_value)?;
+    let options = read_text_options(ctx, options_value)?;
     let align = options
         .align
         .as_deref()
@@ -3343,17 +3391,18 @@ fn get_text_clusters<'js>(
 fn get_actual_bounding_box<'js>(
     this: This<Object<'js>>,
     args: rquickjs::function::Rest<Value<'js>>,
-) -> Result<Object<'js>> {
+) -> Result<Value<'js>> {
     let ctx = this.0.ctx();
     let record = metrics_record(&this)?;
     let (start, end) = text_range(ctx, &record.text, &args.0, false, false)?;
     let (left, right, ascent, descent) = bounding_box(&record, range_ink(&record, start, end));
-    let object = Object::new(ctx.clone())?;
-    object.set("x", f64::from(-left))?;
-    object.set("y", f64::from(-ascent))?;
-    object.set("width", f64::from(left + right))?;
-    object.set("height", f64::from(ascent + descent))?;
-    Ok(object)
+    crate::js::bindings::geometry::dom_rect(
+        ctx,
+        f64::from(-left),
+        f64::from(-ascent),
+        f64::from(left + right),
+        f64::from(ascent + descent),
+    )
 }
 
 fn get_selection_rects<'js>(
@@ -3607,15 +3656,24 @@ fn cluster_end(this: This<Object<'_>>) -> Result<u32> {
 fn cluster_x(this: This<Object<'_>>) -> Result<f64> {
     let (record, index, align, _) = cluster_parts(&this)?;
     let cluster = &record.shaped.clusters[index];
-    let align_dx = alignment_offset(&record.shaped, align);
+    let advance = cluster.advance * record.shaped.scale_x;
+    // Blink: `cluster.x_position + getTextAlignDelta(cluster.width, option) -
+    // text_align_dx`, where `text_align_dx` is the measured alignment's
+    // distance from the anchor to the text origin.
+    let text_align_dx = -alignment_offset(&record.shaped, record.align);
     Ok(f64::from(
-        -(align_dx + cluster.offset * record.shaped.scale_x),
+        cluster.offset * record.shaped.scale_x + align_delta(advance, align) - text_align_dx,
     ))
 }
 
 fn cluster_y(this: This<Object<'_>>) -> Result<f64> {
     let (record, _, _, baseline) = cluster_parts(&this)?;
-    Ok(f64::from(-baseline_offset(&record.shaped, baseline)))
+    // Blink: `GetFontBaseline(measured) - GetFontBaseline(option)`, which is
+    // the difference of the two baseline offsets.
+    Ok(f64::from(
+        baseline_offset(&record.shaped, record.baseline)
+            - baseline_offset(&record.shaped, baseline),
+    ))
 }
 
 fn cluster_text(this: This<Object<'_>>) -> Result<std::string::String> {

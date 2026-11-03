@@ -67,8 +67,11 @@ impl ClusterInk {
 }
 
 /// One measured string. The `TextMetrics` object and every `TextCluster` it
-/// returns hold an `Rc` to this record, so the shaping is freed when the last
-/// script-visible object dies instead of accumulating on the context.
+/// returns hold an `Rc` to this record, so the shaping is freed when `QuickJS`
+/// collects the last script-visible reference instead of accumulating on the
+/// context. The record's native bytes are outside the engine's heap cap, and
+/// one retained cluster pins every cluster's path, so a page measuring in a
+/// loop can still grow between collections.
 pub(crate) struct TextMetricsRecord {
     pub(crate) text: String,
     pub(crate) shaped: ShapedText,
@@ -125,7 +128,9 @@ pub(crate) struct ShapedText {
     pub(crate) descent: f32,
     /// Horizontal squeeze applied by `fillText`'s `maxWidth`.
     pub(crate) scale_x: f32,
-    /// Shaped clusters, in visual order, present only for [`Shaping::Clusters`].
+    /// Shaped clusters in the shaping run's logical order, present only for
+    /// [`Shaping::Clusters`]. RTL runs are reversed by `parley`'s visual
+    /// iteration, not here.
     pub(crate) clusters: Vec<TextCluster>,
     /// The union of every cluster's ink, relative to the text origin and the
     /// alphabetic baseline, squeezed by `maxWidth`
@@ -279,10 +284,10 @@ pub(crate) fn shape(
                     let byte_start = byte_map[range.start];
                     let byte_end = byte_map[range.end];
                     // The byte map is monotonic and lands on character
-                    // boundaries: every normalization is one byte to one byte
-                    // and U+0000 is dropped from both sides. A slice that is
-                    // not on a boundary would abort the renderer, so prove the
-                    // invariant here instead of trusting it at the call site.
+                    // boundaries because every normalization is one byte to
+                    // one byte and U+0000 is dropped from both sides. Release
+                    // relies on that construction, not on the debug assertion;
+                    // a slice off a boundary would abort the renderer.
                     debug_assert!(text.is_char_boundary(byte_start));
                     debug_assert!(text.is_char_boundary(byte_end));
                     clusters.push(TextCluster {
@@ -310,26 +315,15 @@ pub(crate) fn shape(
         }
         Shaping::Width => None,
     };
+    // Only a measurement reads the ink box; a drawing pass would pay for a
+    // second path clone and bounds scan it never consumes.
     let ink = if shaping == Shaping::Clusters {
         clusters
             .iter()
             .filter_map(|cluster| cluster.ink)
             .reduce(ClusterInk::union)
     } else {
-        path.as_ref()
-            .and_then(|path| {
-                path.clone().transform(
-                    Transform::from_scale(scale_x, 1.0)
-                        .pre_concat(Transform::from_translate(0.0, -ascent)),
-                )
-            })
-            .map(|path| path.bounds())
-            .map(|bounds| ClusterInk {
-                min_x: bounds.left(),
-                max_x: bounds.right(),
-                ascent: (-bounds.top()).max(0.0),
-                descent: bounds.bottom().max(0.0),
-            })
+        None
     };
     ShapedText {
         path,
