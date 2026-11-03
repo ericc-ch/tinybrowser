@@ -437,10 +437,13 @@ enum PatternRepeat {
 }
 
 /// A decoded source image for `drawImage`: straight RGBA, row-major.
+///
+/// The pixels are shared so a raster cached for a vector source is reused
+/// without copying it on every draw.
 pub(crate) struct SourceImage {
     pub(crate) width: u32,
     pub(crate) height: u32,
-    pub(crate) pixels: Vec<u8>,
+    pub(crate) pixels: Arc<[u8]>,
     /// False when the source came from another origin; painting it clears the
     /// destination canvas's origin-clean flag.
     pub(crate) origin_clean: bool,
@@ -838,6 +841,18 @@ impl Canvas2D {
 
     pub(crate) fn get_transform(&self) -> Transform {
         self.state.transform
+    }
+
+    /// The device-space length of each user-space unit vector under the
+    /// current transformation. A `dst` rect is drawn at this scale, so a
+    /// vector source needs a raster of at least this many pixels per source
+    /// pixel.
+    pub(crate) fn device_scale(&self) -> (f32, f32) {
+        let transform = self.state.transform;
+        (
+            transform.sx.hypot(transform.ky),
+            transform.kx.hypot(transform.sy),
+        )
     }
 
     pub(crate) fn translate(&mut self, x: f32, y: f32) {
@@ -4134,7 +4149,7 @@ mod tests {
             &SourceImage {
                 width: 1,
                 height: 1,
-                pixels: vec![255, 0, 0, 255],
+                pixels: vec![255, 0, 0, 255].into(),
                 origin_clean: false,
             },
             Rect::new(0.0, 0.0, 1.0, 1.0),

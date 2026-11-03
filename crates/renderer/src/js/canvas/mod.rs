@@ -25,6 +25,9 @@ use rquickjs::{
     Array, Class, Coerced, Ctx, Exception, FromJs, Function, Object, Result, TypedArray, Value,
 };
 
+use num_traits::ToPrimitive as _;
+use std::sync::Arc;
+
 use crate::dom::tree::NodeId;
 use crate::js::bindings::{attribute_value, world, wrap_node};
 use path2d::JsPath2D;
@@ -1563,6 +1566,14 @@ fn create_pattern<'js>(
     };
     let source = match source_image(this.0.ctx(), source)? {
         ImageLookup::Decoded(source) => source,
+        ImageLookup::Vector(vector) => {
+            // A pattern has no destination rect, so the natural size is the
+            // only scale available.
+            let Some(image) = vector.natural(this.0.ctx()) else {
+                return Ok(Value::new_null(this.0.ctx().clone()));
+            };
+            image
+        }
         ImageLookup::NotReady => return Ok(Value::new_null(this.0.ctx().clone())),
         ImageLookup::Unsupported => {
             return Err(Exception::throw_type(
@@ -2299,7 +2310,8 @@ fn create_image_bitmap_decode<'js>(
     }
     let image = image.to_rgba8();
     let (width, height) = (image.width(), image.height());
-    let Some((width, height, pixels)) = resize_bitmap(width, height, image.into_raw(), &options)
+    let Some((width, height, pixels)) =
+        resize_bitmap(width, height, image.into_raw().into(), &options)
     else {
         return Err(crate::js::bindings::throw_dom(
             &ctx,
@@ -2318,6 +2330,16 @@ fn create_image_bitmap_from_source<'js>(
     let options = bitmap_options(options.0.as_ref().and_then(|value| value.as_object()))?;
     let image = match source_image(&ctx, source)? {
         ImageLookup::Decoded(image) => image,
+        ImageLookup::Vector(vector) => {
+            let Some(image) = vector.natural(&ctx) else {
+                return Err(crate::js::bindings::throw_dom(
+                    &ctx,
+                    "InvalidStateError",
+                    "the image source is not usable",
+                ));
+            };
+            image
+        }
         ImageLookup::Unsupported => {
             return Err(Exception::throw_type(
                 &ctx,
@@ -2349,7 +2371,7 @@ fn image_bitmap_object<'js>(
     ctx: &Ctx<'js>,
     width: u32,
     height: u32,
-    pixels: Vec<u8>,
+    pixels: Arc<[u8]>,
     origin_clean: bool,
 ) -> Result<Value<'js>> {
     let ctor: Function = ctx.globals().get("ImageBitmap")?;
@@ -2447,10 +2469,12 @@ fn bitmap_options(options: Option<&Object<'_>>) -> Result<BitmapOptions> {
 fn resize_bitmap(
     width: u32,
     height: u32,
-    pixels: Vec<u8>,
+    pixels: Arc<[u8]>,
     options: &BitmapOptions,
-) -> Option<(u32, u32, Vec<u8>)> {
-    let buffer = image::RgbaImage::from_raw(width, height, pixels)?;
+) -> Option<(u32, u32, Arc<[u8]>)> {
+    // `RgbaImage` owns its pixels, so a raster still shared with the source
+    // cache is copied once here; `createImageBitmap` is not a hot path.
+    let buffer = image::RgbaImage::from_raw(width, height, pixels.to_vec())?;
     let (source_width, source_height) = (buffer.width(), buffer.height());
     let (target_width, target_height) = match (options.resize_width, options.resize_height) {
         (None, None) => (source_width, source_height),
@@ -2469,7 +2493,7 @@ fn resize_bitmap(
     } else {
         resized
     };
-    Some((resized.width(), resized.height(), resized.into_raw()))
+    Some((resized.width(), resized.height(), resized.into_raw().into()))
 }
 
 /// The unspecified resize axis keeps the source aspect ratio, rounded to the
@@ -2498,8 +2522,10 @@ fn draw_image<'js>(
     args: rquickjs::function::Rest<Coerced<f64>>,
 ) -> Result<()> {
     reject_open_layer(this.0.ctx(), &this.0)?;
-    let image = match source_image(this.0.ctx(), source)? {
-        ImageLookup::Decoded(image) => image,
+    let lookup = source_image(this.0.ctx(), source)?;
+    let (natural_width, natural_height) = match &lookup {
+        ImageLookup::Decoded(image) => (image.width, image.height),
+        ImageLookup::Vector(vector) => (vector.natural_width, vector.natural_height),
         ImageLookup::NotReady => return Ok(()),
         ImageLookup::Unsupported => {
             return Err(Exception::throw_type(
@@ -2520,18 +2546,18 @@ fn draw_image<'js>(
         [dx, dy] => (
             0.0,
             0.0,
-            f64::from(image.width),
-            f64::from(image.height),
+            f64::from(natural_width),
+            f64::from(natural_height),
             *dx,
             *dy,
-            f64::from(image.width),
-            f64::from(image.height),
+            f64::from(natural_width),
+            f64::from(natural_height),
         ),
         [dx, dy, dw, dh] => (
             0.0,
             0.0,
-            f64::from(image.width),
-            f64::from(image.height),
+            f64::from(natural_width),
+            f64::from(natural_height),
             *dx,
             *dy,
             *dw,
@@ -2545,18 +2571,50 @@ fn draw_image<'js>(
             ));
         }
     };
-    with_canvas(this.0.ctx(), &this.0, |canvas| {
-        canvas.draw_image(
-            &image,
-            Rect::new(f32_of(sx), f32_of(sy), f32_of(sw), f32_of(sh)),
-            Rect::new(f32_of(dx), f32_of(dy), f32_of(dw), f32_of(dh)),
-        );
-    })
+    let src = Rect::new(f32_of(sx), f32_of(sy), f32_of(sw), f32_of(sh));
+    let dst = Rect::new(f32_of(dx), f32_of(dy), f32_of(dw), f32_of(dh));
+    match lookup {
+        ImageLookup::Decoded(image) => with_canvas(this.0.ctx(), &this.0, |canvas| {
+            canvas.draw_image(&image, src, dst);
+        }),
+        ImageLookup::Vector(vector) => {
+            let (scale_x, scale_y) =
+                with_canvas(this.0.ctx(), &this.0, |canvas| canvas.device_scale())?;
+            let Some((raster_width, raster_height)) =
+                vector.raster_size(src, dst, scale_x, scale_y)
+            else {
+                return Ok(());
+            };
+            let Some(image) = vector.rasterize(this.0.ctx(), raster_width, raster_height) else {
+                return Ok(());
+            };
+            // `src` selects a region in intrinsic image pixels; the raster is
+            // that image at `raster_width x raster_height`, so the same region
+            // is a proportionally larger rectangle.
+            let factor_x = to_f32(raster_width) / to_f32(vector.natural_width);
+            let factor_y = to_f32(raster_height) / to_f32(vector.natural_height);
+            let src = Rect::new(
+                src.x * factor_x,
+                src.y * factor_y,
+                src.width * factor_x,
+                src.height * factor_y,
+            );
+            with_canvas(this.0.ctx(), &this.0, |canvas| {
+                canvas.draw_image(&image, src, dst);
+            })
+        }
+        // The natural-size lookup above returned for these.
+        ImageLookup::NotReady | ImageLookup::Unsupported | ImageLookup::Invalid => Ok(()),
+    }
 }
 
 /// A `drawImage`/`createPattern` source lookup.
 enum ImageLookup {
     Decoded(SourceImage),
+    /// A vector source (`<img>` whose data is SVG). Rasterization is deferred
+    /// so `drawImage` can choose the destination's device resolution instead
+    /// of scaling a fixed raster.
+    Vector(VectorSource),
     /// A canvas or image that exists but has no pixels yet; drawing it is a
     /// no-op, not an error.
     NotReady,
@@ -2646,7 +2704,7 @@ fn source_image<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> Result<ImageLookup> {
     Ok(ImageLookup::Decoded(SourceImage {
         width,
         height,
-        pixels,
+        pixels: pixels.into(),
         origin_clean,
     }))
 }
@@ -2685,7 +2743,7 @@ fn source_element(
         return Some(ImageLookup::Decoded(SourceImage {
             width,
             height,
-            pixels,
+            pixels: pixels.into(),
             origin_clean: true,
         }));
     }
@@ -2700,7 +2758,7 @@ fn source_element(
             Some(raster) => ImageLookup::Decoded(SourceImage {
                 width: raster.width,
                 height: raster.height,
-                pixels: raster.data.as_ref().to_vec(),
+                pixels: raster.data.as_ref().to_vec().into(),
                 // Blitz does not decode SVG `<image>` resources, so this is
                 // unreachable today; if it starts, fail closed rather than
                 // claim the pixels are clean.
@@ -2731,12 +2789,16 @@ fn source_element(
         if zero_size {
             return Some(ImageLookup::NotReady);
         }
-        return Some(
-            svg_source_image(svg).map_or(ImageLookup::NotReady, |mut image| {
-                image.origin_clean = origin_clean.unwrap_or(false);
-                ImageLookup::Decoded(image)
-            }),
-        );
+        let (natural_width, natural_height) = crate::render::svg_natural_size(svg);
+        if natural_width == 0 || natural_height == 0 {
+            return Some(ImageLookup::NotReady);
+        }
+        return Some(ImageLookup::Vector(VectorSource {
+            svg: svg.clone(),
+            natural_width,
+            natural_height,
+            origin_clean: origin_clean.unwrap_or(false),
+        }));
     }
     let has_source = data.attrs().iter().any(|attribute| {
         attribute.name.local.as_str() == "src" && !attribute.value.trim().is_empty()
@@ -2746,7 +2808,7 @@ fn source_element(
         Some(raster) => Some(ImageLookup::Decoded(SourceImage {
             width: raster.width,
             height: raster.height,
-            pixels: raster.data.as_ref().to_vec(),
+            pixels: raster.data.as_ref().to_vec().into(),
             // Only the settled request's taint record speaks for the pixels;
             // an unrecorded request is treated as cross-origin.
             origin_clean: origin_clean.unwrap_or(false),
@@ -2758,13 +2820,186 @@ fn source_element(
     }
 }
 
-/// Rasterizes an SVG `<img>` at its intrinsic size into straight RGBA pixels
-/// for `drawImage` / `createPattern`.
-fn svg_source_image(svg: &blitz_dom::node::SvgImageData) -> Option<SourceImage> {
-    let (width, height) = crate::render::svg_natural_size(svg);
+/// A parsed vector image source. Rasterization is deferred so `drawImage` can
+/// choose the destination's device resolution instead of scaling a fixed
+/// raster.
+struct VectorSource {
+    svg: blitz_dom::node::SvgImageData,
+    natural_width: u32,
+    natural_height: u32,
+    origin_clean: bool,
+}
+
+impl VectorSource {
+    /// Rasterizes at the natural size, for callers without a destination rect
+    /// (`createPattern`, `createImageBitmap`).
+    fn natural(&self, ctx: &Ctx<'_>) -> Option<SourceImage> {
+        self.rasterize(ctx, self.natural_width, self.natural_height)
+    }
+
+    /// Rasterizes at `width x height` through the realm's bounded cache.
+    fn rasterize(&self, ctx: &Ctx<'_>, width: u32, height: u32) -> Option<SourceImage> {
+        Some(SourceImage {
+            width,
+            height,
+            pixels: svg_raster(ctx, &self.svg, width, height)?,
+            origin_clean: self.origin_clean,
+        })
+    }
+
+    /// The raster size for a draw of `src` (in intrinsic image pixels) into
+    /// `dst` (in user units) under a CTM that maps user units to device pixels
+    /// by `(scale_x, scale_y)`.
+    fn raster_size(&self, src: Rect, dst: Rect, scale_x: f32, scale_y: f32) -> Option<(u32, u32)> {
+        vector_raster_size(
+            self.natural_width,
+            self.natural_height,
+            src,
+            dst,
+            scale_x,
+            scale_y,
+        )
+    }
+}
+
+/// The raster size for a vector draw of `src` (in intrinsic image pixels)
+/// into `dst` (in user units), under a CTM that maps user units to device
+/// pixels by `(scale_x, scale_y)`.
+///
+/// The raster never shrinks below the intrinsic size: upscaling a small SVG to
+/// a large destination is the case that looks soft, while keeping the
+/// intrinsic size for a downscale leaves room for the sampler.
+fn vector_raster_size(
+    natural_width: u32,
+    natural_height: u32,
+    src: Rect,
+    dst: Rect,
+    scale_x: f32,
+    scale_y: f32,
+) -> Option<(u32, u32)> {
+    let natural_width = to_f32(natural_width);
+    let natural_height = to_f32(natural_height);
+    let src_width = src.width.abs();
+    let src_height = src.height.abs();
+    let pixels_per_source_x = if src_width.is_finite() && src_width > 0.0 {
+        dst.width.abs() * scale_x / src_width
+    } else {
+        1.0
+    };
+    let pixels_per_source_y = if src_height.is_finite() && src_height > 0.0 {
+        dst.height.abs() * scale_y / src_height
+    } else {
+        1.0
+    };
+    fit_raster(
+        (natural_width * pixels_per_source_x).max(natural_width),
+        (natural_height * pixels_per_source_y).max(natural_height),
+    )
+}
+
+/// The most cached SVG rasters and the bytes they may hold together. A page
+/// can request any size, so both bounds are needed.
+const MAX_SVG_RASTER_ENTRIES: usize = 8;
+const MAX_SVG_RASTER_BYTES: usize = 32 * 1024 * 1024;
+
+/// Bounded cache of SVG rasters, keyed by the parsed tree and target size.
+///
+/// The entry keeps the tree alive, so the `Arc` identity cannot be reused by a
+/// later parse while its raster is cached.
+#[derive(Default)]
+pub(crate) struct SvgRasterCache {
+    entries: Vec<SvgRasterEntry>,
+    bytes: usize,
+}
+
+struct SvgRasterEntry {
+    svg: blitz_dom::node::SvgImageData,
+    width: u32,
+    height: u32,
+    pixels: Arc<[u8]>,
+}
+
+impl SvgRasterCache {
+    fn get(
+        &mut self,
+        svg: &blitz_dom::node::SvgImageData,
+        width: u32,
+        height: u32,
+    ) -> Option<Arc<[u8]>> {
+        let index = self.entries.iter().position(|entry| {
+            entry.width == width
+                && entry.height == height
+                && Arc::ptr_eq(&entry.svg.tree, &svg.tree)
+        })?;
+        // A repeated draw at the same size is the common case, so the hit
+        // moves to the front and eviction takes from the back.
+        if index != 0 {
+            let entry = self.entries.remove(index);
+            self.entries.insert(0, entry);
+        }
+        Some(self.entries[0].pixels.clone())
+    }
+
+    fn insert(
+        &mut self,
+        svg: &blitz_dom::node::SvgImageData,
+        width: u32,
+        height: u32,
+        pixels: Arc<[u8]>,
+    ) {
+        // An oversized raster is used once, not retained for the whole realm.
+        if pixels.len() > MAX_SVG_RASTER_BYTES {
+            return;
+        }
+        self.bytes += pixels.len();
+        self.entries.insert(
+            0,
+            SvgRasterEntry {
+                svg: svg.clone(),
+                width,
+                height,
+                pixels,
+            },
+        );
+        while self.entries.len() > MAX_SVG_RASTER_ENTRIES || self.bytes > MAX_SVG_RASTER_BYTES {
+            let Some(entry) = self.entries.pop() else {
+                break;
+            };
+            self.bytes -= entry.pixels.len();
+        }
+    }
+}
+
+/// Rasterizes `svg` at `width x height` into straight RGBA, through the
+/// realm's cache.
+fn svg_raster(
+    ctx: &Ctx<'_>,
+    svg: &blitz_dom::node::SvgImageData,
+    width: u32,
+    height: u32,
+) -> Option<Arc<[u8]>> {
     if width == 0 || height == 0 {
         return None;
     }
+    let registry = world(ctx).ok()?.borrow().registry();
+    if let Some(pixels) = registry.borrow_mut().svg_rasters.get(svg, width, height) {
+        return Some(pixels);
+    }
+    let pixels: Arc<[u8]> = render_svg_pixels(svg, width, height)?.into();
+    registry
+        .borrow_mut()
+        .svg_rasters
+        .insert(svg, width, height, pixels.clone());
+    Some(pixels)
+}
+
+/// Renders `svg` at `width x height` into straight RGBA. This is the work the
+/// cache exists to avoid repeating.
+fn render_svg_pixels(
+    svg: &blitz_dom::node::SvgImageData,
+    width: u32,
+    height: u32,
+) -> Option<Vec<u8>> {
     // The declared viewport is page-controlled. Refuse anything above the
     // canvas pixmap budget instead of letting a huge SVG allocate gigabytes.
     let bytes = crate::js::world::canvas_bytes(width, height)?;
@@ -2792,12 +3027,40 @@ fn svg_source_image(svg: &blitz_dom::node::SvgImageData) -> Option<SourceImage> 
         let color = pixel.demultiply();
         pixels.extend_from_slice(&[color.red(), color.green(), color.blue(), color.alpha()]);
     }
-    Some(SourceImage {
-        width,
-        height,
-        pixels,
-        origin_clean: true,
-    })
+    Some(pixels)
+}
+
+/// A raster size clamped to the pixmap budget by shrinking both sides
+/// proportionally.
+fn fit_raster(width: f32, height: f32) -> Option<(u32, u32)> {
+    if !(width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0) {
+        return None;
+    }
+    let mut width = f64::from(width).ceil().max(1.0);
+    let mut height = f64::from(height).ceil().max(1.0);
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "the budget is 64 MiB, exactly representable in f64"
+    )]
+    let budget = crate::js::world::MAX_CANVAS_BYTES as f64;
+    let pixels = width * height * 4.0;
+    if pixels > budget {
+        let factor = (budget / pixels).sqrt();
+        width = (width * factor).floor().max(1.0);
+        height = (height * factor).floor().max(1.0);
+    }
+    Some((width.to_u32()?, height.to_u32()?))
+}
+
+/// A raster side in device pixels. Raster sizes are bounded by
+/// [`crate::js::world::MAX_CANVAS_BYTES`], far inside the exact `f32` range.
+fn to_f32(value: u32) -> f32 {
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "raster sides are bounded well below 2^24"
+    )]
+    let value = value as f32;
+    value
 }
 
 // ---- text ----------------------------------------------------------------
@@ -4148,4 +4411,115 @@ fn current_color(ctx: &Ctx<'_>, object: &Object<'_>) -> Result<style::color::Abs
         return Ok(style::color::AbsoluteColor::BLACK);
     };
     Ok(current.unwrap_or(style::color::AbsoluteColor::BLACK))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vector_raster_size_upscales_to_the_destination_scale() {
+        // A 10x10 SVG drawn into 100x100 user units on a 2x display needs 200
+        // device pixels per side.
+        let size = vector_raster_size(
+            10,
+            10,
+            Rect::new(0.0, 0.0, 10.0, 10.0),
+            Rect::new(0.0, 0.0, 100.0, 100.0),
+            2.0,
+            2.0,
+        );
+        assert_eq!(size, Some((200, 200)));
+    }
+
+    #[test]
+    fn vector_raster_size_keeps_the_intrinsic_size_for_a_downscale() {
+        let size = vector_raster_size(
+            100,
+            100,
+            Rect::new(0.0, 0.0, 100.0, 100.0),
+            Rect::new(0.0, 0.0, 10.0, 10.0),
+            1.0,
+            1.0,
+        );
+        assert_eq!(size, Some((100, 100)));
+    }
+
+    #[test]
+    fn vector_raster_size_scales_a_source_subrect_back_to_the_whole_image() {
+        // Half the image fills the same destination, so the whole raster needs
+        // twice the destination's device pixels.
+        let size = vector_raster_size(
+            100,
+            100,
+            Rect::new(0.0, 0.0, 50.0, 50.0),
+            Rect::new(0.0, 0.0, 100.0, 100.0),
+            2.0,
+            2.0,
+        );
+        assert_eq!(size, Some((400, 400)));
+    }
+
+    #[test]
+    fn fit_raster_stays_inside_the_pixmap_budget() {
+        let (width, height) = fit_raster(100_000.0, 100_000.0).expect("raster");
+        assert!(crate::js::world::canvas_bytes(width, height).is_some());
+        assert!(width > 0 && height > 0);
+    }
+
+    fn test_svg(markup: &str, width: u32, height: u32) -> blitz_dom::node::SvgImageData {
+        blitz_dom::node::SvgImageData::from_data(
+            format!(
+                "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\">{markup}</svg>"
+            )
+            .as_bytes(),
+            &anyrender_svg::usvg::Options::default(),
+        )
+        .expect("test SVG")
+    }
+
+    #[test]
+    fn svg_raster_cache_reuses_a_raster_for_the_same_tree_and_size() {
+        let svg = test_svg("<rect width=\"4\" height=\"4\"/>", 4, 4);
+        let mut cache = SvgRasterCache::default();
+        let pixels: Arc<[u8]> = Arc::from(vec![7u8; 4 * 4 * 4].into_boxed_slice());
+        cache.insert(&svg, 4, 4, pixels.clone());
+        let hit = cache.get(&svg, 4, 4).expect("cached raster");
+        assert!(
+            Arc::ptr_eq(&pixels, &hit),
+            "a repeated draw must reuse the cached raster, not copy or redraw it"
+        );
+        assert!(cache.get(&svg, 5, 5).is_none(), "a new size must miss");
+    }
+
+    #[test]
+    fn svg_raster_cache_keys_on_the_parsed_tree() {
+        let first = test_svg("<rect width=\"4\" height=\"4\"/>", 4, 4);
+        let second = test_svg("<circle cx=\"2\" cy=\"2\" r=\"2\"/>", 4, 4);
+        let mut cache = SvgRasterCache::default();
+        cache.insert(
+            &first,
+            4,
+            4,
+            Arc::from(vec![0u8; 4 * 4 * 4].into_boxed_slice()),
+        );
+        assert!(
+            cache.get(&second, 4, 4).is_none(),
+            "a different SVG at the same size must not reuse the raster"
+        );
+    }
+
+    #[test]
+    fn svg_raster_cache_evicts_to_its_entry_bound() {
+        let mut cache = SvgRasterCache::default();
+        for index in 0..(MAX_SVG_RASTER_ENTRIES + 2) {
+            let svg = test_svg(
+                &format!("<rect x=\"{index}\" width=\"1\" height=\"1\"/>"),
+                1,
+                1,
+            );
+            cache.insert(&svg, 1, 1, Arc::from(vec![0u8; 4].into_boxed_slice()));
+        }
+        assert!(cache.entries.len() <= MAX_SVG_RASTER_ENTRIES);
+    }
 }

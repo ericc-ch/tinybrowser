@@ -2012,6 +2012,39 @@ mod realm_tests {
     }
 
     #[test]
+    fn structured_clone_transfer_detaches_the_source_buffer() {
+        let services: Arc<dyn BrowserServices> = Arc::new(NullServices);
+        let shared = SharedJsRuntime::default();
+        let stop = Arc::new(Stop::new());
+        let documents = Rc::new(RefCell::new(crate::documents::DocumentStore::default()));
+        let registry = Rc::new(RefCell::new(crate::js::RealmRegistry::default()));
+        let world = world_with_document(
+            &shared,
+            &services,
+            &documents,
+            &registry,
+            "https://a.test/",
+            "<!doctype html><p>clone</p>",
+        );
+        let realm = JsRealm::new(&shared.handle(), world, stop).expect("realm");
+        let outcome = realm
+            .eval(
+                r"
+                var buffer = new ArrayBuffer(8);
+                new Uint8Array(buffer).set([1, 2, 3, 4, 5, 6, 7, 8]);
+                var copy = structuredClone(buffer, { transfer: [buffer] });
+                var view = new Uint8Array(copy);
+                [buffer.byteLength, copy.byteLength, view[3]].join('|')
+                ",
+            )
+            .expect("structured clone");
+        assert_eq!(
+            outcome, "0|8|4",
+            "a transferred buffer must be detached on the sender side"
+        );
+    }
+
+    #[test]
     fn replacing_with_a_foreign_fragment_adopts_each_child() {
         let services: Arc<dyn BrowserServices> = Arc::new(NullServices);
         let shared = SharedJsRuntime::default();

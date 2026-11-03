@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use rquickjs::{Ctx, Result, prelude::Func};
+use rquickjs::{Ctx, Result, TypedArray, prelude::Func};
 
 use crate::js::bindings::world;
 use crate::js::world::{FontFamilyEntry, FontRegistration};
@@ -40,7 +40,14 @@ fn descriptors(
         .collect()
 }
 
-fn register_font(ctx: Ctx<'_>, family: String, data: Vec<u8>) -> Result<u32> {
+fn register_font(ctx: Ctx<'_>, family: String, data: TypedArray<'_, u8>) -> Result<u32> {
+    // A page can call this host entry point with a detached buffer, and
+    // `to_vec` panics on one. No JavaScript can run between this query and
+    // the copy, so a detached buffer is the only case `to_vec` sees.
+    if data.as_raw().is_none() {
+        return Ok(0);
+    }
+    let data = data.to_vec();
     if data.is_empty() {
         return Ok(0);
     }

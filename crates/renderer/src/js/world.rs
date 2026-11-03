@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::hash::Hash;
 use std::rc::{Rc, Weak};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use blitz_traits::node_id::NodeId as BlitzNodeId;
@@ -78,6 +79,10 @@ pub(crate) struct RealmRegistry {
     /// on the JS object; the pixels are not, so a page cannot read a
     /// cross-origin image through the bitmap's internal storage.
     bitmaps: HashMap<u64, BitmapPixels>,
+    /// Rasters of vector image sources, bounded by entry count and bytes.
+    /// The entry keeps the parsed tree alive so a tree pointer cannot be
+    /// reused by a later parse while its raster is cached.
+    pub(crate) svg_rasters: super::canvas::SvgRasterCache,
     next_bitmap: u64,
     /// `TextDecoder` session ids, allocated across every world and frame so
     /// a freed id can never alias a live session, even if a finalizer runs
@@ -197,7 +202,7 @@ pub(crate) fn canvas_bytes(width: u32, height: u32) -> Option<usize> {
 pub(crate) struct BitmapPixels {
     pub(crate) width: u32,
     pub(crate) height: u32,
-    pub(crate) pixels: Vec<u8>,
+    pub(crate) pixels: Arc<[u8]>,
     pub(crate) origin_clean: bool,
 }
 
@@ -206,7 +211,7 @@ impl RealmRegistry {
         &mut self,
         width: u32,
         height: u32,
-        pixels: Vec<u8>,
+        pixels: Arc<[u8]>,
         origin_clean: bool,
     ) -> u64 {
         self.next_bitmap = self.next_bitmap.saturating_add(1);
@@ -300,7 +305,9 @@ impl RealmRegistry {
         Some(SourceImage {
             width: canvas.width,
             height: canvas.height,
-            pixels: canvas.read_pixels(0, 0, canvas.width, canvas.height)?,
+            pixels: canvas
+                .read_pixels(0, 0, canvas.width, canvas.height)?
+                .into(),
             origin_clean: canvas.origin_clean(),
         })
     }

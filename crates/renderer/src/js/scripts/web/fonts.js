@@ -4,6 +4,10 @@
 // `__tbRegisterFont` only while they are members of the set, and
 // `document.fonts.ready` settles after every loading face finishes.
 const __tbFontFaces = new Set();
+// The binary source of each FontFace. It is an internal slot, not an own data
+// property: page code must not be able to detach or mutate the bytes the face
+// will register.
+const __tbFontFaceData = new __tbPrivateMap();
 
 function __tbFontError(message) {
   if (typeof DOMException === 'function') {
@@ -21,7 +25,6 @@ class FontFace {
     this._family = String(family);
     this._descriptors = descriptors === null ? {} : descriptors;
     this._source = source;
-    this._bytes = null;
     this._url = null;
     this._status = 'unloaded';
     this._loadPromise = null;
@@ -104,7 +107,11 @@ class FontFace {
               this._source.byteOffset,
               this._source.byteLength,
             );
-      this._bytes = Array.from(view);
+      // FontFace copies a binary source, and a typed array keeps the bytes in
+      // an ArrayBuffer-shaped value that reaches the host without becoming an
+      // array of numbers
+      // (<https://drafts.csswg.org/css-font-loading/#fontface-interface>).
+      __tbFontFaceData.set(this, view.slice());
       return;
     }
     const source = String(this._source);
@@ -122,7 +129,7 @@ class FontFace {
       return this._loadedPromise;
     }
     this._status = 'loading';
-    if (this._bytes !== null) {
+    if (__tbFontFaceData.get(this) !== undefined) {
       // Binary data needs no network round trip.
       this._loadPromise = Promise.resolve().then(() => {
         this._finishLoaded();
@@ -145,7 +152,7 @@ class FontFace {
           return response.arrayBuffer();
         })
         .then((buffer) => {
-          this._bytes = Array.from(new Uint8Array(buffer));
+          __tbFontFaceData.set(this, new Uint8Array(buffer));
           this._finishLoaded();
           return this;
         })
@@ -174,10 +181,11 @@ class FontFace {
   }
 
   _register() {
-    if (!this._attached || this._token !== 0 || this._bytes === null) {
+    const bytes = __tbFontFaceData.get(this);
+    if (!this._attached || this._token !== 0 || bytes === undefined) {
       return;
     }
-    this._token = globalThis.__tbRegisterFont(this._family, this._bytes);
+    this._token = globalThis.__tbRegisterFont(this._family, bytes);
   }
 
   _unregister() {
