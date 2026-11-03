@@ -746,3 +746,38 @@ fn a_name_the_new_document_sets_survives_its_mount() {
     popup.wait("/second");
     popup.wait("/report?name=chosen");
 }
+
+/// A declarative refresh whose delay is larger than the clock can represent
+/// saturates while parsing and arms a timer with no deadline, so the page
+/// neither panics nor navigates
+/// (<https://html.spec.whatwg.org/multipage/semantics.html#attr-meta-http-equiv-refresh>).
+#[test]
+fn a_refresh_delay_beyond_the_clock_never_fires() {
+    let page = "<!doctype html><meta http-equiv=\"refresh\" content=\"99999999999999999999;url=/next\"><title>overflow</title>";
+    let (listener, origin) = server();
+    let served = TestServer::serve_on(
+        listener,
+        vec![
+            ("/page/index.html", ok("text/html", page.as_bytes())),
+            (
+                "/page/next",
+                ok("text/html", b"<!doctype html><title>next</title>"),
+            ),
+        ],
+    );
+    let (_fixture, mut client, session) = open_page(
+        "tinybrowser-refresh-overflow",
+        &format!("http://{origin}/page/index.html"),
+    );
+
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        evaluate(&mut client, &session, "location.pathname"),
+        json!("/page/index.html"),
+        "the saturated delay never fires"
+    );
+    assert!(
+        served.history("/page/next").is_empty(),
+        "the page never asks for its refresh target"
+    );
+}

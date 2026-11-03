@@ -737,3 +737,50 @@ document.body.append(image);
         "the request sampled before the write kept its no-referrer state: {requests:?}"
     );
 }
+
+/// A redirect response's `Referrer-Policy` decides the remaining hops: the
+/// first hop sends the document's policy, and the header tightens the next one
+/// (<https://w3c.github.io/webappsec-referrer-policy/#set-requests-referrer-policy-on-redirect>,
+/// <https://fetch.spec.whatwg.org/#http-redirect-fetch>).
+#[test]
+fn a_redirect_response_policy_decides_the_next_hop() {
+    use crate::fixture::redirect;
+
+    let far = TestServer::start(
+        vec![
+            (
+                "/first.png",
+                redirect("/second.png").header("Referrer-Policy", "no-referrer"),
+            ),
+            ("/second.png", ok("image/png", PIXEL)),
+        ],
+        None,
+    );
+    let page = format!(
+        "<!doctype html><img src=\"http://{}/first.png\">",
+        far.address()
+    );
+    let (listener, origin) = server();
+    let _served = TestServer::serve_on(
+        listener,
+        vec![("/page/index.html", ok("text/html", page.as_bytes()))],
+    );
+    let (_fixture, _client, _session) = open_page(
+        "tinybrowser-referrer-redirect-policy",
+        &format!("http://{origin}/page/index.html"),
+    );
+
+    let first = far.wait("/first.png");
+    let origin_only = format!("http://{origin}/");
+    assert_eq!(
+        referer(&first),
+        Some(origin_only.as_str()),
+        "the first hop uses the document's policy: {first}"
+    );
+    let second = far.wait("/second.png");
+    assert_eq!(
+        referer(&second),
+        None,
+        "the redirect response's policy governs the next hop: {second}"
+    );
+}
