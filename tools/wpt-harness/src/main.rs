@@ -316,7 +316,7 @@ fn reported(outcome: &Outcome) -> wpt_report::Outcome {
             .iter()
             .map(|subtest| wpt_report::Subtest {
                 name: subtest.name.clone(),
-                status: subtest.status.clone(),
+                status: subtest.status,
                 message: subtest.message.clone(),
             })
             .collect(),

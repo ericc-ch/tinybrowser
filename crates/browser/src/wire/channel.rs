@@ -47,8 +47,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// context state the browser owns (target name, opener relationship, popup
 /// sandboxing flag set) and added the tab rename call. Version 19 made the
 /// calling document's sandbox set part of a navigation source and dropped the
-/// `window.open` flags the browser now derives from its own copy.
-pub const PROTOCOL_VERSION: u8 = 19;
+/// `window.open` flags the browser now derives from its own copy. Version 20
+/// typed browsing-context names (non-empty, never a keyword) and merged the
+/// name lookup and navigation into one call.
+pub const PROTOCOL_VERSION: u8 = 20;
 
 /// Fixed frame header size in bytes.
 pub const HEADER_BYTES: usize = 16;
@@ -534,7 +536,7 @@ mod tests {
         );
         for head in [http, local, inherited] {
             let tab = renderer::TabState {
-                name: "peer".to_owned(),
+                name: renderer::ContextName::parse("peer"),
                 auxiliary_with_opener: true,
                 popup_sandbox: renderer::SandboxFlags::parse(Some("allow-scripts allow-popups")),
             };
@@ -867,7 +869,9 @@ mod tests {
         let cases = [
             (
                 Some(url::Url::parse("https://b.test/").expect("url")),
-                renderer::TargetName::Named("peer".to_owned()),
+                renderer::TargetName::Named(
+                    renderer::ContextName::parse("peer").expect("a test name"),
+                ),
                 renderer::OpenerPolicy::NoOpener,
                 source,
             ),

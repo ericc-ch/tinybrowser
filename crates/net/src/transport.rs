@@ -38,7 +38,7 @@ use crate::resolve::{HostMap, ResolveFailure, Target};
 
 /// The deadlines for one `send` call: the global limit covering every
 /// redirect hop plus the per-hop limit captured once at call start.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct CallBudget {
     global: Option<Instant>,
     per_call: Option<Duration>,
@@ -53,7 +53,7 @@ impl CallBudget {
                 .timeout_global
                 .map(|limit| engine.clock.monotonic() + limit),
             per_call: engine.timeout_per_call,
-            clock: engine.clock,
+            clock: engine.clock.clone(),
         }
     }
 
@@ -69,7 +69,7 @@ impl CallBudget {
         HopBudget {
             global: self.global,
             hop: self.per_call.map(|limit| self.clock.monotonic() + limit),
-            clock: self.clock,
+            clock: self.clock.clone(),
         }
     }
 
@@ -80,7 +80,7 @@ impl CallBudget {
 
 /// The deadlines for one hop of a `send` call: the call's global deadline
 /// plus the hop's own `timeout_per_call` deadline.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct HopBudget {
     global: Option<Instant>,
     hop: Option<Instant>,

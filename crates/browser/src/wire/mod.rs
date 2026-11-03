@@ -390,29 +390,24 @@ pub enum BrowsingContextCall {
         /// <https://html.spec.whatwg.org/multipage/browsers.html#sandboxing>).
         source: NavigationSource,
     },
-    /// The browser tab this tab's browsing context group holds under a name.
-    WindowByName {
-        /// The name to look up.
-        name: String,
-    },
-    /// The calling tab's target name changed
+    /// The calling tab's target name changed, or was cleared
     /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-name>).
     WindowName {
-        /// The tab's new name, empty after a cross-origin reset.
-        name: String,
+        /// The tab's new name; `None` after a cross-origin reset.
+        name: Option<renderer::ContextName>,
     },
-    /// Navigates a browser tab a name already selected.
-    WindowNavigate {
-        /// The selected tab.
-        window: WindowId,
-        /// The name that selected it; the browser re-runs the lookup so a
-        /// renderer cannot navigate a tab outside its own group.
-        name: String,
+    /// Selects the tab this tab's browsing context group holds under `name`
+    /// and navigates it. The browser answers the selected tab, or `None` when
+    /// no tab in the group has the name.
+    NavigateNamed {
+        /// The name to look up and then navigate.
+        name: renderer::ContextName,
         /// Absolute URL to load, or `None` to leave the tab where it is.
         url: Option<Url>,
         /// What the call's `noopener` and `noreferrer` features asked for.
         opener: OpenerPolicy,
-        /// The calling document's origin, referrer source, and policy.
+        /// The calling document's origin, referrer source, policy, and
+        /// sandbox set.
         source: NavigationSource,
     },
     /// `window.close()` on a window this renderer opened.
@@ -504,8 +499,7 @@ impl ServiceReply {
             | ServiceCall::BrowsingContext(
                 BrowsingContextCall::WindowClose { .. }
                 | BrowsingContextCall::WindowMessage { .. }
-                | BrowsingContextCall::WindowName { .. }
-                | BrowsingContextCall::WindowNavigate { .. },
+                | BrowsingContextCall::WindowName { .. },
             ) => ServiceReply::Unit,
             ServiceCall::Storage(StorageCall::Get { .. })
             | ServiceCall::BrowsingContext(BrowsingContextCall::RemoteSessionGet { .. }) => {
@@ -517,7 +511,7 @@ impl ServiceReply {
             ) => ServiceReply::StorageChanged(Ok(None)),
             ServiceCall::BrowsingContext(
                 BrowsingContextCall::WindowOpen { .. }
-                | BrowsingContextCall::WindowByName { .. }
+                | BrowsingContextCall::NavigateNamed { .. }
                 | BrowsingContextCall::Opener,
             ) => ServiceReply::Window(None),
         }

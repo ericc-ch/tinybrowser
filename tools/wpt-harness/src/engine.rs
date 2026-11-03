@@ -8,6 +8,9 @@ use serde_json::Value;
 use url::Url;
 
 use crate::services::{BASE, FsServices};
+pub use wpt_report::Subtest;
+use wpt_report::SubtestStatus;
+
 use crate::suite::{Kind, TestCase};
 
 /// Wall-clock time a test may spend before it is called hung. These are the
@@ -39,17 +42,6 @@ const POLL: &str =
 /// The verdict for one file, shared with the other fast lane so the report and
 /// the baseline rule cannot drift (#234).
 pub use wpt_report::Status;
-
-/// One testharness subtest.
-#[derive(Clone, Debug)]
-pub struct Subtest {
-    /// Subtest name.
-    pub name: String,
-    /// `PASS`, `FAIL`, `TIMEOUT`, `ERROR`, or `SKIP`.
-    pub status: String,
-    /// Failure message.
-    pub message: Option<String>,
-}
 
 /// The result of one file.
 #[derive(Clone, Debug)]
@@ -120,7 +112,13 @@ impl Session {
                 let (status, message) = failure.into_parts();
                 let subtests = vec![Subtest {
                     name: "Test".into(),
-                    status: status.as_str().into(),
+                    status: match status {
+                        Status::Pass => SubtestStatus::Pass,
+                        Status::Fail => SubtestStatus::Fail,
+                        Status::Timeout => SubtestStatus::Timeout,
+                        Status::Error => SubtestStatus::NotRun,
+                        Status::Skip => SubtestStatus::Skip,
+                    },
                     message: message.clone(),
                 }];
                 (status, message, subtests)
@@ -285,7 +283,7 @@ async fn run_crashtest(
                     message: None,
                     subtests: vec![Subtest {
                         name: "Crashtest".into(),
-                        status: "PASS".into(),
+                        status: SubtestStatus::Pass,
                         message: None,
                     }],
                 });
@@ -298,25 +296,36 @@ async fn run_crashtest(
 fn parse_result(raw: &str) -> Result<Completed, Failure> {
     let value: Value = serde_json::from_str(raw)
         .map_err(|error| Failure::Error(format!("bad harness result: {error}")))?;
+    // testharness.js always reports a status; a payload without one is a
+    // broken reporter, not a skip, and guessing would hide it.
     let harness_status = value
         .get("status")
         .and_then(Value::as_u64)
-        .unwrap_or(3)
-        .try_into()
-        .unwrap_or(3u8);
+        .ok_or_else(|| Failure::Error("harness result has no status".into()))?;
     let subtests: Vec<Subtest> = value
         .get("tests")
         .and_then(Value::as_array)
-        .map(|tests| tests.iter().map(parse_subtest).collect())
+        .map(|tests| tests.iter().map(parse_subtest).collect::<Result<_, _>>())
+        .transpose()?
         .unwrap_or_default();
     let status = match harness_status {
-        0 if subtests.iter().all(|subtest| subtest.status == "PASS") => Status::Pass,
+        0 if subtests
+            .iter()
+            .all(|subtest| subtest.status == SubtestStatus::Pass) =>
+        {
+            Status::Pass
+        }
         0 | 1 => Status::Fail,
         2 => Status::Timeout,
-        // `PRECONDITION_FAILED`: optional features the test needs are absent,
-        // which wptrunner reports as a skip.
-        3 => Status::Skip,
-        _ => Status::Error,
+        // `NOTRUN` and `PRECONDITION_FAILED`: the harness stopped before the
+        // file ran, or optional features the test needs are absent. wptrunner
+        // reports both as skips.
+        3 | 4 => Status::Skip,
+        other => {
+            return Err(Failure::Error(format!(
+                "harness reported unknown status code {other}"
+            )));
+        }
     };
     let message = value
         .get("message")
@@ -326,7 +335,7 @@ fn parse_result(raw: &str) -> Result<Completed, Failure> {
         .or_else(|| {
             subtests
                 .iter()
-                .find(|subtest| subtest.status != "PASS")
+                .find(|subtest| subtest.status != SubtestStatus::Pass)
                 .and_then(|subtest| subtest.message.clone())
         });
     Ok(Completed {
@@ -336,25 +345,23 @@ fn parse_result(raw: &str) -> Result<Completed, Failure> {
     })
 }
 
-fn parse_subtest(value: &Value) -> Subtest {
-    Subtest {
+/// Reads one reported subtest. A status code testharness.js does not define is
+/// a harness error: guessing would turn a broken reporter into a verdict.
+fn parse_subtest(value: &Value) -> Result<Subtest, Failure> {
+    let code = value.get("status").and_then(Value::as_u64).unwrap_or(3);
+    let status = SubtestStatus::from_harness_code(code)
+        .ok_or_else(|| Failure::Error(format!("subtest reported unknown status code {code}")))?;
+    Ok(Subtest {
         name: value
             .get("name")
             .and_then(Value::as_str)
             .unwrap_or("Test")
             .to_owned(),
-        status: match value.get("status").and_then(Value::as_u64).unwrap_or(3) {
-            0 => "PASS",
-            1 => "FAIL",
-            2 => "TIMEOUT",
-            4 => "SKIP",
-            _ => "ERROR",
-        }
-        .into(),
+        status,
         message: value
             .get("message")
             .and_then(Value::as_str)
             .filter(|message| !message.is_empty())
             .map(str::to_owned),
-    }
+    })
 }

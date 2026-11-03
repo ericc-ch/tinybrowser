@@ -321,25 +321,21 @@ impl BrowsingContextHost for FsServices {
         None
     }
 
-    fn window_by_name(&self, _name: &str) -> Option<WindowId> {
-        None
-    }
-
-    fn window_navigate(
+    fn navigate_named(
         &self,
-        _window: WindowId,
-        _name: &str,
+        _name: &renderer::ContextName,
         _url: Option<&Url>,
         _opener: OpenerPolicy,
         _source: &renderer::NavigationSource,
-    ) {
+    ) -> Option<WindowId> {
+        None
     }
 
     fn window_close(&self, _window: WindowId) {}
 
     /// A target name only matters to a browser that keeps a cross-tab table.
     /// This host has one tab, so the name has nowhere to go.
-    fn set_window_name(&self, _name: &str) {}
+    fn set_window_name(&self, _name: Option<&renderer::ContextName>) {}
 
     fn window_opener(&self) -> Option<WindowId> {
         None

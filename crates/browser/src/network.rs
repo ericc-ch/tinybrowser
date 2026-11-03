@@ -361,7 +361,7 @@ fn vary_matches(entry: &CachedResponse, request: &DialRequest) -> bool {
 
 /// Whether a stored response is still fresh for a request arriving at `now`
 /// (<https://www.rfc-editor.org/rfc/rfc9111#section-4.2>).
-fn fresh(entry: &CachedResponse, clock: net::Clock) -> bool {
+fn fresh(entry: &CachedResponse, clock: &net::Clock) -> bool {
     let age = clock
         .monotonic()
         .saturating_duration_since(entry.stored_at)
@@ -455,7 +455,7 @@ fn store_response(
     key: CacheKey,
     outcome: DialOutcome,
     request_headers: Vec<(String, String)>,
-    clock: net::Clock,
+    clock: &net::Clock,
 ) {
     let mut cache = cache
         .lock()
@@ -523,7 +523,7 @@ impl NetworkContext {
         if options.timeout_per_call.is_none() {
             options.timeout_per_call = Some(PAGE_FETCH_TIMEOUT);
         }
-        let clock = options.clock;
+        let clock = options.clock.clone();
         Self {
             agent: Agent::new(options),
             clock,
@@ -539,7 +539,7 @@ impl NetworkContext {
     pub(crate) fn tab_handle(&self) -> TabNetworkHandle {
         TabNetworkHandle {
             agent: self.agent.clone(),
-            clock: self.clock,
+            clock: self.clock.clone(),
             permits: self.permits.clone(),
             tab: Arc::new(Semaphore::new(MAX_TAB_DIALS)),
             cache: Arc::clone(&self.cache),
@@ -894,7 +894,7 @@ impl TabNetworkHandle {
             cache: Arc::clone(&self.cache),
             key: cache_key(request, initiator, owner),
             request_headers: request.headers.clone(),
-            clock: self.clock,
+            clock: self.clock.clone(),
         });
         let task = spawn_stream_body(StreamJob {
             response,
@@ -1000,7 +1000,7 @@ impl TabNetworkHandle {
         } else {
             self.cached_hit(request, initiator, owner)
         };
-        if let Some(hit) = Self::cached_response(request, mode, cached.as_ref(), self.clock)? {
+        if let Some(hit) = Self::cached_response(request, mode, cached.as_ref(), &self.clock)? {
             return Ok(CacheDecision::Hit(hit));
         }
         // A default or no-cache request revalidates a stored response when it
@@ -1049,7 +1049,7 @@ impl TabNetworkHandle {
         request: &DialRequest,
         mode: RequestCache,
         cached: Option<&CachedResponse>,
-        clock: net::Clock,
+        clock: &net::Clock,
     ) -> Result<Option<DialOutcome>, DialFailure> {
         if !request.policy.exposes_response() {
             return Ok(None);
@@ -1095,7 +1095,7 @@ impl TabNetworkHandle {
             cache_key(request, initiator, partition),
             outcome.clone(),
             request.headers.clone(),
-            self.clock,
+            &self.clock,
         );
     }
 
@@ -1521,7 +1521,7 @@ fn spawn_stream_body(job: StreamJob) -> tokio::task::JoinHandle<()> {
                             store.key,
                             store.outcome,
                             store.request_headers,
-                            store.clock,
+                            &store.clock,
                         );
                     }
                     let _ = tx.send(StreamMessage::End).await;
@@ -1684,7 +1684,7 @@ fn internal_headers(response: &net::Response) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime};
 
     fn dial(policy: RequestPolicy, url: &str) -> DialRequest {
         let url = Url::parse(url).expect("dial URL");
@@ -2064,7 +2064,7 @@ mod tests {
                 &request,
                 RequestCache::OnlyIfCached,
                 None,
-                net::Clock::default()
+                &net::Clock::default()
             )
             .expect_err("only-if-cached needs an entry"),
             DialFailure::Connect
@@ -2076,7 +2076,7 @@ mod tests {
                 &request,
                 RequestCache::OnlyIfCached,
                 Some(&cross_origin),
-                net::Clock::default()
+                &net::Clock::default()
             )
             .is_err(),
             "only-if-cached refuses a cross-origin final URL"
@@ -2086,7 +2086,7 @@ mod tests {
                 &request,
                 RequestCache::OnlyIfCached,
                 Some(&entry),
-                net::Clock::default()
+                &net::Clock::default()
             )
             .expect("hit")
             .is_some()
@@ -2096,7 +2096,7 @@ mod tests {
                 &request,
                 RequestCache::ForceCache,
                 Some(&entry),
-                net::Clock::default()
+                &net::Clock::default()
             )
             .expect("stale hit")
             .is_some(),
@@ -2107,7 +2107,7 @@ mod tests {
                 &request,
                 RequestCache::ForceCache,
                 None,
-                net::Clock::default()
+                &net::Clock::default()
             )
             .expect("miss")
             .is_none()
@@ -2117,7 +2117,7 @@ mod tests {
                 &request,
                 RequestCache::Default,
                 Some(&entry),
-                net::Clock::default()
+                &net::Clock::default()
             )
             .expect("stale miss")
             .is_none(),
@@ -2132,7 +2132,7 @@ mod tests {
                 &request,
                 RequestCache::Default,
                 Some(&entry),
-                net::Clock::default()
+                &net::Clock::default()
             )
             .expect("fresh hit")
             .is_some(),
@@ -2148,7 +2148,7 @@ mod tests {
                     &request,
                     mode,
                     Some(&entry),
-                    net::Clock::default()
+                    &net::Clock::default()
                 )
                 .expect("miss")
                 .is_none(),
@@ -2417,26 +2417,29 @@ mod tests {
             "cache-control".to_owned(),
             "private=\"a,b\", max-age=60".to_owned(),
         )];
-        assert!(fresh(&entry, clock));
+        assert!(fresh(&entry, &clock));
 
         entry.outcome.headers = vec![("cache-control".to_owned(), "max-age=1".to_owned())];
         entry.stored_at = Instant::now()
             .checked_sub(Duration::from_secs(2))
             .expect("two seconds before now");
-        assert!(!fresh(&entry, clock), "an expired max-age is stale");
+        assert!(!fresh(&entry, &clock), "an expired max-age is stale");
 
         // `age` counts whole seconds, so `max-age=0` must not stay fresh for
         // the first second of its life
         // (<https://www.rfc-editor.org/rfc/rfc9111#section-4.2>).
         entry.outcome.headers = vec![("cache-control".to_owned(), "max-age=0".to_owned())];
         entry.stored_at = Instant::now();
-        assert!(!fresh(&entry, clock), "a zero lifetime is spent on arrival");
+        assert!(
+            !fresh(&entry, &clock),
+            "a zero lifetime is spent on arrival"
+        );
 
         entry.outcome.headers = vec![(
             "expires".to_owned(),
             "Thu, 01 Jan 2099 00:00:00 GMT".to_owned(),
         )];
-        assert!(fresh(&entry, clock), "a future Expires is fresh");
+        assert!(fresh(&entry, &clock), "a future Expires is fresh");
     }
 
     /// The cache stamps and reads entries with the injected clock, so an
@@ -2444,14 +2447,15 @@ mod tests {
     /// entry without sleeping.
     #[test]
     fn the_cache_reads_the_injected_clock() {
-        let clock = test_clock::clock();
+        let manual = ManualClock::new();
+        let clock = manual.clock();
         let request = js_fetch(renderer::CorsMode::Cors, "http://a.test/data");
         let initiator = Url::parse("http://a.test/page").expect("page URL").origin();
         let key = cache_key(&request, &initiator, RendererAssignmentId::new(1));
         let mut outcome = cached(net::cors::ResponseType::Basic).outcome;
         outcome.headers = vec![("cache-control".to_owned(), "max-age=60".to_owned())];
         let cache = ResponseCache::default();
-        store_response(&cache, key.clone(), outcome, Vec::new(), clock);
+        store_response(&cache, key.clone(), outcome, Vec::new(), &clock);
         let entry = cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2463,41 +2467,47 @@ mod tests {
             clock.monotonic(),
             "the entry is stamped with the injected clock"
         );
-        assert!(fresh(&entry, clock), "fresh at the stored instant");
-        test_clock::set_offset(61);
-        assert!(!fresh(&entry, clock), "stale one second after max-age");
-        test_clock::set_offset(0);
+        assert!(fresh(&entry, &clock), "fresh at the stored instant");
+        manual.advance(61);
+        assert!(!fresh(&entry, &clock), "stale one second after max-age");
     }
 
     /// A clock the test moves by hand: a wall clock, a monotonic clock, and one
     /// offset for both.
-    mod test_clock {
-        use std::sync::OnceLock;
-        use std::sync::atomic::{AtomicU64, Ordering};
-        use std::time::{Duration, Instant, SystemTime};
+    ///
+    /// The state belongs to the value, so two tests with clocks cannot race
+    /// each other the way a process-global static would.
+    struct ManualClock {
+        wall_base: SystemTime,
+        monotonic_base: Instant,
+        offset: AtomicU64,
+    }
 
-        static OFFSET_SECONDS: AtomicU64 = AtomicU64::new(0);
-        static MONOTONIC_BASE: OnceLock<Instant> = OnceLock::new();
-        static WALL_BASE: OnceLock<SystemTime> = OnceLock::new();
-
-        pub(super) fn set_offset(seconds: u64) {
-            OFFSET_SECONDS.store(seconds, Ordering::Relaxed);
+    impl ManualClock {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                wall_base: SystemTime::now(),
+                monotonic_base: Instant::now(),
+                offset: AtomicU64::new(0),
+            })
         }
 
-        fn offset() -> Duration {
-            Duration::from_secs(OFFSET_SECONDS.load(Ordering::Relaxed))
+        fn advance(&self, seconds: u64) {
+            self.offset.fetch_add(seconds, Ordering::Relaxed);
         }
 
-        fn monotonic() -> Instant {
-            *MONOTONIC_BASE.get_or_init(Instant::now) + offset()
+        fn clock(self: &Arc<Self>) -> net::Clock {
+            net::Clock::new(Arc::clone(self))
+        }
+    }
+
+    impl net::ClockSource for ManualClock {
+        fn wall(&self) -> SystemTime {
+            self.wall_base + Duration::from_secs(self.offset.load(Ordering::Relaxed))
         }
 
-        fn wall() -> SystemTime {
-            *WALL_BASE.get_or_init(SystemTime::now) + offset()
-        }
-
-        pub(super) fn clock() -> net::Clock {
-            net::Clock::new(wall, monotonic)
+        fn monotonic(&self) -> Instant {
+            self.monotonic_base + Duration::from_secs(self.offset.load(Ordering::Relaxed))
         }
     }
 

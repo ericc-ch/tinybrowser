@@ -670,21 +670,17 @@ impl BrowsingContextHost for WasmServices {
         None
     }
 
-    fn window_by_name(&self, _name: &str) -> Option<renderer::WindowId> {
-        None
-    }
-
-    fn set_window_name(&self, _name: &str) {}
-
-    fn window_navigate(
+    fn navigate_named(
         &self,
-        _window: renderer::WindowId,
-        _name: &str,
+        _name: &renderer::ContextName,
         _url: Option<&Url>,
         _opener: renderer::OpenerPolicy,
         _source: &renderer::NavigationSource,
-    ) {
+    ) -> Option<renderer::WindowId> {
+        None
     }
+
+    fn set_window_name(&self, _name: Option<&renderer::ContextName>) {}
 
     fn window_close(&self, _window: renderer::WindowId) {}
 

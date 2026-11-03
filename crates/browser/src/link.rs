@@ -866,7 +866,8 @@ impl WindowRouter<'_> {
             renderer::TargetName::Current
                 | renderer::TargetName::Parent
                 | renderer::TargetName::Top
-        ) {
+        ) || !target.is_canonical()
+        {
             return Err(RendererViolation);
         }
         // The browser's copy of the tab's set is the baseline, and the calling
@@ -917,11 +918,12 @@ impl WindowRouter<'_> {
         send_reply(&context.responder, id, ServiceReply::Window(tab)).await
     }
 
-    /// Navigates the browser tab a name already selected.
+    /// Selects the browser tab this tab's group holds under `name` and
+    /// navigates it. The reply is the selected tab, or `None` when the name
+    /// selects nothing so the caller creates a context.
     async fn navigate(
         self,
-        window: renderer::WindowId,
-        name: String,
+        name: renderer::ContextName,
         url: Option<Url>,
         opener: renderer::OpenerPolicy,
         source: renderer::NavigationSource,
@@ -931,25 +933,22 @@ impl WindowRouter<'_> {
             assignment,
             request: id,
         } = self;
-        let target = TabId::new(window.get());
-        // The renderer selected this tab by name; re-running the group lookup
-        // is what stops it from navigating a tab outside its own browsing
-        // context group.
-        if context.tabs.find_by_name(assignment.tab, &name) == Some(target)
-            && let Some(url) = url.and_then(navigable_popup_url)
-        {
+        // The lookup runs here, once: the caller names a context, the browser
+        // decides which tab that is, and the answer is what it selected. A
+        // renderer cannot name a tab outside its own group.
+        let Some(target) = context.tabs.find_by_name(assignment.tab, &name) else {
+            return send_reply(&context.responder, id, ServiceReply::Window(None)).await;
+        };
+        if let Some(url) = url.and_then(navigable_popup_url) {
             // A sandboxed document may navigate itself, the contexts nested
             // inside it, and the auxiliary contexts it opened — and only those.
-            // The frame tree's own navigations never reach this path, so the
-            // one case this leaves is a tab the caller opened. The set is the
-            // browser's copy unioned with the calling document's claim, so the
-            // claim can only add restrictions
+            // The set is the browser's copy unioned with the calling
+            // document's claim, so the claim can only add restrictions
             // (<https://html.spec.whatwg.org/multipage/browsers.html#sandboxed-navigation-browsing-context-flag>).
             let active = context.tabs.sandbox(assignment.tab).union(source.sandbox);
             // "The auxiliary contexts it created" is a frame relationship: the
             // tab that hosts the sandboxed document is not the document, so a
-            // frame cannot inherit its parent document's permission
-            // (<https://html.spec.whatwg.org/multipage/browsers.html#sandboxed-navigation-browsing-context-flag>).
+            // frame cannot inherit its parent document's permission.
             let created_by_caller = context.tabs.opener(target) == Some(assignment.tab)
                 && context.tabs.opener_frame(target) == Some(source.frame);
             if target != assignment.tab && active.blocks_navigation() && !created_by_caller {
@@ -957,16 +956,19 @@ impl WindowRouter<'_> {
                     target: "browser::tabs",
                     "window.open navigation refused: a sandboxed document cannot navigate another browsing context"
                 );
-                return send_reply(&context.responder, id, ServiceReply::Unit).await;
-            }
-            let initiator = window_initiator(assignment, source, opener)?;
-            if let Ok(handle) = context.browser.tab(target).await {
-                tokio::spawn(async move {
-                    let _result = handle.goto_from(url.as_str(), initiator).await;
-                });
+            } else {
+                let initiator = window_initiator(assignment, source, opener)?;
+                if let Ok(handle) = context.browser.tab(target).await {
+                    tokio::spawn(async move {
+                        let _result = handle.goto_from(url.as_str(), initiator).await;
+                    });
+                }
             }
         }
-        send_reply(&context.responder, id, ServiceReply::Unit).await
+        // A refused navigation still selected the tab, so the caller answers
+        // the `WindowProxy` it already has. Only a missing name creates one.
+        let tab = renderer::WindowId::new(target.get());
+        send_reply(&context.responder, id, ServiceReply::Window(Some(tab))).await
     }
 }
 
@@ -994,13 +996,6 @@ async fn route_window_call(
             .open(url, target, opener, source)
             .await?;
         }
-        BrowsingContextCall::WindowByName { name } => {
-            let tab = context
-                .tabs
-                .find_by_name(assignment.tab, &name)
-                .map(|tab| renderer::WindowId::new(tab.get()));
-            send_reply(&context.responder, id, ServiceReply::Window(tab)).await?;
-        }
         BrowsingContextCall::WindowName { name } => {
             // The call names no target, so a renderer can only rename its own
             // tab. The name is the target a `window.open` from any tab in the
@@ -1014,8 +1009,7 @@ async fn route_window_call(
             }
             send_reply(&context.responder, id, ServiceReply::Unit).await?;
         }
-        BrowsingContextCall::WindowNavigate {
-            window,
+        BrowsingContextCall::NavigateNamed {
             name,
             url,
             opener,
@@ -1026,7 +1020,7 @@ async fn route_window_call(
                 assignment,
                 request: id,
             }
-            .navigate(window, name, url, opener, source)
+            .navigate(name, url, opener, source)
             .await?;
         }
         BrowsingContextCall::WindowClose { window } => {

@@ -158,7 +158,7 @@ fn run_all(cases: &[TestCase], harness: &Harness, jobs: usize) -> Vec<Outcome> {
                         status: Status::Skip,
                         subtests: vec![wpt_report::Subtest {
                             name: "Test".to_owned(),
-                            status: Status::Skip.as_str().to_owned(),
+                            status: wpt_report::SubtestStatus::Skip,
                             message: message.clone(),
                         }],
                         message,

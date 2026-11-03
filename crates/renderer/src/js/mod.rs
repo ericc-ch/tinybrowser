@@ -1592,9 +1592,9 @@ fn open_window(
         });
     }
     if let TargetName::Named(name) = &target
-        && let Some(tab) = services.window_by_name(name)
+        && let Some(tab) =
+            services.navigate_named(name, plan.url.as_ref(), plan.opener, &plan.source)
     {
-        services.window_navigate(tab, name, plan.url.as_ref(), plan.opener, &plan.source);
         return Some(WindowOpenAnswer {
             context: OpenedContext::Tab(tab),
             withholds: plan.withholds,

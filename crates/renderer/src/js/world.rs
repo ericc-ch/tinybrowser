@@ -1951,7 +1951,7 @@ impl World {
                 sandbox,
             );
             if let Some(name) = target.new_context_name() {
-                shared.tree.set_name(frame, name.to_owned());
+                shared.tree.set_name(frame, name.as_str().to_owned());
             }
             (frame, world.frame_host.clone())
         };

@@ -20,7 +20,7 @@ use crate::engine::{Outcome, Status, Subtest};
 use crate::suite::Kind;
 
 /// Bumped whenever the meaning of a stored outcome changes.
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 
 /// One file a test read and the digest it had.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -31,30 +31,21 @@ struct Input {
     hash: String,
 }
 
-/// A stored verdict.
+/// A stored verdict. The enums carry their report spellings, so a cache with
+/// an unknown status fails to deserialize and is a miss instead of silently
+/// becoming a skip.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct Entry {
-    /// Whether the file is a testharness file or a crashtest.
-    kind: String,
-    /// File-level status spelling.
-    status: String,
+    /// Which executor produced the verdict.
+    kind: Kind,
+    /// File-level status.
+    status: Status,
     /// Failure reason.
     message: Option<String>,
     /// Stored subtests.
-    subtests: Vec<StoredSubtest>,
+    subtests: Vec<Subtest>,
     /// Everything the file read.
     inputs: Vec<Input>,
-}
-
-/// One stored subtest.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-struct StoredSubtest {
-    /// Subtest name.
-    name: String,
-    /// `PASS`, `FAIL`, and so on.
-    status: String,
-    /// Failure message.
-    message: Option<String>,
 }
 
 /// The cache file.
@@ -122,23 +113,10 @@ impl Cache {
         }
         Some(Outcome {
             id: id.to_owned(),
-            kind: match entry.kind.as_str() {
-                "crashtest" => Kind::Crashtest,
-                "reftest" => Kind::Reftest,
-                "testdriver" => Kind::Testdriver,
-                _ => Kind::Testharness,
-            },
-            status: status_from_str(&entry.status),
+            kind: entry.kind,
+            status: entry.status,
             message: entry.message.clone(),
-            subtests: entry
-                .subtests
-                .iter()
-                .map(|subtest| Subtest {
-                    name: subtest.name.clone(),
-                    status: subtest.status.clone(),
-                    message: subtest.message.clone(),
-                })
-                .collect(),
+            subtests: entry.subtests.clone(),
             duration: std::time::Duration::ZERO,
             inputs: Vec::new(),
         })
@@ -159,24 +137,10 @@ impl Cache {
         self.tests.insert(
             outcome.id.clone(),
             Entry {
-                kind: match outcome.kind {
-                    Kind::Testharness => "testharness",
-                    Kind::Crashtest => "crashtest",
-                    Kind::Reftest => "reftest",
-                    Kind::Testdriver => "testdriver",
-                }
-                .into(),
-                status: outcome.status.as_str().into(),
+                kind: outcome.kind,
+                status: outcome.status,
                 message: outcome.message.clone(),
-                subtests: outcome
-                    .subtests
-                    .iter()
-                    .map(|subtest| StoredSubtest {
-                        name: subtest.name.clone(),
-                        status: subtest.status.clone(),
-                        message: subtest.message.clone(),
-                    })
-                    .collect(),
+                subtests: outcome.subtests.clone(),
                 inputs,
             },
         );
@@ -196,8 +160,8 @@ impl Cache {
         self.tests.insert(
             id.to_owned(),
             Entry {
-                kind: "testharness".into(),
-                status: "ERROR".into(),
+                kind: Kind::Testharness,
+                status: Status::Error,
                 message: Some("engine crashed in this file".into()),
                 subtests: Vec::new(),
                 inputs,
@@ -285,16 +249,6 @@ fn hex(bytes: &[u8]) -> String {
         out.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
     }
     out
-}
-
-fn status_from_str(status: &str) -> Status {
-    match status {
-        "PASS" => Status::Pass,
-        "FAIL" => Status::Fail,
-        "TIMEOUT" => Status::Timeout,
-        "ERROR" => Status::Error,
-        _ => Status::Skip,
-    }
 }
 
 #[cfg(test)]

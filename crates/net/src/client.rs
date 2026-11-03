@@ -23,42 +23,72 @@ use url::Url;
 
 const DEFAULT_MAX_REDIRECTS: u32 = 20;
 
+/// One clock's wall and monotonic reads.
+///
+/// A value type with state, not a pair of `fn` pointers: a test or embedder
+/// that needs a manual clock owns the state and passes it in, instead of
+/// reaching for a process-global static because a function pointer cannot
+/// capture anything.
+pub trait ClockSource: Send + Sync {
+    /// Current wall-clock time.
+    fn wall(&self) -> SystemTime;
+    /// Current monotonic instant.
+    fn monotonic(&self) -> Instant;
+}
+
+impl<T: ClockSource + ?Sized> ClockSource for std::sync::Arc<T> {
+    fn wall(&self) -> SystemTime {
+        (**self).wall()
+    }
+
+    fn monotonic(&self) -> Instant {
+        (**self).monotonic()
+    }
+}
+
 /// Wall and monotonic clock reads used by one [`Agent`].
 ///
 /// The default reads the system clocks. Embedders and tests pass their own
-/// functions so cookie expiry and every timeout path stay deterministic.
-#[derive(Clone, Copy)]
-pub struct Clock {
-    wall: fn() -> SystemTime,
-    monotonic: fn() -> Instant,
-}
+/// [`ClockSource`] so cookie expiry and every timeout path stay deterministic.
+#[derive(Clone)]
+pub struct Clock(std::sync::Arc<dyn ClockSource>);
 
 impl Clock {
-    /// Builds a clock from a wall-clock read and a monotonic read.
+    /// Builds a clock from any [`ClockSource`].
     #[must_use]
-    pub fn new(wall: fn() -> SystemTime, monotonic: fn() -> Instant) -> Self {
-        Self { wall, monotonic }
+    pub fn new(source: impl ClockSource + 'static) -> Self {
+        Self(std::sync::Arc::new(source))
     }
 
     /// Current wall-clock time.
     #[must_use]
-    pub fn now(self) -> SystemTime {
-        (self.wall)()
+    pub fn now(&self) -> SystemTime {
+        self.0.wall()
     }
 
     /// Current monotonic instant.
     #[must_use]
-    pub fn monotonic(self) -> Instant {
-        (self.monotonic)()
+    pub fn monotonic(&self) -> Instant {
+        self.0.monotonic()
     }
 }
 
 impl Default for Clock {
     fn default() -> Self {
-        Self {
-            wall: SystemTime::now,
-            monotonic: Instant::now,
-        }
+        Self(std::sync::Arc::new(SystemClock))
+    }
+}
+
+/// The process's own clocks.
+struct SystemClock;
+
+impl ClockSource for SystemClock {
+    fn wall(&self) -> SystemTime {
+        SystemTime::now()
+    }
+
+    fn monotonic(&self) -> Instant {
+        Instant::now()
     }
 }
 
@@ -168,7 +198,7 @@ impl Agent {
                 timeout_global,
                 timeout_per_call,
                 proxy,
-                clock,
+                clock.clone(),
                 resolve.into(),
                 &tls_cas,
             ),
@@ -480,7 +510,7 @@ impl Agent {
 
         loop {
             let mut response = self
-                .exchange(&dial, &url, &mut hop, cross_site_redirect, budget)
+                .exchange(&dial, &url, &mut hop, cross_site_redirect, budget.clone())
                 .await?;
             response.redirect_count = followed;
             // The referrer this hop went out with. A navigation stores it as
@@ -606,7 +636,7 @@ impl Agent {
             cross_site_redirect,
         };
         let mut hop_headers = hop.headers.clone();
-        self.apply_cors_request(dial.cors, hop, &wire, &mut hop_headers, budget)
+        self.apply_cors_request(dial.cors, hop, &wire, &mut hop_headers, budget.clone())
             .await?;
         self.prepare_outbound(&mut hop_headers, operation)?;
         prepare_credentials(dial, url, cross_origin, &mut hop_headers)?;
@@ -614,7 +644,13 @@ impl Agent {
             crate::cors::credentials_admitted(dial.cors.credentials, cross_origin);
         let (status, response_headers, reader, http2) = self
             .engine
-            .send(&hop.method, &wire, &hop_headers, hop.body.clone(), budget)
+            .send(
+                &hop.method,
+                &wire,
+                &hop_headers,
+                hop.body.clone(),
+                budget.clone(),
+            )
             .await?;
         let content_encoding: Vec<String> =
             crate::get_decode_split(&response_headers, "content-encoding")

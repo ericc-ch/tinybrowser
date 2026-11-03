@@ -13,7 +13,7 @@ pub mod referrer;
 mod resolve;
 mod transport;
 
-pub use client::{Agent, AgentOptions, Body, Clock, Request, Response};
+pub use client::{Agent, AgentOptions, Body, Clock, ClockSource, Request, Response};
 pub use cookies::{
     CookieRecord, CookieSameSite, InitiatorKind, origins_same_site, site, site_for_origin,
 };

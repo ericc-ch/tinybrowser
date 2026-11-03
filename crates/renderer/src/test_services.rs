@@ -86,21 +86,17 @@ impl BrowsingContextHost for NullServices {
         None
     }
 
-    fn window_by_name(&self, _name: &str) -> Option<crate::protocol::WindowId> {
-        None
-    }
-
-    fn set_window_name(&self, _name: &str) {}
-
-    fn window_navigate(
+    fn navigate_named(
         &self,
-        _window: crate::protocol::WindowId,
-        _name: &str,
+        _name: &crate::protocol::ContextName,
         _url: Option<&Url>,
         _opener: crate::protocol::OpenerPolicy,
         _source: &crate::protocol::NavigationSource,
-    ) {
+    ) -> Option<crate::protocol::WindowId> {
+        None
     }
+
+    fn set_window_name(&self, _name: Option<&crate::protocol::ContextName>) {}
 
     fn window_close(&self, _window: crate::protocol::WindowId) {}
 

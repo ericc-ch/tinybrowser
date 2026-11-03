@@ -673,7 +673,7 @@ pub(crate) struct NewTab {
     /// The target name the tab starts with, which is the `window.open`
     /// target's name
     /// (<https://html.spec.whatwg.org/multipage/document-sequences.html#browsing-context-name>).
-    pub(crate) name: String,
+    pub(crate) name: Option<renderer::ContextName>,
     /// The tab that opened this one, when the opener relationship is live.
     /// A tab with a live opener keeps its target name across a cross-origin
     /// navigation
@@ -700,7 +700,7 @@ impl NewTab {
     /// an opaque initial document.
     pub(crate) fn browser_created() -> Self {
         Self {
-            name: String::new(),
+            name: None,
             opener: None,
             opener_frame: None,
             popup_sandbox: renderer::SandboxFlags::empty(),
@@ -1151,7 +1151,7 @@ impl Tab {
     fn tab_state_at(&self, url: &Url) -> renderer::TabState {
         let mut state = self.current_tab_state();
         if !self.keeps_target_name_at(url) {
-            state.name.clear();
+            state.name = None;
         }
         state
     }
@@ -1200,7 +1200,7 @@ impl Tab {
     /// this value and wins; resolving it after the mount would clobber the
     /// script's name
     /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#resetBCName>).
-    fn begin_commit(&mut self, url: &Url) -> (renderer::TabState, String) {
+    fn begin_commit(&mut self, url: &Url) -> (renderer::TabState, Option<renderer::ContextName>) {
         let previous = self.tabs.name(self.id);
         let state = self.tab_state_at(url);
         self.tabs.set_name(self.id, state.name.clone());
@@ -1209,7 +1209,7 @@ impl Tab {
 
     /// Undoes [`Self::begin_commit`] when the navigation did not commit and the
     /// previous document is still active.
-    fn abort_commit(&mut self, previous_name: String) {
+    fn abort_commit(&mut self, previous_name: Option<renderer::ContextName>) {
         self.tabs.set_name(self.id, previous_name);
     }
 

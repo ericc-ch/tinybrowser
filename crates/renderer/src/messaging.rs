@@ -341,8 +341,8 @@ impl FrameTree {
                 let top = self.top_level(current);
                 [current, top]
                     .into_iter()
-                    .find_map(|subtree| self.find_by_target_name(subtree, name))
-                    .or_else(|| self.find_by_auxiliary_name(top, name))
+                    .find_map(|subtree| self.find_by_target_name(subtree, name.as_str()))
+                    .or_else(|| self.find_by_auxiliary_name(top, name.as_str()))
             }
         }
     }

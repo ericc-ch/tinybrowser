@@ -624,9 +624,9 @@ impl SandboxFlags {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TabState {
     /// The tab's target name (`window.name`) as of this commit, after any
-    /// reset the navigation performed
+    /// reset the navigation performed; `None` means it has no name
     /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#resetBCName>).
-    pub name: String,
+    pub name: Option<ContextName>,
     /// Whether this tab is an auxiliary browsing context whose opener
     /// browsing context is non-null, which keeps its target name when it
     /// navigates to another origin
@@ -1654,7 +1654,48 @@ pub enum TargetName {
     /// `_blank`.
     Blank,
     /// A named context.
-    Named(String),
+    Named(ContextName),
+}
+
+/// A non-empty browsing-context name, parsed once at the boundary.
+///
+/// `""` is the absence of a name, not a name, so [`Option<ContextName>`] is
+/// the only representation of the choice. A renderer can otherwise ask the
+/// browser to find the empty name and match any cleared tab (#235, #236).
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct ContextName(String);
+
+impl ContextName {
+    /// Parses a browsing-context name: non-empty and not a keyword spelling.
+    ///
+    /// A keyword is a target selector, not a name, so it cannot be stored or
+    /// decoded as one. The renderer's own tree still keeps whatever
+    /// `window.name` was set to, so the getter reads it back; only the
+    /// cross-tab lookup and the wire treat a keyword as no name.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        (!raw.is_empty() && TargetName::keyword(raw).is_none()).then(|| Self(raw.to_owned()))
+    }
+
+    /// The name as the page spelled it.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for ContextName {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for ContextName {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        Self::parse(&raw).ok_or_else(|| serde::de::Error::custom("a target name is non-empty"))
+    }
 }
 
 impl TargetName {
@@ -1665,7 +1706,7 @@ impl TargetName {
         if raw.is_empty() {
             Self::Current
         } else {
-            Self::keyword(raw).unwrap_or_else(|| Self::Named(raw.to_owned()))
+            Self::keyword(raw).unwrap_or_else(|| Self::Named(ContextName(raw.to_owned())))
         }
     }
 
@@ -1704,10 +1745,24 @@ impl TargetName {
 
     /// The name a newly created context carries, when the target names one.
     #[must_use]
-    pub fn new_context_name(&self) -> Option<&str> {
+    pub fn new_context_name(&self) -> Option<&ContextName> {
         match self {
             Self::Named(name) => Some(name),
             Self::Current | Self::Parent | Self::Top | Self::Blank => None,
+        }
+    }
+
+    /// Whether this value is what [`Self::parse`] produces for its own name.
+    ///
+    /// A wire decoder builds the enum directly, so a forged `Named("_self")`
+    /// would otherwise name a new tab `_self` instead of selecting the current
+    /// context. The browser refuses a non-canonical target as a violation
+    /// rather than reinterpreting it.
+    #[must_use]
+    pub fn is_canonical(&self) -> bool {
+        match self {
+            Self::Named(name) => Self::parse(name.as_str()) == *self,
+            Self::Current | Self::Parent | Self::Top | Self::Blank => true,
         }
     }
 }
@@ -1766,30 +1821,30 @@ pub trait BrowsingContextHost: Send + Sync + 'static {
         source: &NavigationSource,
     ) -> Option<WindowId>;
 
-    /// The browser tab this tab's browsing context group holds under `name`,
-    /// if any
+    /// Navigates the browser tab this tab's browsing context group holds
+    /// under `name`, and answers the context the lookup selected. `None` means
+    /// no tab in the group has that name, so the caller creates one.
+    ///
+    /// The lookup and the navigation are one call: splitting them let the
+    /// caller's answer disagree with the browser's second lookup, and there is
+    /// no tab identity to name before the lookup runs
     /// (<https://html.spec.whatwg.org/multipage/document-sequences.html#the-rules-for-choosing-a-navigable>).
-    fn window_by_name(&self, name: &str) -> Option<WindowId>;
-
-    /// Records the target name of this realm's tab, after a script set
-    /// `window.name` or a commit reset it. The browser keeps it because it
-    /// searches target names across tabs and because the name outlives the
-    /// renderer that reported it
-    /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-name>).
-    fn set_window_name(&self, name: &str);
-
-    /// Navigates a browser tab `target` already selected under `name`. The
-    /// browser re-runs the lookup, so a renderer cannot navigate a tab outside
-    /// its own browsing context group. A `None` `url` is the window open
-    /// steps' null `urlRecord`, which navigates nothing.
-    fn window_navigate(
+    /// A `None` `url` is the window open steps' null `urlRecord`, which
+    /// navigates nothing.
+    fn navigate_named(
         &self,
-        window: WindowId,
-        name: &str,
+        name: &ContextName,
         url: Option<&Url>,
         opener: OpenerPolicy,
         source: &NavigationSource,
-    );
+    ) -> Option<WindowId>;
+
+    /// Records the target name of this realm's tab after a script set
+    /// `window.name`, or `None` after a commit reset it. The browser keeps it
+    /// because it searches target names across tabs and because the name
+    /// outlives the renderer that reported it
+    /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-name>).
+    fn set_window_name(&self, name: Option<&ContextName>);
 
     /// `window.close()` on a window this realm opened.
     fn window_close(&self, window: WindowId);
@@ -2309,7 +2364,11 @@ mod serialized_origin_tests {
 
 #[cfg(test)]
 mod target_name_tests {
-    use super::TargetName;
+    use super::{ContextName, TargetName};
+
+    fn name(raw: &str) -> ContextName {
+        ContextName::parse(raw).expect("a test name is non-empty")
+    }
 
     /// Choosing a navigable treats an empty target as `_self`; the window open
     /// steps treat it as `_blank`. Keywords match ASCII case-insensitively and
@@ -2340,16 +2399,16 @@ mod target_name_tests {
         }
         // A missing underscore or an unknown keyword is a plain name, matched
         // case-sensitively.
-        for name in ["blank", "_new", "_BLANKX", "frame", "_current"] {
+        for spelling in ["blank", "_new", "_BLANKX", "frame", "_current"] {
             assert_eq!(
-                TargetName::parse(name),
-                TargetName::Named(name.to_owned()),
-                "{name}"
+                TargetName::parse(spelling),
+                TargetName::Named(name(spelling)),
+                "{spelling}"
             );
             assert_eq!(
-                TargetName::for_window_open(name),
-                TargetName::Named(name.to_owned()),
-                "{name}"
+                TargetName::for_window_open(spelling),
+                TargetName::Named(name(spelling)),
+                "{spelling}"
             );
         }
     }
@@ -2362,16 +2421,24 @@ mod target_name_tests {
     #[test]
     fn only_a_named_or_new_target_carries_the_opener_rules() {
         assert!(TargetName::Blank.noopener_withholds());
-        assert!(TargetName::Named("frame".to_owned()).noopener_withholds());
+        let frame = name("frame");
+        assert!(TargetName::Named(frame.clone()).noopener_withholds());
         for target in [TargetName::Current, TargetName::Parent, TargetName::Top] {
             assert!(!target.noopener_withholds(), "{target:?}");
             assert_eq!(target.new_context_name(), None, "{target:?}");
         }
         assert_eq!(TargetName::Blank.new_context_name(), None);
         assert_eq!(
-            TargetName::Named("frame".to_owned()).new_context_name(),
-            Some("frame")
+            TargetName::Named(frame.clone()).new_context_name(),
+            Some(&frame)
         );
+        // A name is never empty and never a keyword, and a wire decoder cannot
+        // smuggle either in as a name.
+        assert_eq!(ContextName::parse(""), None);
+        assert_eq!(ContextName::parse("_self"), None);
+        assert_eq!(ContextName::parse("_BLANK"), None);
+        assert!(TargetName::parse("_self").is_canonical());
+        assert!(TargetName::Named(name("frame")).is_canonical());
     }
 }
 

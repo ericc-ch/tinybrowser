@@ -13,10 +13,12 @@ use std::io::{self, BufWriter, Write};
 use std::path::Path;
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 /// The file-level verdict for one test.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum Status {
     /// The test completed and every subtest passed.
     Pass,
@@ -51,13 +53,81 @@ impl Status {
     }
 }
 
-/// One testharness subtest, in the spelling the reporter used.
-#[derive(Clone, Debug)]
+/// Which executor a test needs. The cache stores this, so an unknown spelling
+/// fails to deserialize into a cache miss instead of silently becoming a
+/// testharness file.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Kind {
+    /// testharness.js reports subtests through the injected reporter.
+    Testharness,
+    /// The file only has to load and not kill the process.
+    Crashtest,
+    /// The file compares against a reference screenshot.
+    Reftest,
+    /// The file calls `WebDriver` through `testdriver.js`.
+    Testdriver,
+}
+
+/// The verdict one subtest reported.
+///
+/// testharness.js encodes these as numbers; the report spells them out. The
+/// two conversions live here so the cache and the report writer cannot
+/// disagree, and an unknown code is a harness error rather than a default.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SubtestStatus {
+    /// The subtest passed.
+    Pass,
+    /// The subtest failed.
+    Fail,
+    /// The subtest exceeded its timeout.
+    Timeout,
+    /// The harness never reached the subtest.
+    NotRun,
+    /// A required feature was absent, which wptrunner reports as a skip.
+    PreconditionFailed,
+    /// A test262 variant that the runner excluded before running.
+    Skip,
+}
+
+impl SubtestStatus {
+    /// The spelling a wptreport uses.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pass => "PASS",
+            Self::Fail => "FAIL",
+            Self::Timeout => "TIMEOUT",
+            Self::NotRun => "NOTRUN",
+            // wptrunner reports both as skips: a missing optional feature and a
+            // variant the runner excluded before it ran.
+            Self::PreconditionFailed | Self::Skip => "SKIP",
+        }
+    }
+
+    /// Reads the numeric code testharness.js reports, or `None` for a code the
+    /// harness does not define.
+    #[must_use]
+    pub fn from_harness_code(code: u64) -> Option<Self> {
+        match code {
+            0 => Some(Self::Pass),
+            1 => Some(Self::Fail),
+            2 => Some(Self::Timeout),
+            3 => Some(Self::NotRun),
+            4 => Some(Self::PreconditionFailed),
+            _ => None,
+        }
+    }
+}
+
+/// One testharness subtest.
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Subtest {
     /// Subtest name.
     pub name: String,
-    /// `PASS`, `FAIL`, `TIMEOUT`, `ERROR`, or `SKIP`.
-    pub status: String,
+    /// The subtest's verdict.
+    pub status: SubtestStatus,
     /// Failure message.
     pub message: Option<String>,
 }
@@ -108,7 +178,7 @@ pub fn write_report(path: &Path, outcomes: &[Outcome]) -> io::Result<()> {
                     .map(|subtest| {
                         json!({
                             "name": subtest.name,
-                            "status": subtest.status,
+                            "status": subtest.status.as_str(),
                             "message": subtest.message,
                             "expected": "PASS",
                             "known_intermittent": [],

@@ -31,7 +31,7 @@ pub(crate) struct TabRegistry {
     /// `window.open`'s name lookup searches, so the names are keyed by tab and
     /// resolved through the opener chain; a tab with no name has no entry
     /// (<https://html.spec.whatwg.org/multipage/document-sequences.html#the-rules-for-choosing-a-navigable>).
-    names: Arc<Mutex<HashMap<TabId, String>>>,
+    names: Arc<Mutex<HashMap<TabId, renderer::ContextName>>>,
     /// The popup sandboxing flag set each tab's documents inherit. The browser
     /// owns the copy a `window.open` is checked against and the copy a new
     /// tab inherits, so the renderer's claim can only ever add flags
@@ -53,37 +53,40 @@ impl TabRegistry {
     /// The tab `caller`'s browsing context group holds under `name`, when one
     /// is open. The group is the opener chain's root, so a name opened by one
     /// tab is visible to every tab in the same group and to no other.
-    pub(crate) fn find_by_name(&self, caller: TabId, name: &str) -> Option<TabId> {
+    pub(crate) fn find_by_name(
+        &self,
+        caller: TabId,
+        name: &renderer::ContextName,
+    ) -> Option<TabId> {
         let openers = self.openers.lock().unwrap_or_else(PoisonError::into_inner);
         let root = group_root(&openers, caller);
         self.names
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .iter()
-            .find(|(id, named)| named.as_str() == name && group_root(&openers, **id) == root)
+            .find(|(id, named)| {
+                named.as_str() == name.as_str() && group_root(&openers, **id) == root
+            })
             .map(|(id, _)| *id)
     }
 
-    /// Records a tab's target name. An empty name drops the entry, so "no
-    /// entry" is the only representation of "no name" and a reset cannot leave
-    /// a name behind for a lookup to find.
-    pub(crate) fn set_name(&self, id: TabId, name: String) {
+    /// Records a tab's target name, or drops it when the context has none.
+    pub(crate) fn set_name(&self, id: TabId, name: Option<renderer::ContextName>) {
         let mut names = self.names.lock().unwrap_or_else(PoisonError::into_inner);
-        if name.is_empty() {
-            names.remove(&id);
-        } else {
+        if let Some(name) = name {
             names.insert(id, name);
+        } else {
+            names.remove(&id);
         }
     }
 
-    /// The target name of one tab; empty when it has none.
-    pub(crate) fn name(&self, id: TabId) -> String {
+    /// The target name of one tab, when it has one.
+    pub(crate) fn name(&self, id: TabId) -> Option<renderer::ContextName> {
         self.names
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get(&id)
             .cloned()
-            .unwrap_or_default()
     }
 
     fn remove_name(&self, id: TabId) {
@@ -392,7 +395,7 @@ impl BrowserTask {
         // (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#resetBCName>).
         let opener_tab = source.filter(|_| opener == renderer::OpenerPolicy::Keep);
         let handle = self.create_tab(NewTab {
-            name: target.new_context_name().unwrap_or_default().to_owned(),
+            name: target.new_context_name().cloned(),
             opener: opener_tab,
             opener_frame: opener_tab.map(|_| source_frame),
             popup_sandbox,
@@ -584,25 +587,26 @@ mod tests {
     use super::TabRegistry;
     use crate::actor::TabId;
 
-    /// A cleared name is removed, not stored as `""`: the empty lookup would
-    /// otherwise match every cleared tab in the group, and a renderer can ask
-    /// for it (`WindowByName { name: "" }`)
+    fn name(raw: &str) -> renderer::ContextName {
+        renderer::ContextName::parse(raw).expect("a test name is non-empty")
+    }
+
+    /// A cleared name is removed, not stored as an empty one. `ContextName`
+    /// cannot hold `""`, so the page-side lookup can no longer ask for the
+    /// name that would match every cleared tab (#235).
     /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#resetBCName>).
     #[test]
-    fn a_cleared_name_is_not_found_by_the_empty_name() {
+    fn a_cleared_name_is_no_name() {
         let tabs = TabRegistry::new();
         let opener = TabId::new(1);
         let popup = TabId::new(2);
         tabs.set_opener(popup, opener, renderer::FrameId::MAIN);
-        tabs.set_name(popup, "peer".to_owned());
-        assert_eq!(tabs.name(popup), "peer");
-        assert_eq!(tabs.find_by_name(opener, "peer"), Some(popup));
-        tabs.set_name(popup, String::new());
-        assert_eq!(tabs.name(popup), "");
-        assert_eq!(tabs.find_by_name(opener, "peer"), None);
-        // The only assertion that tells removal apart from an overwrite with
-        // `""`: with an entry stored, this lookup would return `popup`.
-        assert_eq!(tabs.find_by_name(opener, ""), None);
+        tabs.set_name(popup, Some(name("peer")));
+        assert_eq!(tabs.name(popup), Some(name("peer")));
+        assert_eq!(tabs.find_by_name(opener, &name("peer")), Some(popup));
+        tabs.set_name(popup, None);
+        assert_eq!(tabs.name(popup), None);
+        assert_eq!(tabs.find_by_name(opener, &name("peer")), None);
     }
 
     /// The lookup is scoped to the opener chain: a name one group holds is not
@@ -615,10 +619,10 @@ mod tests {
         let stranger = TabId::new(2);
         let popup = TabId::new(3);
         tabs.set_opener(popup, opener, renderer::FrameId::MAIN);
-        tabs.set_name(popup, "peer".to_owned());
-        assert_eq!(tabs.find_by_name(opener, "peer"), Some(popup));
-        assert_eq!(tabs.find_by_name(popup, "peer"), Some(popup));
-        assert_eq!(tabs.find_by_name(stranger, "peer"), None);
+        tabs.set_name(popup, Some(name("peer")));
+        assert_eq!(tabs.find_by_name(opener, &name("peer")), Some(popup));
+        assert_eq!(tabs.find_by_name(popup, &name("peer")), Some(popup));
+        assert_eq!(tabs.find_by_name(stranger, &name("peer")), None);
     }
 
     /// The browser's own sandbox copy is what a `window.open` is checked

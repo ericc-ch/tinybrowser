@@ -1580,7 +1580,7 @@ impl Document {
             // reset it did not perform itself. The call is synchronous, so no
             // world borrow may be live while it runs.
             let services = self.world.borrow().runtime.services.clone();
-            services.set_window_name("");
+            services.set_window_name(None);
         }
     }
 
@@ -1889,7 +1889,12 @@ impl Document {
             let world = self.world.borrow();
             let shared = world.shared();
             let mut shared = shared.borrow_mut();
-            shared.tree.set_name(frame, tab.name.clone());
+            shared.tree.set_name(
+                frame,
+                tab.name
+                    .as_ref()
+                    .map_or_else(String::new, |name| name.as_str().to_owned()),
+            );
             shared
                 .tree
                 .set_main_auxiliary_with_opener(tab.auxiliary_with_opener);

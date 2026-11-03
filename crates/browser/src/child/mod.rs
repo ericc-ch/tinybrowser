@@ -457,10 +457,19 @@ impl BrowsingContextHost for HostServices {
         }
     }
 
-    fn window_by_name(&self, name: &str) -> Option<WindowId> {
+    fn navigate_named(
+        &self,
+        name: &renderer::ContextName,
+        url: Option<&Url>,
+        opener: OpenerPolicy,
+        source: &renderer::NavigationSource,
+    ) -> Option<WindowId> {
         match self.call(ServiceCall::BrowsingContext(
-            BrowsingContextCall::WindowByName {
-                name: name.to_owned(),
+            BrowsingContextCall::NavigateNamed {
+                name: name.clone(),
+                url: url.cloned(),
+                opener,
+                source: source.clone(),
             },
         )) {
             Some(ServiceReply::Window(tab)) => tab,
@@ -468,29 +477,10 @@ impl BrowsingContextHost for HostServices {
         }
     }
 
-    fn set_window_name(&self, name: &str) {
+    fn set_window_name(&self, name: Option<&renderer::ContextName>) {
         let _result = self.call(ServiceCall::BrowsingContext(
             BrowsingContextCall::WindowName {
-                name: name.to_owned(),
-            },
-        ));
-    }
-
-    fn window_navigate(
-        &self,
-        window: WindowId,
-        name: &str,
-        url: Option<&Url>,
-        opener: OpenerPolicy,
-        source: &renderer::NavigationSource,
-    ) {
-        let _result = self.call(ServiceCall::BrowsingContext(
-            BrowsingContextCall::WindowNavigate {
-                window,
-                name: name.to_owned(),
-                url: url.cloned(),
-                opener,
-                source: source.clone(),
+                name: name.cloned(),
             },
         ));
     }

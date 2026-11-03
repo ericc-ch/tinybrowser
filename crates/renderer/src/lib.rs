@@ -40,15 +40,15 @@ pub use embedded::EmbeddedRenderer;
 pub use engine::{DEFAULT_VIEWPORT, Engine, decode_data_url, decode_data_url_bounded};
 pub use js::{Stop, TURN_SCRIPT_BUDGET};
 pub use protocol::{
-    BodyDelivery, BrowserEvent, BrowserServices, BrowsingContextHost, CorsMode, CorsRequest,
-    DialCancellation, DialCompletion, DialFailure, DialKind, DialOutcome, DialRequest, FrameId,
-    HistoryHandling, HistorySnapshot, HttpHead, MAX_RESPONSE_BODY_BYTES, MessagingHost, Mount,
-    NavigationSource, NetworkHost, OpenerPolicy, PolicyContainer, PostedMessage, ReferrerRequest,
-    RendererEvent, RequestCache, RequestPolicy, ResourceLimit, ResponseBody, ResponseHead,
-    ResponseSource, STORAGE_QUOTA_BYTES, SandboxFlags, ScreenshotClip, ScreenshotRequest,
-    ScriptFailure, ScriptSource, SerializedOrigin, StorageChange, StorageError, StorageHost,
-    StorageKey, StorageKind, StreamId, TabError, TabState, TargetName, TargetOrigin, TimerId,
-    WindowId,
+    BodyDelivery, BrowserEvent, BrowserServices, BrowsingContextHost, ContextName, CorsMode,
+    CorsRequest, DialCancellation, DialCompletion, DialFailure, DialKind, DialOutcome, DialRequest,
+    FrameId, HistoryHandling, HistorySnapshot, HttpHead, MAX_RESPONSE_BODY_BYTES, MessagingHost,
+    Mount, NavigationSource, NetworkHost, OpenerPolicy, PolicyContainer, PostedMessage,
+    ReferrerRequest, RendererEvent, RequestCache, RequestPolicy, ResourceLimit, ResponseBody,
+    ResponseHead, ResponseSource, STORAGE_QUOTA_BYTES, SandboxFlags, ScreenshotClip,
+    ScreenshotRequest, ScriptFailure, ScriptSource, SerializedOrigin, StorageChange, StorageError,
+    StorageHost, StorageKey, StorageKind, StreamId, TabError, TabState, TargetName, TargetOrigin,
+    TimerId, WindowId,
 };
 pub use remote::RemoteValue;
 pub use storage::PendingStorageEvent;

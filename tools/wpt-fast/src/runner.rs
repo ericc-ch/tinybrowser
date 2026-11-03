@@ -17,7 +17,7 @@ use rquickjs::{
     context::EvalOptions,
 };
 
-use wpt_report::{Outcome, Status, Subtest};
+use wpt_report::{Outcome, Status, Subtest, SubtestStatus};
 
 use crate::meta::{Meta, Phase};
 
@@ -123,7 +123,13 @@ pub fn run(runtime: &Runtime, harness: &Harness, case: &TestCase) -> Outcome {
         status,
         subtests: vec![Subtest {
             name: "Test".to_owned(),
-            status: status.as_str().to_owned(),
+            status: match status {
+                Status::Pass => SubtestStatus::Pass,
+                Status::Fail => SubtestStatus::Fail,
+                Status::Timeout => SubtestStatus::Timeout,
+                Status::Error => SubtestStatus::NotRun,
+                Status::Skip => SubtestStatus::Skip,
+            },
             message: message.clone(),
         }],
         message,

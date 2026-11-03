@@ -7,19 +7,9 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// Which executor a file needs.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Kind {
-    /// testharness.js reports subtests through the injected reporter.
-    Testharness,
-    /// The file only has to load and not kill the process.
-    Crashtest,
-    /// The file compares against a reference screenshot.
-    Reftest,
-    /// The file calls `WebDriver` through `testdriver.js`, which this runner does
-    /// not implement.
-    Testdriver,
-}
+/// Which executor a file needs, shared with the cache so an unknown stored
+/// spelling is a cache miss rather than a silent testharness file.
+pub use wpt_report::Kind;
 
 /// One selected file.
 #[derive(Clone, Debug)]
