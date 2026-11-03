@@ -123,13 +123,21 @@ pub fn compare(baseline: &Path, outcomes: &[Outcome]) -> io::Result<Comparison> 
 ///
 /// A test262 entry keeps the overall `OK`/`SKIP` status and puts the verdict in
 /// its single subtest, so an entry fails when any subtest is neither `PASS` nor
-/// `SKIP`. `tools/wpt/cli.py`'s `failing_tests` reads the same rule, which is
-/// what makes a baseline written by one reader usable by the other.
+/// `SKIP`. A file-level timeout, crash, or error outranks its subtests: the
+/// file stopped part-way, so what it reported is a prefix, not a verdict. The
+/// reader has to handle those even though this lane only writes `PASS`, `FAIL`,
+/// and `SKIP`, because `--baseline` may point at a wptreport another runner
+/// wrote (a full `cli.py` run of the same test262 files). `cli.py`'s
+/// `failing_tests` reads the same rule, which is what makes a baseline written
+/// by one reader usable by the other.
 fn verdict(result: &Value) -> &str {
     let status = result
         .get("status")
         .and_then(Value::as_str)
         .unwrap_or("SKIP");
+    if matches!(status, "TIMEOUT" | "ERROR" | "CRASH") {
+        return status;
+    }
     let mut passed = matches!(status, "OK" | "PASS");
     if let Some(subtests) = result.get("subtests").and_then(Value::as_array) {
         for subtest in subtests {
@@ -172,6 +180,8 @@ mod tests {
                 {"test":"c","subtests":[{"status":"SKIP"}]},
                 {"test":"d","subtests":[{"status":"PASS"}]},
                 {"test":"mixed","subtests":[{"status":"PASS"},{"status":"FAIL"}]},
+                {"test":"timed","status":"TIMEOUT","subtests":[]},
+                {"test":"broken","status":"ERROR","subtests":[{"status":"PASS"}]},
                 {"test":"gone","subtests":[{"status":"PASS"}]}
             ]}"#,
         )
@@ -182,6 +192,8 @@ mod tests {
             outcome("c", Status::Pass),
             outcome("d", Status::Skip),
             outcome("mixed", Status::Fail),
+            outcome("timed", Status::Pass),
+            outcome("broken", Status::Fail),
             outcome("new", Status::Fail),
         ];
         let comparison = compare(&path, &outcomes).expect("compared");
