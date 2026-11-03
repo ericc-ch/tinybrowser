@@ -187,7 +187,75 @@ impl Implementation {
     }
 }
 
-pub(crate) fn compile(idl: &[Source<'_>], rust: &[Source<'_>]) -> Result<Vec<Binding>, Error> {
+/// Parse the reflected-enumerated metadata table.
+pub(crate) fn parse_reflected_enumerated(
+    source: &Source<'_>,
+) -> Result<Vec<crate::ReflectedEnum>, Error> {
+    let mut entries = Vec::new();
+    let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+    for (index, line) in source.text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let columns: Vec<&str> = line.split_whitespace().collect();
+        let [interface, attribute, type_path, content, missing, invalid] = columns.as_slice()
+        else {
+            return Err(Error(format!(
+                "{}:{}: expected `interface attribute type content missing invalid`",
+                source.name,
+                index + 1
+            )));
+        };
+        let path = |raw: &str, role: &str| -> Result<Option<syn::Ident>, Error> {
+            if raw == "-" {
+                return Ok(None);
+            }
+            syn::parse_str::<syn::Ident>(raw)
+                .map(Some)
+                .map_err(|error| {
+                    Error(format!(
+                        "{}:{}: {role} must be one variant name, not `{raw}`: {error}",
+                        source.name,
+                        index + 1
+                    ))
+                })
+        };
+        if !seen.insert(((*interface).to_owned(), (*attribute).to_owned())) {
+            return Err(Error(format!(
+                "{}:{}: {interface}.{attribute} is listed twice",
+                source.name,
+                index + 1
+            )));
+        }
+        // Validate the type path the same way; the variant paths stay strings
+        // here and are joined with it by the lowering.
+        syn::parse_str::<syn::Path>(type_path).map_err(|error| {
+            Error(format!(
+                "{}:{}: invalid type `{type_path}`: {error}",
+                source.name,
+                index + 1
+            ))
+        })?;
+        let missing = path(missing, "missing-value default")?;
+        let invalid = path(invalid, "invalid-value default")?;
+        entries.push(crate::ReflectedEnum {
+            interface: (*interface).to_owned(),
+            attribute: (*attribute).to_owned(),
+            content: (*content).to_owned(),
+            type_path: (*type_path).to_owned(),
+            missing: missing.map(|path| quote!(#path).to_string()),
+            invalid: invalid.map(|path| quote!(#path).to_string()),
+        });
+    }
+    Ok(entries)
+}
+
+pub(crate) fn compile(
+    idl: &[Source<'_>],
+    rust: &[Source<'_>],
+    reflected: &[crate::ReflectedEnum],
+) -> Result<Vec<Binding>, Error> {
     let database = Database::parse(idl)?;
     let mut implementations = BTreeMap::new();
     let mut classes = BTreeMap::new();
@@ -249,7 +317,7 @@ pub(crate) fn compile(idl: &[Source<'_>], rust: &[Source<'_>]) -> Result<Vec<Bin
             } else {
                 InterfaceKind::Complete
             };
-            let interface = lower(&database, &implementation, kind, &implemented)
+            let interface = lower(&database, &implementation, kind, &implemented, reflected)
                 .map_err(|error| Error(format!("{}: {error}", implementation.interface)))?;
             let generated = crate::emit::interface(&interface);
             let syntax = syn::parse2(generated).map_err(|error| {
@@ -335,11 +403,27 @@ fn module_path(tokens: &proc_macro2::TokenStream) -> Option<syn::LitStr> {
 /// implementation of its own bindable: the engine implements the ancestor, and
 /// every platform type implements a child interface the same way because the
 /// child interface's members are a superset reached through the same object.
+///
+/// A mixin with no implementation of its own is bindable the same way: its
+/// members install on every implemented interface that includes it, so the
+/// payload is the first such includer's. That happens when every mixin member
+/// is generator-supplied and there is no trait to implement.
 fn inherited_payload(
     database: &Database<'_>,
     name: &str,
     implementations: &BTreeMap<String, Implementation>,
 ) -> Result<Option<(syn::Ident, bool)>, Error> {
+    if database.mixin(name).is_ok() {
+        for includer in database.includers(name) {
+            if let Some(implementation) = implementations.get(&includer) {
+                return Ok(Some((
+                    implementation.payload.clone(),
+                    implementation.lifetime,
+                )));
+            }
+        }
+        return Ok(None);
+    }
     let mut parent = database.interface(name)?.parent;
     while let Some(candidate) = parent {
         if let Some(implementation) = implementations.get(candidate) {
@@ -535,6 +619,7 @@ fn lower(
     implementation: &Implementation,
     kind: InterfaceKind,
     implemented: &BTreeSet<String>,
+    reflected: &[crate::ReflectedEnum],
 ) -> Result<model::Interface, Error> {
     // Mixins have no interface object; their members install on every
     // *implemented* including interface's prototype, derived from the IDL
@@ -543,7 +628,14 @@ fn lower(
     // added later needs an implementation to become an install target —
     // it is silently skipped until then, by design).
     if let Ok(mixin) = database.mixin(&implementation.interface) {
-        return lower_mixin(database, implementation, kind, &mixin, implemented);
+        return lower_mixin(
+            database,
+            implementation,
+            kind,
+            &mixin,
+            implemented,
+            reflected,
+        );
     }
     let declaration = database.interface(&implementation.interface)?;
     validate_interface_attributes(declaration.attributes.as_ref())?;
@@ -576,7 +668,13 @@ fn lower(
         secure_context,
         contract: None,
     };
-    interface.contract = lower_members(database, &declaration, implementation, &mut interface)?;
+    interface.contract = lower_members(
+        database,
+        &declaration,
+        implementation,
+        &mut interface,
+        reflected,
+    )?;
     if matches!(interface.kind, InterfaceKind::Partial)
         && (interface.constructor.is_some() || !matches!(interface.properties, PropertyHooks::None))
     {
@@ -600,6 +698,7 @@ fn lower_mixin(
     kind: InterfaceKind,
     mixin: &crate::database::Mixin<'_>,
     implemented: &BTreeSet<String>,
+    reflected: &[crate::ReflectedEnum],
 ) -> Result<model::Interface, Error> {
     if !matches!(kind, InterfaceKind::Partial) {
         return Err(Error(format!(
@@ -644,7 +743,13 @@ fn lower_mixin(
         parent: None,
         members: mixin.members.clone(),
     };
-    interface.contract = lower_members(database, &declaration, implementation, &mut interface)?;
+    interface.contract = lower_members(
+        database,
+        &declaration,
+        implementation,
+        &mut interface,
+        reflected,
+    )?;
     add_referenced_definitions(database, &mut interface)?;
     Ok(interface)
 }
@@ -676,6 +781,7 @@ fn lower_members(
     declaration: &crate::database::Interface<'_>,
     implementation: &Implementation,
     interface: &mut model::Interface,
+    reflected: &[crate::ReflectedEnum],
 ) -> Result<Option<TokenStream>, Error> {
     let mut remaining = implementation.methods.clone();
     let mut methods = Vec::new();
@@ -711,8 +817,14 @@ fn lower_members(
                 )?;
             }
             InterfaceMember::Attribute(member) => {
-                let Some((attribute, signature)) =
-                    lower_attribute(database, member, exposure, &implementation.methods)?
+                let Some((attribute, signature)) = lower_attribute(
+                    database,
+                    declaration.name,
+                    member,
+                    exposure,
+                    &implementation.methods,
+                    reflected,
+                )?
                 else {
                     continue;
                 };
@@ -1739,12 +1851,127 @@ fn reject_legacy_non_string_reflect(
     Ok(())
 }
 
-fn lower_attribute(
-    database: &Database<'_>,
+/// The table entry for one attribute, lowered when it is listed.
+fn reflected_enumerated_attribute(
+    interface: &str,
     member: &weedle::interface::AttributeInterfaceMember<'_>,
     exposure: Exposure,
     implemented: &BTreeMap<String, Method>,
+    reflected: &[crate::ReflectedEnum],
 ) -> Result<Option<(model::Attribute, TokenStream)>, Error> {
+    let Some(entry) = reflected
+        .iter()
+        .find(|entry| entry.interface == interface && entry.attribute == member.identifier.0)
+    else {
+        return Ok(None);
+    };
+    lower_reflected_enumerated_attribute(member, exposure, entry, implemented).map(Some)
+}
+
+/// Lower one reflected enumerated attribute from the metadata table.
+///
+/// The table names the keyword type, the content attribute, and the two
+/// defaults; the IDL names the interface, the member, and its mutability. The
+/// generated getter and setter are the only definitions, so a hand-written one
+/// for the same member is reported instead of silently winning.
+fn lower_reflected_enumerated_attribute(
+    member: &weedle::interface::AttributeInterfaceMember<'_>,
+    exposure: Exposure,
+    entry: &crate::ReflectedEnum,
+    implemented: &BTreeMap<String, Method>,
+) -> Result<(model::Attribute, TokenStream), Error> {
+    let is_dom_string = matches!(
+        &member.type_.type_,
+        Type::Single(SingleType::NonAny(NonAnyType::DOMString(item))) if item.q_mark.is_none()
+    );
+    if !is_dom_string {
+        return Err(Error(format!(
+            "{}: a reflected enumerated attribute must be DOMString",
+            member.identifier.0
+        )));
+    }
+    validate_attribute_attributes(member.attributes.as_ref())?;
+    validate_argument_attributes(member.type_.attributes.as_ref())?;
+    let getter_name = format!("get_{}", snake_case(member.identifier.0));
+    if implemented.contains_key(&getter_name) {
+        return Err(Error(format!(
+            "{}: the metadata table generates this getter; remove the hand-written one",
+            member.identifier.0
+        )));
+    }
+    let writable = member.readonly.is_none();
+    let setter_name = format!("set_{}", snake_case(member.identifier.0));
+    if writable && implemented.contains_key(&setter_name) {
+        return Err(Error(format!(
+            "{}: the metadata table generates this setter; remove the hand-written one",
+            member.identifier.0
+        )));
+    }
+    let type_path = {
+        let raw = syn::parse_str::<syn::Path>(&entry.type_path)
+            .map_err(|error| Error(format!("{}: invalid type path: {error}", entry.attribute)))?;
+        // A bare name is a type in the renderer's `enumerated` module; anything
+        // with a path (such as `net::ReferrerPolicy`) is used as written.
+        if raw.segments.len() == 1 {
+            let name = &raw.segments[0].ident;
+            syn::parse_str::<syn::Path>(&format!("crate::js::bindings::enumerated::{name}"))
+                .expect("a bare identifier is a valid path")
+        } else {
+            raw
+        }
+    };
+    let type_text = quote!(#type_path).to_string();
+    let default = |raw: &Option<String>| -> Result<Option<syn::Path>, Error> {
+        raw.as_ref()
+            .map(|raw| {
+                syn::parse_str::<syn::Path>(&format!("{type_text}::{raw}")).map_err(|error| {
+                    Error(format!(
+                        "{}: invalid default `{raw}`: {error}",
+                        entry.attribute
+                    ))
+                })
+            })
+            .transpose()
+    };
+    let getter = format_ident!("{getter_name}");
+    let setter = writable.then(|| model::Setter::Reflect {
+        content: entry.content.clone(),
+    });
+    let attribute = model::Attribute {
+        exposure,
+        name: member.identifier.0.into(),
+        rust: getter,
+        return_type: ReturnType::String,
+        mapping: GetterMapping::ReflectEnumerated {
+            content: entry.content.clone(),
+            type_path,
+            missing: default(&entry.missing)?,
+            invalid: default(&entry.invalid)?,
+        },
+        setter,
+        legacy_null_to_empty: false,
+        reactions: has_no_args(member.attributes.as_ref(), "CEReactions"),
+    };
+    Ok((attribute, quote! {}))
+}
+
+fn lower_attribute(
+    database: &Database<'_>,
+    interface: &str,
+    member: &weedle::interface::AttributeInterfaceMember<'_>,
+    exposure: Exposure,
+    implemented: &BTreeMap<String, Method>,
+    reflected: &[crate::ReflectedEnum],
+) -> Result<Option<(model::Attribute, TokenStream)>, Error> {
+    // A reflected enumerated attribute is listed in tinybrowser's metadata
+    // table, because the IDL extract carries the member but not its keyword
+    // set or its two defaults. The generated getter is the only definition,
+    // so a hand-written one is a mistake the compiler reports.
+    if let Some(lowered) =
+        reflected_enumerated_attribute(interface, member, exposure, implemented, reflected)?
+    {
+        return Ok(Some(lowered));
+    }
     // Reflected attributes install without implementation methods, so
     // resolve them before the implemented-member checks below. Only shapes
     // the generator auto-generates (plain string/boolean/`USVString`) take
@@ -1785,6 +2012,16 @@ fn lower_attribute(
     {
         return Ok(Some(lowered));
     }
+    lower_method_attribute(database, member, exposure, implemented)
+}
+
+/// Lower a hand-implemented attribute: the trait method and its signature.
+fn lower_method_attribute(
+    database: &Database<'_>,
+    member: &weedle::interface::AttributeInterfaceMember<'_>,
+    exposure: Exposure,
+    implemented: &BTreeMap<String, Method>,
+) -> Result<Option<(model::Attribute, TokenStream)>, Error> {
     let getter_name = format!("get_{}", snake_case(member.identifier.0));
     let setter_name = format!("set_{}", snake_case(member.identifier.0));
     let readable = implemented.contains_key(&getter_name);

@@ -19,11 +19,7 @@ use crate::dom::tree::{NodeId, attr, html_namespace};
 use super::JsNode;
 use super::document::document_first;
 use super::element::{
-    content_attr, reflect_clamped_ulong, reflect_cross_origin, reflect_referrer_policy,
-    reflect_ulong, set_cross_origin, set_referrer_policy,
-};
-use crate::js::bindings::enumerated::{
-    Defaults, LinkAs, TableScope, TrackKind, reflect_enumerated,
+    content_attr, reflect_clamped_ulong, reflect_cross_origin, reflect_ulong, set_cross_origin,
 };
 
 include!(concat!(env!("OUT_DIR"), "/HTMLAnchorElement.rs"));
@@ -73,30 +69,6 @@ include!(concat!(env!("OUT_DIR"), "/HTMLQuoteElement.rs"));
 include!(concat!(env!("OUT_DIR"), "/HTMLSpanElement.rs"));
 include!(concat!(env!("OUT_DIR"), "/HTMLTimeElement.rs"));
 include!(concat!(env!("OUT_DIR"), "/HTMLUListElement.rs"));
-
-impl<'js> html_anchor_element_generated::HTMLAnchorElement<'js> for JsNode {
-    // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-referrerpolicy
-    fn get_referrer_policy(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        reflect_referrer_policy(ctx, self.handle.0)
-    }
-
-    // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-referrerpolicy
-    fn set_referrer_policy(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
-        set_referrer_policy(ctx, self.handle.0, &value)
-    }
-}
-
-impl<'js> html_area_element_generated::HTMLAreaElement<'js> for JsNode {
-    // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-referrerpolicy
-    fn get_referrer_policy(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        reflect_referrer_policy(ctx, self.handle.0)
-    }
-
-    // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-referrerpolicy
-    fn set_referrer_policy(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
-        set_referrer_policy(ctx, self.handle.0, &value)
-    }
-}
 
 impl<'js> htmlli_element_generated::HTMLLIElement<'js> for JsNode {
     // `value` is a plain long defaulting to zero
@@ -180,21 +152,6 @@ impl<'js> html_table_cell_element_generated::HTMLTableCellElement<'js> for JsNod
     fn set_row_span(&self, ctx: &Ctx<'js>, value: u32) -> Result<()> {
         host::reflect_set_ulong_defaulting(ctx, self.handle.0, "rowspan", value, 1)
     }
-
-    // `scope` is an enumeration with an empty-string default
-    // (<https://html.spec.whatwg.org/multipage/tables.html#dom-tdth-scope>).
-    fn get_scope(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        let value = reflect_enumerated::<TableScope>(
-            content_attr(ctx, self.handle.0, "scope").as_deref(),
-            Defaults::NONE,
-        );
-        rquickjs::String::from_str(ctx.clone(), value)
-    }
-
-    // https://html.spec.whatwg.org/multipage/tables.html#dom-tdth-scope
-    fn set_scope(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
-        set_attribute_sync(ctx, self.handle.0, "scope", &value.to_string()?)
-    }
 }
 
 impl<'js> html_table_col_element_generated::HTMLTableColElement<'js> for JsNode {
@@ -240,32 +197,6 @@ impl<'js> html_base_element_generated::HTMLBaseElement<'js> for JsNode {
 }
 
 impl<'js> html_link_element_generated::HTMLLinkElement<'js> for JsNode {
-    // `as` is an enumeration over the preload and module preload
-    // destinations, defaulting to the empty string
-    // (<https://html.spec.whatwg.org/multipage/semantics.html#dom-link-as>).
-    fn get_as(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        let value = reflect_enumerated::<LinkAs>(
-            content_attr(ctx, self.handle.0, "as").as_deref(),
-            Defaults::NONE,
-        );
-        rquickjs::String::from_str(ctx.clone(), value)
-    }
-
-    // https://html.spec.whatwg.org/multipage/semantics.html#dom-link-as
-    fn set_as(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
-        set_attribute_sync(ctx, self.handle.0, "as", &value.to_string()?)
-    }
-
-    // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-referrerpolicy
-    fn get_referrer_policy(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        reflect_referrer_policy(ctx, self.handle.0)
-    }
-
-    // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-referrerpolicy
-    fn set_referrer_policy(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
-        set_referrer_policy(ctx, self.handle.0, &value)
-    }
-
     // https://html.spec.whatwg.org/multipage/semantics.html#dom-link-crossorigin
     fn get_cross_origin(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
         reflect_cross_origin(ctx, self.handle.0)
@@ -278,16 +209,6 @@ impl<'js> html_link_element_generated::HTMLLinkElement<'js> for JsNode {
 }
 
 impl<'js> html_script_element_generated::HTMLScriptElement<'js> for JsNode {
-    // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-referrerpolicy
-    fn get_referrer_policy(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        reflect_referrer_policy(ctx, self.handle.0)
-    }
-
-    // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-referrerpolicy
-    fn set_referrer_policy(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
-        set_referrer_policy(ctx, self.handle.0, &value)
-    }
-
     // https://html.spec.whatwg.org/multipage/scripting.html#dom-script-crossorigin
     fn get_cross_origin(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
         reflect_cross_origin(ctx, self.handle.0)
@@ -296,26 +217,6 @@ impl<'js> html_script_element_generated::HTMLScriptElement<'js> for JsNode {
     // https://html.spec.whatwg.org/multipage/scripting.html#dom-script-crossorigin
     fn set_cross_origin(&self, ctx: &Ctx<'js>, value: Option<rquickjs::String<'js>>) -> Result<()> {
         set_cross_origin(ctx, self.handle.0, value)
-    }
-}
-
-impl<'js> html_track_element_generated::HTMLTrackElement<'js> for JsNode {
-    // `kind` defaults to `subtitles`; unknown values read `metadata`
-    // (<https://html.spec.whatwg.org/multipage/media.html#dom-track-kind>).
-    fn get_kind(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        let value = reflect_enumerated::<TrackKind>(
-            content_attr(ctx, self.handle.0, "kind").as_deref(),
-            Defaults {
-                missing: Some(TrackKind::Subtitles),
-                invalid: Some(TrackKind::Metadata),
-            },
-        );
-        rquickjs::String::from_str(ctx.clone(), value)
-    }
-
-    // https://html.spec.whatwg.org/multipage/media.html#dom-track-kind
-    fn set_kind(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
-        set_attribute_sync(ctx, self.handle.0, "kind", &value.to_string()?)
     }
 }
 

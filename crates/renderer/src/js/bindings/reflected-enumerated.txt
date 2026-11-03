@@ -1,0 +1,45 @@
+# Reflected enumerated attributes: the one table the binding compiler reads.
+#
+# Columns: interface, attribute, Enumerated type, content attribute,
+# missing-value default, invalid-value default. `-` means the spec's "no
+# state", which the getter reports as the empty string. A bare type name lives
+# in `crate::js::bindings::enumerated`; a dotted path is used as written.
+#
+# The WPT IDL extracts carry the member but not its keyword set or its two
+# defaults, so those three facts live here instead of in a hand-written getter
+# in `node/*.rs`.
+#
+# Reasoning for the defaults, from the specs:
+# - `dir`, `enterKeyHint`, `inputMode`, `referrerPolicy`, `scope`, `as`: the
+#   missing and invalid states both report the empty string.
+# - `loading` defaults to `eager` in both states.
+# - `preload` defaults to `auto`; `decoding` defaults to `auto`.
+# - `form.method` is `get`, `form.enctype` is `application/x-www-form-urlencoded`,
+#   and `form.autocomplete` is `on` in both states.
+# - `input.formMethod`/`button.formMethod` default to `get` only when the
+#   attribute is present but invalid; absent reads empty and the submission
+#   algorithm uses the form's own value.
+# - `track.kind` defaults to `subtitles` when absent and `metadata` when the
+#   value is not a keyword.
+
+HTMLElement dir Dir dir - -
+ElementContentEditable enterKeyHint EnterKeyHint enterkeyhint - -
+ElementContentEditable inputMode InputMode inputmode - -
+HTMLFormElement method FormMethod method Get Get
+HTMLFormElement enctype FormEnctype enctype UrlEncoded UrlEncoded
+HTMLFormElement encoding FormEnctype enctype UrlEncoded UrlEncoded
+HTMLFormElement autocomplete Autocomplete autocomplete On On
+HTMLIFrameElement referrerPolicy net::ReferrerPolicy referrerpolicy - -
+HTMLIFrameElement loading Loading loading Eager Eager
+HTMLImageElement referrerPolicy net::ReferrerPolicy referrerpolicy - -
+HTMLImageElement decoding Decoding decoding Auto Auto
+HTMLImageElement loading Loading loading Eager Eager
+HTMLAnchorElement referrerPolicy net::ReferrerPolicy referrerpolicy - -
+HTMLAreaElement referrerPolicy net::ReferrerPolicy referrerpolicy - -
+HTMLLinkElement referrerPolicy net::ReferrerPolicy referrerpolicy - -
+HTMLLinkElement as LinkAs as - -
+HTMLScriptElement referrerPolicy net::ReferrerPolicy referrerpolicy - -
+HTMLTrackElement kind TrackKind kind Subtitles Metadata
+HTMLTableCellElement scope TableScope scope - -
+HTMLMediaElement preload Preload preload Auto Auto
+HTMLMediaElement loading Loading loading Eager Eager

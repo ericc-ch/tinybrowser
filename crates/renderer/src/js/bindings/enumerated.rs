@@ -35,17 +35,6 @@ impl<T> Defaults<T> {
         missing: None,
         invalid: None,
     };
-
-    /// The same default for both states.
-    pub(crate) const fn both(value: T) -> Self
-    where
-        T: Copy,
-    {
-        Self {
-            missing: Some(value),
-            invalid: Some(value),
-        }
-    }
 }
 
 /// Enumerated reflection: the canonical keyword, the missing-value default

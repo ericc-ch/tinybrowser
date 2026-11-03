@@ -28,6 +28,42 @@ pub fn validate_sources(sources: &[Source<'_>]) -> Result<(), Error> {
     database::Database::parse(sources).map(|_| ())
 }
 
+/// One reflected enumerated attribute: the (interface, attribute) pair the
+/// generated getter belongs to, the content attribute it reads, the
+/// `Enumerated` type that owns the keyword set, and the two spec defaults.
+///
+/// The WPT IDL extracts carry the member but not its keyword set, missing
+/// default, or invalid default, and editing an extract is forbidden. This
+/// table is tinybrowser's own input for exactly those three facts, so the
+/// generator can emit the getter instead of accepting a hand-written copy.
+pub struct ReflectedEnum {
+    /// IDL interface (or mixin) that declares the attribute.
+    pub interface: String,
+    /// IDL attribute name, e.g. `enterKeyHint`.
+    pub attribute: String,
+    /// The content attribute the getter reads, e.g. `enterkeyhint`.
+    pub content: String,
+    /// The Rust path of the `Enumerated` type, e.g. `Dir`.
+    pub type_path: String,
+    /// The missing-value default variant, or `None` for the spec's "no state".
+    pub missing: Option<String>,
+    /// The invalid-value default variant, or `None` for the spec's "no state".
+    pub invalid: Option<String>,
+}
+
+/// Parse tinybrowser's reflected-enumerated table.
+///
+/// One entry per line: whitespace-separated `interface attribute type content
+/// missing invalid`, where a default is `-` for "no state" or the variant name.
+/// Blank lines and lines starting with `#` are ignored.
+///
+/// # Errors
+/// Returns a diagnostic naming the line for a malformed entry, a duplicate
+/// `(interface, attribute)` pair, or an unparsable type path or variant.
+pub fn parse_reflected_enumerated(source: &Source<'_>) -> Result<Vec<ReflectedEnum>, Error> {
+    crate::contracts::parse_reflected_enumerated(source)
+}
+
 /// Generated bindings for one discovered native interface implementation.
 pub struct Binding {
     /// Unmodified IDL interface name, also used as the output file stem.
@@ -48,7 +84,19 @@ pub struct Binding {
 /// Returns a diagnostic for invalid input, ambiguous implementations, unknown
 /// implementation methods, or implemented IDL semantics not yet supported.
 pub fn compile_contracts(idl: &[Source<'_>], rust: &[Source<'_>]) -> Result<Vec<Binding>, Error> {
-    contracts::compile(idl, rust)
+    contracts::compile(idl, rust, &[])
+}
+
+/// Compile with tinybrowser's reflected-enumerated metadata table.
+///
+/// # Errors
+/// Same as [`compile_contracts`].
+pub fn compile_contracts_with_reflection(
+    idl: &[Source<'_>],
+    rust: &[Source<'_>],
+    reflected: &[ReflectedEnum],
+) -> Result<Vec<Binding>, Error> {
+    contracts::compile(idl, rust, reflected)
 }
 
 /// JavaScript algorithms with generated interface installation contracts.

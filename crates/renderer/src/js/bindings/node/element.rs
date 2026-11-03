@@ -14,7 +14,6 @@ use super::super::{
 };
 use super::forms::fixup_controls_on_insert;
 use crate::dom::adoption::materialize_children;
-use crate::js::bindings::enumerated::{Defaults, Dir, EnterKeyHint, InputMode, reflect_enumerated};
 use std::collections::HashSet;
 
 use blitz_dom::NodeData;
@@ -495,23 +494,6 @@ impl<'js> html_element_generated::HTMLElement<'js> for JsNode {
     // https://html.spec.whatwg.org/multipage/dom.html#dom-dataset
     fn get_dataset(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         self.dataset(ctx)
-    }
-
-    // The `dir` content attribute is enumerated (`ltr`, `rtl`, `auto`,
-    // ASCII case-insensitive); anything else, including absence, reads
-    // as the empty string
-    // (<https://html.spec.whatwg.org/multipage/dom.html#the-dir-attribute>).
-    fn get_dir(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        let raw = content_attr(ctx, self.handle.0, "dir");
-        rquickjs::String::from_str(
-            ctx.clone(),
-            reflect_enumerated::<Dir>(raw.as_deref(), Defaults::NONE),
-        )
-    }
-
-    // https://html.spec.whatwg.org/multipage/dom.html#the-dir-attribute
-    fn set_dir(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
-        set_attribute_sync(ctx, self.handle.0, "dir", &value.to_string()?)
     }
 
     // The cryptographic nonce: reading answers the slot, writing sets it
@@ -1259,39 +1241,10 @@ impl<'js> element_css_inline_style_generated::ElementCSSInlineStyle<'js> for JsN
     }
 }
 
-/// `ElementContentEditable` is a spec mixin included by `HTMLElement`: the
-/// enumerated `enterkeyhint`/`inputmode` live here rather than on the
-/// element contract
-/// (<https://html.spec.whatwg.org/multipage/interaction.html#attr-enterkeyhint>).
-impl<'js> element_content_editable_generated::ElementContentEditable<'js> for JsNode {
-    // https://html.spec.whatwg.org/multipage/interaction.html#dom-enterkeyhint
-    fn get_enter_key_hint(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        let value = reflect_enumerated::<EnterKeyHint>(
-            content_attr(ctx, self.handle.0, "enterkeyhint").as_deref(),
-            Defaults::NONE,
-        );
-        rquickjs::String::from_str(ctx.clone(), value)
-    }
-
-    // https://html.spec.whatwg.org/multipage/interaction.html#dom-enterkeyhint
-    fn set_enter_key_hint(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
-        set_attribute_sync(ctx, self.handle.0, "enterkeyhint", &value.to_string()?)
-    }
-
-    // https://html.spec.whatwg.org/multipage/interaction.html#dom-inputmode
-    fn get_input_mode(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        let value = reflect_enumerated::<InputMode>(
-            content_attr(ctx, self.handle.0, "inputmode").as_deref(),
-            Defaults::NONE,
-        );
-        rquickjs::String::from_str(ctx.clone(), value)
-    }
-
-    // https://html.spec.whatwg.org/multipage/interaction.html#dom-inputmode
-    fn set_input_mode(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
-        set_attribute_sync(ctx, self.handle.0, "inputmode", &value.to_string()?)
-    }
-}
+// `ElementContentEditable` is a spec mixin included by `HTMLElement`: the
+// enumerated `enterkeyhint`/`inputmode` are generated from the metadata table
+// rather than written here
+// (<https://html.spec.whatwg.org/multipage/interaction.html#attr-enterkeyhint>).
 
 /// `HTMLHyperlinkElementUtils` is a spec mixin included by `HTMLAnchorElement`
 /// and `HTMLAreaElement`, so the one contract installs on both prototypes
@@ -2829,32 +2782,6 @@ pub(super) fn aria_set(
         Some(value) => set_attribute_sync(ctx, id, name, &value.to_string()?),
         None => remove_attribute_sync(ctx, id, "", name, false),
     }
-}
-
-/// `referrerpolicy` reflection, shared by every element that declares it:
-/// an enumerated attribute defaulting to the empty string
-/// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-referrerpolicy>).
-///
-/// The keywords come from [`net::ReferrerPolicy`], the type that parses the
-/// header and meta forms, so the reflection cannot disagree with them.
-pub(super) fn reflect_referrer_policy<'js>(
-    ctx: &Ctx<'js>,
-    id: NodeId,
-) -> Result<rquickjs::String<'js>> {
-    let value = reflect_enumerated::<net::ReferrerPolicy>(
-        content_attr(ctx, id, "referrerpolicy").as_deref(),
-        Defaults::NONE,
-    );
-    rquickjs::String::from_str(ctx.clone(), value)
-}
-
-pub(super) fn set_referrer_policy(
-    ctx: &Ctx<'_>,
-    id: NodeId,
-    value: &rquickjs::String<'_>,
-) -> Result<()> {
-    // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-referrerpolicy
-    set_attribute_sync(ctx, id, "referrerpolicy", &value.to_string()?)
 }
 
 /// `crossorigin` reflection: absent reads null, the empty string reads

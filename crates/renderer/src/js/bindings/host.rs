@@ -241,6 +241,28 @@ pub(crate) fn reflect_string<'js>(
     rquickjs::String::from_str(ctx.clone(), &value)
 }
 
+/// Read a reflected enumerated attribute: the content attribute mapped
+/// through its keyword set, the missing-value default when the attribute is
+/// absent, or the invalid-value default when it names no keyword
+/// (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#limited-to-only-known-values>).
+#[inline(never)]
+pub(crate) fn reflect_enumerated_attribute<'js, T: crate::js::bindings::enumerated::Enumerated>(
+    ctx: &Ctx<'js>,
+    element: NodeId,
+    name: &str,
+    defaults: crate::js::bindings::enumerated::Defaults<T>,
+) -> Result<rquickjs::String<'js>> {
+    let raw = {
+        let world = super::world(ctx)?;
+        let parsed = world.borrow();
+        parsed.document(element).and_then(|parsed| {
+            crate::dom::tree::attr(&parsed.document.base, element.node, name).map(str::to_owned)
+        })
+    };
+    let value = crate::js::bindings::enumerated::reflect_enumerated(raw.as_deref(), defaults);
+    rquickjs::String::from_str(ctx.clone(), value)
+}
+
 /// Read a reflected `boolean` attribute: presence of the content attribute
 /// (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#reflect>).
 pub(crate) fn reflect_bool(ctx: &Ctx<'_>, element: NodeId, name: &str) -> Result<bool> {

@@ -164,8 +164,18 @@ fn generate_bindings() -> Contracts {
         .iter()
         .map(|(name, text)| webidl_bindgen::Source { name, text })
         .collect();
-    let bindings = webidl_bindgen::compile_contracts(&extracts, &implementations)
-        .unwrap_or_else(|error| panic!("upstream IDL contracts: {error}"));
+    let table_path = root.join("src/js/bindings/reflected-enumerated.txt");
+    println!("cargo:rerun-if-changed={}", table_path.display());
+    let table =
+        fs::read_to_string(&table_path).expect("read the reflected-enumerated metadata table");
+    let reflected = webidl_bindgen::parse_reflected_enumerated(&webidl_bindgen::Source {
+        name: &table_path.display().to_string(),
+        text: &table,
+    })
+    .unwrap_or_else(|error| panic!("reflected-enumerated metadata: {error}"));
+    let bindings =
+        webidl_bindgen::compile_contracts_with_reflection(&extracts, &implementations, &reflected)
+            .unwrap_or_else(|error| panic!("upstream IDL contracts: {error}"));
     for binding in bindings {
         contracts.providers.insert(binding.interface.clone());
         fs::write(

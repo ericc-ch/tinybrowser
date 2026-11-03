@@ -1,5 +1,8 @@
 use quote::ToTokens;
-use webidl_bindgen::{Source, compile_contracts, compile_javascript, validate_sources};
+use webidl_bindgen::{
+    ReflectedEnum, Source, compile_contracts, compile_contracts_with_reflection,
+    compile_javascript, parse_reflected_enumerated, validate_sources,
+};
 
 /// Generated token streams are whitespace-insensitive; assertions can be too.
 fn squash(source: &str) -> String {
@@ -1114,4 +1117,120 @@ fn an_interface_secure_context_gates_the_interface_not_its_members() {
             "missing {fragment}: {source}"
         );
     }
+}
+
+fn reflected(
+    interface: &str,
+    attribute: &str,
+    type_path: &str,
+    content: &str,
+    missing: Option<&str>,
+    invalid: Option<&str>,
+) -> ReflectedEnum {
+    ReflectedEnum {
+        interface: interface.to_owned(),
+        attribute: attribute.to_owned(),
+        content: content.to_owned(),
+        type_path: type_path.to_owned(),
+        missing: missing.map(str::to_owned),
+        invalid: invalid.map(str::to_owned),
+    }
+}
+
+/// A table entry is the only definition of the getter and setter: the trait
+/// carries neither, and the generated dispatch names the keyword type and both
+/// defaults. Exchanging the defaults changes the generated code, so the table
+/// cannot silently swap them.
+#[test]
+fn reflected_enumerated_members_are_generated_from_the_table() {
+    let idl = [Source {
+        name: "fixture.idl",
+        text: "[Exposed=Window] interface Sample { attribute DOMString mood; };",
+    }];
+    let rust = [Source {
+        name: "fixture.rs",
+        text: "impl<'js> sample_generated::Sample<'js> for Payload {}",
+    }];
+    let table = [reflected(
+        "Sample",
+        "mood",
+        "Mood",
+        "mood",
+        Some("Happy"),
+        Some("Sad"),
+    )];
+    let bindings = compile_contracts_with_reflection(&idl, &rust, &table).expect("compile");
+    let source = squash(&bindings[0].rust);
+    assert!(
+        !generated_trait(&bindings[0].rust).contains("get_mood"),
+        "a generated reflected getter is not a trait method"
+    );
+    for fragment in [
+        "reflect_enumerated_attribute::<crate::js::bindings::enumerated::Mood",
+        "\"mood\"",
+        "missing:Some(crate::js::bindings::enumerated::Mood::Happy)",
+        "invalid:Some(crate::js::bindings::enumerated::Mood::Sad)",
+    ] {
+        assert!(
+            source.contains(&squash(fragment)),
+            "missing {fragment}: {source}"
+        );
+    }
+    let swapped = [reflected(
+        "Sample",
+        "mood",
+        "Mood",
+        "mood",
+        Some("Sad"),
+        Some("Happy"),
+    )];
+    let swapped = compile_contracts_with_reflection(&idl, &rust, &swapped).expect("compile");
+    let swapped = squash(&swapped[0].rust);
+    assert!(
+        swapped.contains(&squash(
+            "missing:Some(crate::js::bindings::enumerated::Mood::Sad)"
+        )),
+        "the table's missing default is the one emitted: {swapped}"
+    );
+}
+
+/// A hand-written getter for a table member would compete with the generated
+/// one, so the compiler refuses it instead of letting one silently win.
+#[test]
+fn a_hand_written_getter_for_a_table_member_is_rejected() {
+    let idl = [Source {
+        name: "fixture.idl",
+        text: "[Exposed=Window] interface Sample { attribute DOMString mood; };",
+    }];
+    let rust = [Source {
+        name: "fixture.rs",
+        text: "impl<'js> sample_generated::Sample<'js> for Payload { fn get_mood(&self, ctx: &Ctx<'js>) -> Result<String<'js>> { read(ctx) } }",
+    }];
+    let table = [reflected("Sample", "mood", "Mood", "mood", None, None)];
+    let error = compile_contracts_with_reflection(&idl, &rust, &table)
+        .err()
+        .expect("hand-written getter");
+    assert!(
+        error.to_string().contains("remove the hand-written one"),
+        "{error}"
+    );
+}
+
+/// The table is one line per (interface, attribute); a duplicate is an error
+/// rather than a silent last-one-wins.
+#[test]
+fn the_reflected_table_rejects_a_duplicate_member() {
+    let source = Source {
+        name: "reflected.txt",
+        text: "Sample mood Mood mood - -\nSample mood Mood mood - -\n",
+    };
+    let error = parse_reflected_enumerated(&source)
+        .err()
+        .expect("duplicate entry");
+    assert!(error.to_string().contains("listed twice"), "{error}");
+    let malformed = Source {
+        name: "reflected.txt",
+        text: "Sample mood Mood\n",
+    };
+    assert!(parse_reflected_enumerated(&malformed).is_err());
 }

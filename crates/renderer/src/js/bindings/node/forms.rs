@@ -12,9 +12,7 @@ use rquickjs::{Ctx, Exception, Result, Value};
 
 use crate::dom::insertion::replace_all_journaled;
 use crate::dom::tree::{NodeId, attr, form_owner_of, html_namespace};
-use crate::js::bindings::enumerated::{
-    Autocomplete, Defaults, FormEnctype, FormMethod, reflect_enumerated,
-};
+use crate::js::bindings::enumerated::{Defaults, FormEnctype, FormMethod, reflect_enumerated};
 
 use super::JsNode;
 use super::element::{content_attr, reflect_ulong};
@@ -39,70 +37,9 @@ impl<'js> html_form_element_generated::HTMLFormElement<'js> for JsNode {
         Ok(self.action(ctx.clone())?.into())
     }
 
-    // https://html.spec.whatwg.org/multipage/forms.html#dom-form-method
-    fn get_method(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        let method = reflect_enumerated::<FormMethod>(
-            content_attr(ctx, self.handle.0, "method").as_deref(),
-            Defaults::both(FormMethod::Get),
-        );
-        rquickjs::String::from_str(ctx.clone(), method)
-    }
-
-    // https://html.spec.whatwg.org/multipage/forms.html#dom-form-method
-    fn set_method(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
-        self.set_attribute(
-            ctx.clone(),
-            WebIdlString("method".into()),
-            WebIdlString(value.to_string()?),
-        )
-    }
-
-    // https://html.spec.whatwg.org/multipage/forms.html#dom-form-enctype
-    fn get_enctype(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        let enctype = reflect_enumerated::<FormEnctype>(
-            content_attr(ctx, self.handle.0, "enctype").as_deref(),
-            Defaults::both(FormEnctype::UrlEncoded),
-        );
-        rquickjs::String::from_str(ctx.clone(), enctype)
-    }
-
-    // https://html.spec.whatwg.org/multipage/forms.html#dom-form-enctype
-    fn set_enctype(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
-        self.set_attribute(
-            ctx.clone(),
-            WebIdlString("enctype".into()),
-            WebIdlString(value.to_string()?),
-        )
-    }
-
-    // https://html.spec.whatwg.org/multipage/forms.html#dom-form-encoding
-    fn get_encoding(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        self.get_enctype(ctx)
-    }
-
-    // https://html.spec.whatwg.org/multipage/forms.html#dom-form-encoding
-    fn set_encoding(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
-        self.set_enctype(ctx, value)
-    }
-
     // https://html.spec.whatwg.org/multipage/forms.html#dom-form-reset
     fn reset(&self, ctx: Ctx<'js>) -> Result<()> {
         self.reset_form(ctx)
-    }
-
-    // `autocomplete` is an on/off enumeration defaulting to on
-    // (<https://html.spec.whatwg.org/multipage/forms.html#dom-form-autocomplete>).
-    fn get_autocomplete(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        let value = reflect_enumerated::<Autocomplete>(
-            content_attr(ctx, self.handle.0, "autocomplete").as_deref(),
-            Defaults::both(Autocomplete::On),
-        );
-        rquickjs::String::from_str(ctx.clone(), value)
-    }
-
-    // https://html.spec.whatwg.org/multipage/forms.html#dom-form-autocomplete
-    fn set_autocomplete(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
-        set_attribute_sync(ctx, self.handle.0, "autocomplete", &value.to_string()?)
     }
 }
 

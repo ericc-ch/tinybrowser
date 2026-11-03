@@ -223,6 +223,20 @@ pub(crate) enum GetterMapping {
     ReflectUrl {
         content: String,
     },
+    /// A reflected enumerated attribute. The getter reads the content
+    /// attribute and maps it through one `Enumerated` type, answering the
+    /// canonical keyword, the missing-value default, or the invalid-value
+    /// default. The metadata table is the one place the three values are
+    /// written.
+    ReflectEnumerated {
+        content: String,
+        /// The `Enumerated` type the keyword set belongs to.
+        type_path: syn::Path,
+        /// The missing-value default, when the spec defines one.
+        missing: Option<syn::Path>,
+        /// The invalid-value default, when the spec defines one.
+        invalid: Option<syn::Path>,
+    },
 }
 
 #[derive(Debug)]

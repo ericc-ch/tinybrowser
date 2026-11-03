@@ -39,11 +39,11 @@ use crate::js::world::{DocumentStreamCommand, NodeReference, SameObject};
 
 use crate::ReadyState;
 
-use crate::js::bindings::enumerated::{Defaults, Dir, Loading, reflect_enumerated};
+use crate::js::bindings::enumerated::{Defaults, Dir, reflect_enumerated};
 
 use super::JsNode;
 use super::core::{adopt_node, document_value};
-use super::element::{content_attr, is_element_data, reflect_referrer_policy, set_referrer_policy};
+use super::element::{content_attr, is_element_data};
 
 include!(concat!(env!("OUT_DIR"), "/Document.rs"));
 include!(concat!(env!("OUT_DIR"), "/DocumentFragment.rs"));
@@ -609,31 +609,6 @@ impl<'js> htmli_frame_element_generated::HTMLIFrameElement<'js> for JsNode {
     // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#dom-iframe-contentwindow
     fn get_content_window(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         self.content_window(ctx.clone())
-    }
-
-    // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-referrerpolicy
-    fn get_referrer_policy(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        reflect_referrer_policy(ctx, self.handle.0)
-    }
-
-    // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-referrerpolicy
-    fn set_referrer_policy(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
-        set_referrer_policy(ctx, self.handle.0, &value)
-    }
-
-    // `loading` defaults to `eager`
-    // (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-loading>).
-    fn get_loading(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        let value = reflect_enumerated::<Loading>(
-            content_attr(ctx, self.handle.0, "loading").as_deref(),
-            Defaults::both(Loading::Eager),
-        );
-        rquickjs::String::from_str(ctx.clone(), value)
-    }
-
-    // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-loading
-    fn set_loading(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
-        set_attribute_sync(ctx, self.handle.0, "loading", &value.to_string()?)
     }
 
     // `srcdoc` answers the content attribute

@@ -9,10 +9,9 @@ use crate::dom::tree::{NodeId, attr, html_namespace, is_connected};
 
 use super::JsNode;
 use super::element::{
-    content_attr, reflect_cross_origin, reflect_double, reflect_limited_double,
-    reflect_referrer_policy, reflect_ulong, set_cross_origin, set_referrer_policy,
+    content_attr, reflect_cross_origin, reflect_double, reflect_limited_double, reflect_ulong,
+    set_cross_origin,
 };
-use crate::js::bindings::enumerated::{Decoding, Defaults, Loading, Preload, reflect_enumerated};
 
 include!(concat!(env!("OUT_DIR"), "/HTMLMediaElement.rs"));
 include!(concat!(env!("OUT_DIR"), "/HTMLVideoElement.rs"));
@@ -84,34 +83,6 @@ impl<'js> html_media_element_generated::HTMLMediaElement<'js> for JsNode {
     // https://html.spec.whatwg.org/multipage/media.html#dom-media-crossorigin
     fn set_cross_origin(&self, ctx: &Ctx<'js>, value: Option<rquickjs::String<'js>>) -> Result<()> {
         set_cross_origin(ctx, self.handle.0, value)
-    }
-
-    // https://html.spec.whatwg.org/multipage/media.html#dom-media-preload
-    fn get_preload(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        let value = reflect_enumerated::<Preload>(
-            content_attr(ctx, self.handle.0, "preload").as_deref(),
-            Defaults::both(Preload::Auto),
-        );
-        rquickjs::String::from_str(ctx.clone(), value)
-    }
-
-    // https://html.spec.whatwg.org/multipage/media.html#dom-media-preload
-    fn set_preload(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
-        set_attribute_sync(ctx, self.handle.0, "preload", &value.to_string()?)
-    }
-
-    // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-loading
-    fn get_loading(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        let value = reflect_enumerated::<Loading>(
-            content_attr(ctx, self.handle.0, "loading").as_deref(),
-            Defaults::both(Loading::Eager),
-        );
-        rquickjs::String::from_str(ctx.clone(), value)
-    }
-
-    // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-loading
-    fn set_loading(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
-        set_attribute_sync(ctx, self.handle.0, "loading", &value.to_string()?)
     }
 }
 
@@ -289,46 +260,6 @@ impl<'js> html_image_element_generated::HTMLImageElement<'js> for JsNode {
     // https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-crossorigin
     fn set_cross_origin(&self, ctx: &Ctx<'js>, value: Option<rquickjs::String<'js>>) -> Result<()> {
         set_cross_origin(ctx, self.handle.0, value)
-    }
-
-    // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-referrerpolicy
-    fn get_referrer_policy(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        reflect_referrer_policy(ctx, self.handle.0)
-    }
-
-    // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-referrerpolicy
-    fn set_referrer_policy(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
-        set_referrer_policy(ctx, self.handle.0, &value)
-    }
-
-    // `decoding` defaults to `auto`
-    // (<https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-decoding>).
-    fn get_decoding(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        let value = reflect_enumerated::<Decoding>(
-            content_attr(ctx, self.handle.0, "decoding").as_deref(),
-            Defaults::both(Decoding::Auto),
-        );
-        rquickjs::String::from_str(ctx.clone(), value)
-    }
-
-    // https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-decoding
-    fn set_decoding(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
-        set_attribute_sync(ctx, self.handle.0, "decoding", &value.to_string()?)
-    }
-
-    // `loading` defaults to `eager`
-    // (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-loading>).
-    fn get_loading(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        let value = reflect_enumerated::<Loading>(
-            content_attr(ctx, self.handle.0, "loading").as_deref(),
-            Defaults::both(Loading::Eager),
-        );
-        rquickjs::String::from_str(ctx.clone(), value)
-    }
-
-    // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-loading
-    fn set_loading(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
-        set_attribute_sync(ctx, self.handle.0, "loading", &value.to_string()?)
     }
 
     // Obsolete `hspace`/`vspace` default to zero

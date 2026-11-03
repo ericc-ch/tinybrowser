@@ -798,6 +798,15 @@ fn method_call(interface: &Interface, method: &syn::Ident, arguments: &TokenStre
     }
 }
 
+/// The `Option<T>` value for a generated default: `None` or `Some(path)`.
+fn optional_default(path: Option<&syn::Path>) -> TokenStream {
+    if let Some(path) = path {
+        quote! { Some(#path) }
+    } else {
+        quote! { None }
+    }
+}
+
 fn getter_dispatch(getter: &Attribute, interface: &Interface) -> TokenStream {
     let method = &getter.rust;
     // Operation dispatch always hands over an owned `Ctx`; attributes borrow it.
@@ -827,6 +836,29 @@ fn getter_dispatch(getter: &Attribute, interface: &Interface) -> TokenStream {
                 let result: crate::dom_string::DomString =
                     host::reflect_url_string(&ctx, receiver.node_id(), #content)?;
                 host::ret_usv(&result, &ctx)
+            }
+        }
+        GetterMapping::ReflectEnumerated {
+            content,
+            type_path,
+            missing,
+            invalid,
+        } => {
+            let missing = optional_default(missing.as_ref());
+            let invalid = optional_default(invalid.as_ref());
+            quote! {
+                host::ret(
+                    host::reflect_enumerated_attribute::<#type_path>(
+                        &ctx,
+                        receiver.node_id(),
+                        #content,
+                        crate::js::bindings::enumerated::Defaults {
+                            missing: #missing,
+                            invalid: #invalid,
+                        },
+                    )?,
+                    &ctx,
+                )
             }
         }
         GetterMapping::Method => match getter.return_type {
