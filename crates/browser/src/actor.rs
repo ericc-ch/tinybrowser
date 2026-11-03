@@ -1036,6 +1036,10 @@ impl Tab {
     fn drop_renderer(&mut self) {
         self.site = None;
         self.events_rx = None;
+        // Frame ids are minted by the renderer, so a replacement restarts
+        // them. Keeping the old records would let a reused id inherit another
+        // document's sandbox flags.
+        self.tabs.clear_frames(self.id);
         // Dropping the assignment is the release: it removes the registry
         // record, notifies the renderer, and lets the process manager
         // evaluate shutdown.
@@ -1152,11 +1156,18 @@ impl Tab {
             return false;
         };
         let site = Site::for_url(&url).unwrap_or_else(|| Site::opaque(self.id));
+        // A `data:` document has no response headers, so it imposes no CSP
+        // `sandbox`: reset the main frame to the tab popup set before the
+        // target-name reset reads it.
+        let previous_csp = self.tabs.main_csp(self.id);
+        self.tabs
+            .reset_main_sandbox(self.id, renderer::SandboxFlags::empty());
         self.sync_outgoing_name();
         let state = self.commit_state(&url);
         let commit = self.history_commit(&url, &state);
         let mut history = self.history.clone();
         if !history.commit(commit) {
+            self.tabs.reset_main_sandbox(self.id, previous_csp);
             self.navigation_failed = true;
             return false;
         }
@@ -1173,6 +1184,7 @@ impl Tab {
         };
         if let Err(error) = self.mount(&site, mount).await {
             self.abort_commit(previous_names);
+            self.tabs.reset_main_sandbox(self.id, previous_csp);
             logging::error!(
                 target: "browser::tab",
                 "data navigation mount failed for {}: {error}",
@@ -1239,7 +1251,15 @@ impl Tab {
         if self.auxiliary_with_opener() || url.scheme() == "about" {
             return true;
         }
-        !self.popup_sandbox.origin_is_opaque() && url.origin() == self.document_origin
+        // A CSP `sandbox` directive can make the committed document's origin
+        // opaque just like an `iframe` attribute, so the decision reads the
+        // browser's main-frame record rather than only the tab popup set
+        // (<https://w3c.github.io/webappsec-csp/#sandbox>).
+        let active = self
+            .tabs
+            .frame_sandbox(self.id, renderer::FrameId::MAIN)
+            .unwrap_or(self.popup_sandbox);
+        !active.origin_is_opaque() && url.origin() == self.document_origin
     }
 
     /// Records that the tab's active document is now at `url`, which is what
@@ -1375,11 +1395,19 @@ impl Tab {
     async fn commit_navigation(&mut self, outcome: NavOutcome) -> bool {
         let final_url = outcome.head.url.clone();
         let site = Site::for_url(&final_url).unwrap_or_else(|| Site::opaque(self.id));
+        // The response head is the browser's own copy, so its enforced CSP
+        // `sandbox` directives narrow the main frame before the target-name
+        // reset reads the set
+        // (<https://w3c.github.io/webappsec-csp/#sandbox>).
+        let csp = outcome.head.source.policy().sandbox;
+        let previous_csp = self.tabs.main_csp(self.id);
+        self.tabs.reset_main_sandbox(self.id, csp);
         self.sync_outgoing_name();
         let state = self.commit_state(&final_url);
         let commit = self.history_commit(&final_url, &state);
         let mut history = self.history.clone();
         if !history.commit(commit) {
+            self.tabs.reset_main_sandbox(self.id, previous_csp);
             logging::error!(
                 target: "browser::tab",
                 "navigation rejected by history for {}",
@@ -1408,6 +1436,7 @@ impl Tab {
             .await
         {
             self.abort_commit(previous_names);
+            self.tabs.reset_main_sandbox(self.id, previous_csp);
             logging::error!(
                 target: "browser::tab",
                 "navigation mount failed for {}: {error}",

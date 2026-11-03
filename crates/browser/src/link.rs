@@ -644,6 +644,8 @@ async fn route_service_call(
                 );
             let dials = context.dials.clone();
             let registry = context.registry.clone();
+            let tabs = context.tabs.clone();
+            let tab_id = assignment.tab;
             tokio::spawn(async move {
                 let mut outcome = race_dial(
                     &worker_network,
@@ -681,6 +683,15 @@ async fn route_service_call(
                     && registry.resolve(assignment_id).is_none()
                 {
                     worker_network.cancel_stream(assignment_id, *stream);
+                }
+                // A frame navigation carries the response head the browser
+                // already sees, so parse the enforced CSP `sandbox`
+                // directives here and narrow the frame's own record before the
+                // renderer can commit the document and run its scripts
+                // (<https://w3c.github.io/webappsec-csp/#sandbox>).
+                if let (Ok(head), Some(frame)) = (&outcome, request.frame) {
+                    let csp = renderer::SandboxFlags::from_csp_headers(&head.headers);
+                    tabs.commit_frame_sandbox(tab_id, frame, csp);
                 }
                 dials
                     .lock()
@@ -798,9 +809,8 @@ fn window_initiator(
         origin: claim,
         referrer,
         referrer_policy,
-        // The caller already applied these to the browser's sandbox state;
-        // the initiator does not carry them.
-        sandbox: _,
+        // The browser checks the calling frame against its own per-frame
+        // sandbox record; the initiator does not carry that state.
         frame: _,
     } = source;
     // The calling document's origin must belong to this renderer's site lock;
@@ -870,14 +880,14 @@ impl WindowRouter<'_> {
         {
             return Err(RendererViolation);
         }
-        // The browser's copy of the tab's set is the baseline, and the calling
-        // document's set can only add what the browser cannot see (an `iframe
-        // sandbox` attribute, CSP `sandbox`). A renderer that claims its
-        // sandboxed document is not sandboxed therefore cannot widen the set,
-        // and an honest renderer never reaches this branch because it refused
-        // the call already
+        // The browser's per-frame record is the whole check. A renderer
+        // reports an `iframe`'s `sandbox` attribute once, at creation, and the
+        // browser unions it with its own parent set; a call can therefore only
+        // be refused, never widened, by anything the renderer says now
         // (<https://html.spec.whatwg.org/multipage/browsers.html#sandboxed-auxiliary-navigation-browsing-context-flag>).
-        let active = context.tabs.sandbox(assignment.tab).union(source.sandbox);
+        let Some(active) = context.tabs.frame_sandbox(assignment.tab, source.frame) else {
+            return Err(RendererViolation);
+        };
         if active.blocks_auxiliary_navigation() {
             logging::debug!(
                 target: "browser::tabs",
@@ -942,10 +952,12 @@ impl WindowRouter<'_> {
         if let Some(url) = url.and_then(navigable_popup_url) {
             // A sandboxed document may navigate itself, the contexts nested
             // inside it, and the auxiliary contexts it opened — and only those.
-            // The set is the browser's copy unioned with the calling
-            // document's claim, so the claim can only add restrictions
+            // The set is the browser's per-frame record, never a claim the
+            // renderer makes now
             // (<https://html.spec.whatwg.org/multipage/browsers.html#sandboxed-navigation-browsing-context-flag>).
-            let active = context.tabs.sandbox(assignment.tab).union(source.sandbox);
+            let Some(active) = context.tabs.frame_sandbox(assignment.tab, source.frame) else {
+                return Err(RendererViolation);
+            };
             // "The auxiliary contexts it created" is a frame relationship: the
             // tab that hosts the sandboxed document is not the document, so a
             // frame cannot inherit its parent document's permission.
@@ -1022,6 +1034,17 @@ async fn route_window_call(
             .navigate(name, url, opener, source)
             .await?;
         }
+        BrowsingContextCall::FrameCreated {
+            frame,
+            parent,
+            kind,
+            sandbox,
+        } => {
+            route_frame_created(context, assignment, id, frame, parent, kind, sandbox).await?;
+        }
+        BrowsingContextCall::FrameDestroyed { frame } => {
+            route_frame_destroyed(context, assignment, id, frame).await?;
+        }
         BrowsingContextCall::WindowClose { window } => {
             let target = TabId::new(window.get());
             // A page may close itself or a tab it opened; anything else is a
@@ -1081,6 +1104,40 @@ async fn route_window_call(
         }
     }
     Ok(())
+}
+
+/// Registers a frame the renderer created. The call arrives on the
+/// synchronous service lane before the frame's document can run script, so a
+/// `window.open` from the new frame always finds its record.
+async fn route_frame_created(
+    context: &ServiceContext,
+    assignment: &Assignment,
+    id: RequestId,
+    frame: FrameId,
+    parent: FrameId,
+    kind: renderer::FrameKind,
+    sandbox: renderer::SandboxFlags,
+) -> Result<(), RendererViolation> {
+    if !context
+        .tabs
+        .register_frame(assignment.tab, frame, parent, kind, sandbox)
+    {
+        return Err(RendererViolation);
+    }
+    send_reply(&context.responder, id, ServiceReply::Unit).await
+}
+
+/// Drops a frame the renderer tore down.
+async fn route_frame_destroyed(
+    context: &ServiceContext,
+    assignment: &Assignment,
+    id: RequestId,
+    frame: FrameId,
+) -> Result<(), RendererViolation> {
+    if !context.tabs.remove_frame(assignment.tab, frame) {
+        return Err(RendererViolation);
+    }
+    send_reply(&context.responder, id, ServiceReply::Unit).await
 }
 
 struct StorageRouter<'a> {

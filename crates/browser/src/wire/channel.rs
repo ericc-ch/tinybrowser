@@ -52,8 +52,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// name lookup and navigation into one call. Version 21 separates a
 /// `window.name` assignment, which writes the active history entry, from the
 /// cross-origin reset. Version 22 adds the error for a history entry a
-/// traversal names but the tab no longer holds.
-pub const PROTOCOL_VERSION: u8 = 22;
+/// traversal names but the tab no longer holds. Version 23 reports frame
+/// creation and teardown so the browser owns every frame's sandbox flags, and
+/// drops the renderer-supplied sandbox set from a navigation source.
+pub const PROTOCOL_VERSION: u8 = 23;
 
 /// Fixed frame header size in bytes.
 pub const HEADER_BYTES: usize = 16;
@@ -852,9 +854,8 @@ mod tests {
         );
     }
 
-    /// Every field of a `window.open` call crosses the wire: the source
-    /// (including its sandbox set), the target, the URL (present or absent),
-    /// and the opener policy
+    /// Every field of a `window.open` call crosses the wire: the source, the
+    /// target, the URL (present or absent), and the opener policy
     /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#window-open-steps>).
     #[test]
     fn a_window_open_caller_survives_the_wire() {
@@ -862,12 +863,7 @@ mod tests {
             origin: renderer::SerializedOrigin::Opaque,
             referrer: url::Url::parse("https://a.test/page").expect("referrer"),
             referrer_policy: net::ReferrerPolicy::UnsafeUrl,
-            sandbox: renderer::SandboxFlags::empty(),
-            frame: renderer::FrameId::MAIN,
-        };
-        let sandboxed = renderer::NavigationSource {
-            sandbox: renderer::SandboxFlags::parse(Some("allow-scripts allow-popups")),
-            ..source.clone()
+            frame: renderer::FrameId::new(7),
         };
         let cases = [
             (
@@ -876,13 +872,21 @@ mod tests {
                     renderer::ContextName::parse("peer").expect("a test name"),
                 ),
                 renderer::OpenerPolicy::NoOpener,
-                source,
+                source.clone(),
             ),
             (
                 None,
                 renderer::TargetName::Blank,
                 renderer::OpenerPolicy::Keep,
-                sandboxed,
+                renderer::NavigationSource {
+                    origin: renderer::SerializedOrigin::Tuple(
+                        url::Url::parse("https://a.test/page")
+                            .expect("origin")
+                            .origin(),
+                    ),
+                    frame: renderer::FrameId::MAIN,
+                    ..source
+                },
             ),
         ];
         for (url, target, opener, source) in cases {

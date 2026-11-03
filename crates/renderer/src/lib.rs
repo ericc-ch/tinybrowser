@@ -42,7 +42,7 @@ pub use js::{Stop, TURN_SCRIPT_BUDGET};
 pub use protocol::{
     BodyDelivery, BrowserEvent, BrowserServices, BrowsingContextHost, ContextName, CorsMode,
     CorsRequest, DialCancellation, DialCompletion, DialFailure, DialKind, DialOutcome, DialRequest,
-    DomBoxModel, DomNode, DomRemoteNode, DomReply, DomRequest, FrameId, HistoryHandling,
+    DomBoxModel, DomNode, DomRemoteNode, DomReply, DomRequest, FrameId, FrameKind, HistoryHandling,
     HistorySnapshot, HttpHead, MAX_RESPONSE_BODY_BYTES, MessagingHost, Mount, NameChange,
     NavigationSource, NetworkHost, OpenerPolicy, PolicyContainer, PostedMessage, ReferrerRequest,
     RendererEvent, RequestCache, RequestPolicy, ResourceLimit, ResponseBody, ResponseHead,

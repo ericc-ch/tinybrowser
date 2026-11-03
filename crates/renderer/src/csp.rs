@@ -385,6 +385,25 @@ impl List {
         })
     }
 
+    /// The sandbox flags the enforced policies impose: the union of every
+    /// `sandbox` directive, which is how multiple policies combine. A
+    /// directive with no value is a bare `sandbox` and sets every flag
+    /// (<https://w3c.github.io/webappsec-csp/#sandbox>).
+    #[must_use]
+    pub(crate) fn sandbox_flags(&self) -> crate::protocol::SandboxFlags {
+        let mut flags = crate::protocol::SandboxFlags::empty();
+        for policy in self
+            .policies
+            .iter()
+            .filter(|policy| policy.disposition == Disposition::Enforce)
+        {
+            if let Some((_, value)) = policy.directives.iter().find(|(name, _)| name == "sandbox") {
+                flags = flags.union(crate::protocol::SandboxFlags::parse(Some(&value.join(" "))));
+            }
+        }
+        flags
+    }
+
     /// Header policies from a navigation response. Absent headers yield an
     /// empty list, which allows every request.
     #[must_use]

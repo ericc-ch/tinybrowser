@@ -477,6 +477,29 @@ impl BrowsingContextHost for HostServices {
         }
     }
 
+    fn frame_created(
+        &self,
+        frame: FrameId,
+        parent: FrameId,
+        kind: renderer::FrameKind,
+        sandbox: renderer::SandboxFlags,
+    ) {
+        let _result = self.call(ServiceCall::BrowsingContext(
+            BrowsingContextCall::FrameCreated {
+                frame,
+                parent,
+                kind,
+                sandbox,
+            },
+        ));
+    }
+
+    fn frame_destroyed(&self, frame: FrameId) {
+        let _result = self.call(ServiceCall::BrowsingContext(
+            BrowsingContextCall::FrameDestroyed { frame },
+        ));
+    }
+
     fn set_window_name(&self, change: renderer::NameChange) {
         let _result = self.call(ServiceCall::BrowsingContext(
             BrowsingContextCall::WindowName { change },

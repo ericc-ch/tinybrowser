@@ -665,6 +665,11 @@ pub(crate) struct Document {
     /// from the response being parsed, parsed once
     /// (<https://w3c.github.io/webappsec-csp/#parse-response-csp>).
     response_policy: crate::csp::List,
+    /// The sandbox flags the response's enforced CSP `sandbox` directives
+    /// impose, kept beside the policy so a local-scheme document inherits the
+    /// same container
+    /// (<https://w3c.github.io/webappsec-csp/#sandbox>).
+    response_sandbox: crate::protocol::SandboxFlags,
     /// `Referrer-Policy` from the response being parsed, applied after the
     /// parser installs the new document (the state reset clears the realm).
     response_referrer_policy: Option<net::ReferrerPolicy>,
@@ -900,6 +905,7 @@ impl Document {
             character_set: "UTF-8",
             response_content_type: None,
             response_policy: crate::csp::List::default(),
+            response_sandbox: crate::protocol::SandboxFlags::default(),
             response_referrer_policy: None,
             response_secure_context: false,
             creator_secure_context: None,
@@ -1934,6 +1940,7 @@ impl Document {
         self.parser_owner = owner;
         self.response_content_type = None;
         self.response_policy = crate::csp::List::default();
+        self.response_sandbox = crate::protocol::SandboxFlags::default();
         self.response_referrer_policy = None;
         self.response_secure_context = false;
         self.csp_from_response = false;
@@ -1971,6 +1978,18 @@ impl Document {
         if let Some((width, height)) = head.viewport {
             self.viewport_size = (width, height);
         }
+        // The origin variant decides both: an HTTP response carries the
+        // policy its headers establish, and a local-scheme response carries
+        // only what it inherited, so no field can override the other.
+        let policy = head.source.policy();
+        // A CSP `sandbox` directive is part of the flags the document runs
+        // under, and its origin flag decides the origin this commit captures:
+        // union it before the URL is installed
+        // (<https://w3c.github.io/webappsec-csp/#sandbox>).
+        if !policy.sandbox.is_empty() {
+            let mut world = self.world.borrow_mut();
+            world.sandbox = world.sandbox.union(policy.sandbox);
+        }
         self.install_response_url(head, origin);
         let mut world = self.world.borrow_mut();
         // A response document resolves against its own URL; any inherited
@@ -1997,11 +2016,8 @@ impl Document {
         // the exact bytes the server sent before the extraction runs
         // (<https://mimesniff.spec.whatwg.org/#supplied-mime-type-detection-algorithm>).
         self.response_content_type.clone_from(&head.content_type);
-        // The origin variant decides both: an HTTP response carries the
-        // policy its headers establish, and a local-scheme response carries
-        // only what it inherited, so no field can override the other.
-        let policy = head.source.policy();
         self.response_policy = policy.csp.clone();
+        self.response_sandbox = policy.sandbox;
         self.response_referrer_policy = policy.referrer_policy;
         // A local-scheme document clones its creator's whole container, and its
         // creator's secure-context bit is the one it inherits. A document with no
@@ -2495,6 +2511,7 @@ impl Document {
         if self.csp_from_response {
             self.world.borrow_mut().policy = PolicyContainer {
                 csp: self.response_policy.clone(),
+                sandbox: self.response_sandbox,
                 referrer_policy: self.response_referrer_policy,
                 secure_context: self.response_secure_context,
             };

@@ -82,6 +82,22 @@ impl FrameId {
     }
 }
 
+/// How a renderer-created frame relates to the frame that created it.
+///
+/// The browser unions a child's reported sandbox set with its parent's, but an
+/// auxiliary context inherits exactly the popup set, which may be empty after
+/// `allow-popups-to-escape-sandbox`. The kind is what lets the browser choose
+/// the rule instead of trusting a renderer to have applied it
+/// (<https://html.spec.whatwg.org/multipage/browsers.html#determining-the-creation-sandboxing-flags>,
+/// <https://html.spec.whatwg.org/multipage/browsers.html#popup-sandboxing-flag-set>).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FrameKind {
+    /// A nested browsing context created by an `iframe`.
+    Child,
+    /// An auxiliary top-level context the renderer hosts.
+    Auxiliary,
+}
+
 /// Browser-process identity of one top-level browsing context, as a renderer
 /// holds it through a `WindowProxy`.
 ///
@@ -558,6 +574,20 @@ impl SandboxFlags {
         flags
     }
 
+    /// The sandbox flags the enforced `Content-Security-Policy` response
+    /// headers impose. The browser derives its own copy from the same raw
+    /// headers it sees, so a renderer cannot under-report a CSP `sandbox`
+    /// directive
+    /// (<https://w3c.github.io/webappsec-csp/#sandbox>).
+    #[must_use]
+    pub fn from_csp_headers(headers: &[(String, String)]) -> Self {
+        crate::csp::List::from_headers(
+            net::combined_header_in(headers, "content-security-policy").as_deref(),
+            None,
+        )
+        .sandbox_flags()
+    }
+
     /// Whether `flag` is set.
     pub(crate) fn contains(self, flag: SandboxFlag) -> bool {
         self.0 & flag.bit() != 0
@@ -691,6 +721,11 @@ pub struct Mount {
 pub struct PolicyContainer {
     /// The content security policies that apply.
     pub csp: crate::csp::List,
+    /// The sandbox flags an enforced CSP `sandbox` directive imposes. The
+    /// directive is part of the policy container, so a local-scheme document
+    /// inherits it exactly like the rest of the container
+    /// (<https://w3c.github.io/webappsec-csp/#sandbox>).
+    pub sandbox: SandboxFlags,
     /// The document's referrer policy, when it has one.
     pub referrer_policy: Option<net::ReferrerPolicy>,
     /// Whether the document's environment is a secure context
@@ -798,6 +833,7 @@ impl ResponseSource {
         // `'static` from a temporary.
         static EMPTY: PolicyContainer = PolicyContainer {
             csp: crate::csp::List::empty(),
+            sandbox: SandboxFlags::empty(),
             referrer_policy: None,
             secure_context: false,
         };
@@ -865,26 +901,34 @@ impl ResponseHead {
             init_scripts: Vec::new(),
             source: ResponseSource::Http(HttpHead {
                 status,
-                policy: PolicyContainer {
-                    csp: crate::csp::List::from_headers(
+                policy: {
+                    let csp = crate::csp::List::from_headers(
                         net::combined_header_in(headers, "content-security-policy").as_deref(),
                         net::combined_header_in(headers, "content-security-policy-report-only")
                             .as_deref(),
-                    ),
-                    // The policy parser needs the field values one by one:
-                    // extraction fails as a whole when one value is malformed,
-                    // which joining with ", " would hide
-                    // (<https://w3c.github.io/webappsec-referrer-policy/#parse-referrer-policy-from-header>).
-                    referrer_policy: net::ReferrerPolicy::from_header(
-                        headers
-                            .iter()
-                            .filter(|(name, _)| name.eq_ignore_ascii_case("referrer-policy"))
-                            .map(|(_, value)| value.as_str()),
-                    ),
-                    // Only the environment knows its creator, so the renderer
-                    // computes the bit when it installs this head
-                    // (<https://html.spec.whatwg.org/multipage/webappapis.html#secure-contexts>).
-                    secure_context: false,
+                    );
+                    PolicyContainer {
+                        // The `sandbox` directive is part of the same policy
+                        // list, so its flags derive from the one parsed header
+                        // set
+                        // (<https://w3c.github.io/webappsec-csp/#sandbox>).
+                        sandbox: csp.sandbox_flags(),
+                        csp,
+                        // The policy parser needs the field values one by one:
+                        // extraction fails as a whole when one value is malformed,
+                        // which joining with ", " would hide
+                        // (<https://w3c.github.io/webappsec-referrer-policy/#parse-referrer-policy-from-header>).
+                        referrer_policy: net::ReferrerPolicy::from_header(
+                            headers
+                                .iter()
+                                .filter(|(name, _)| name.eq_ignore_ascii_case("referrer-policy"))
+                                .map(|(_, value)| value.as_str()),
+                        ),
+                        // Only the environment knows its creator, so the renderer
+                        // computes the bit when it installs this head
+                        // (<https://html.spec.whatwg.org/multipage/webappapis.html#secure-contexts>).
+                        secure_context: false,
+                    }
                 },
                 reporting_endpoints: net::combined_header_in(headers, "reporting-endpoints"),
                 refresh: headers.iter().find_map(|(name, value)| {
@@ -1244,6 +1288,11 @@ pub struct DialRequest {
     pub policy: RequestPolicy,
     /// Absolute request URL.
     pub url: Url,
+    /// The frame this request navigates, when it is a frame load. The browser
+    /// uses it to attribute the response's enforced CSP `sandbox` directives
+    /// to the frame whose script may later call `window.open`
+    /// (<https://w3c.github.io/webappsec-csp/#sandbox>).
+    pub frame: Option<FrameId>,
     /// The origin the request runs under: the calling document's serialized
     /// origin, which the browser authorizes against the renderer's site lock
     /// before it becomes the request's `Origin`, `Sec-Fetch-*` source, and
@@ -1308,6 +1357,7 @@ impl DialRequest {
         Self {
             policy,
             url: url.clone(),
+            frame: None,
             initiator: SerializedOrigin::from(initiator),
             delivery: BodyDelivery::Buffer,
             method: net::Method::GET,
@@ -2003,13 +2053,8 @@ pub struct NavigationSource {
     pub referrer: Url,
     /// The concrete referrer policy the calling document determined.
     pub referrer_policy: net::ReferrerPolicy,
-    /// The calling document's active sandboxing flag set. A renderer sees flags
-    /// the browser does not (an `iframe sandbox` attribute, CSP `sandbox`), so
-    /// the browser unions this into its own copy of the tab's set and can only
-    /// become stricter, never looser
-    /// (<https://html.spec.whatwg.org/multipage/browsers.html#sandboxing>).
-    pub sandbox: SandboxFlags,
-    /// The calling frame. A sandboxed document may navigate the auxiliary
+    /// The calling frame. The browser checks its own per-frame sandbox record
+    /// for this frame, and a sandboxed document may navigate the auxiliary
     /// contexts it created, which is a relationship between frames: the tab
     /// that hosts the frame is not the document
     /// (<https://html.spec.whatwg.org/multipage/browsers.html#sandboxed-navigation-browsing-context-flag>).
@@ -2039,6 +2084,26 @@ pub trait BrowsingContextHost: Send + Sync + 'static {
         opener: OpenerPolicy,
         source: &NavigationSource,
     ) -> Option<WindowId>;
+
+    /// Reports a frame the renderer created, before its document can run
+    /// script. The browser records the frame's active sandboxing flag set and
+    /// checks later calls against it
+    /// (<https://html.spec.whatwg.org/multipage/browsers.html#determining-the-creation-sandboxing-flags>).
+    ///
+    /// The default is a no-op for a carrier with no separate browser process:
+    /// it has no trust boundary for the report to defend.
+    fn frame_created(
+        &self,
+        _frame: FrameId,
+        _parent: FrameId,
+        _kind: crate::FrameKind,
+        _sandbox: SandboxFlags,
+    ) {
+    }
+
+    /// Reports a frame the renderer tore down. The default is a no-op, like
+    /// [`Self::frame_created`].
+    fn frame_destroyed(&self, _frame: FrameId) {}
 
     /// Navigates the browser tab this tab's browsing context group holds
     /// under `name`, and answers the context the lookup selected. `None` means

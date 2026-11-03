@@ -69,6 +69,36 @@ pub(crate) struct TabRegistry {
     /// tab inherits, so the renderer's claim can only ever add flags
     /// (<https://html.spec.whatwg.org/multipage/browsers.html#popup-sandboxing-flag-set>).
     sandboxes: Arc<Mutex<HashMap<TabId, renderer::SandboxFlags>>>,
+    /// The active sandboxing flag set of each child frame the browser routes,
+    /// keyed by its tab and the renderer's frame id.
+    ///
+    /// The renderer reports an `iframe`'s `sandbox` attribute once, at frame
+    /// creation, and the browser unions it with its own parent record, so a
+    /// later call cannot widen the set. An auxiliary context's set is derived
+    /// from the opener's own record. Frame ids restart when a tab acquires a
+    /// new renderer, so the map is cleared on replacement.
+    ///
+    /// The main frame is not here: its creation flags are the tab popup set
+    /// and its document adds `main_csp`, which must survive the renderer swap
+    /// that a commit performs.
+    frames: Arc<Mutex<HashMap<(TabId, renderer::FrameId), FrameSandbox>>>,
+    /// The enforced CSP `sandbox` flags of each tab's committed main
+    /// document. Kept apart from `frames` because a commit acquires its
+    /// renderer (and clears the child records) *before* it mounts, so a main
+    /// record inside `frames` would be erased by its own commit.
+    main_csp: Arc<Mutex<HashMap<TabId, renderer::SandboxFlags>>>,
+}
+
+/// One frame's sandbox flags, as the browser owns them.
+#[derive(Clone, Copy, Debug)]
+struct FrameSandbox {
+    /// The flags the frame was created with: the `iframe sandbox` attribute
+    /// unioned with the parent's active set, or the popup set of an auxiliary
+    /// context. A navigation cannot change these.
+    creation: renderer::SandboxFlags,
+    /// The flags the frame's current document runs under: `creation` unioned
+    /// with the enforced CSP `sandbox` directives of its last response.
+    active: renderer::SandboxFlags,
 }
 
 impl TabRegistry {
@@ -79,6 +109,8 @@ impl TabRegistry {
             opener_frames: Arc::new(Mutex::new(HashMap::new())),
             names: Arc::new(Mutex::new(HashMap::new())),
             sandboxes: Arc::new(Mutex::new(HashMap::new())),
+            frames: Arc::new(Mutex::new(HashMap::new())),
+            main_csp: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -297,11 +329,157 @@ impl TabRegistry {
             .unwrap_or_default()
     }
 
+    /// The enforced CSP `sandbox` flags of the tab's committed main document.
+    pub(crate) fn main_csp(&self, id: TabId) -> renderer::SandboxFlags {
+        self.main_csp
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&id)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Records a frame the renderer created, before its document can run
+    /// script.
+    ///
+    /// A child's reported `sandbox` attribute is unioned with the parent's
+    /// active set, so a renderer that under-reports the attribute still cannot
+    /// make the child less restricted than its embedder. An auxiliary context
+    /// takes exactly the opener's popup set: `allow-popups-to-escape-sandbox`
+    /// must be able to empty it, so the browser does not union the parent here
+    /// (<https://html.spec.whatwg.org/multipage/browsers.html#determining-the-creation-sandboxing-flags>,
+    /// <https://html.spec.whatwg.org/multipage/browsers.html#popup-sandboxing-flag-set>).
+    ///
+    /// Returns false when the id is the main frame or already in the table.
+    /// Renderer ids are minted monotonically, so a repeat is a forged or
+    /// confused report: accepting it would let a frame replace a stricter
+    /// record with a looser one.
+    pub(crate) fn register_frame(
+        &self,
+        tab: TabId,
+        frame: renderer::FrameId,
+        parent: renderer::FrameId,
+        kind: renderer::FrameKind,
+        reported: renderer::SandboxFlags,
+    ) -> bool {
+        if frame == renderer::FrameId::MAIN {
+            return false;
+        }
+        let tab_sandbox = self.sandbox(tab);
+        let mut frames = self.frames.lock().unwrap_or_else(PoisonError::into_inner);
+        if frames.contains_key(&(tab, frame)) {
+            return false;
+        }
+        let parent_active = match frames.get(&(tab, parent)) {
+            Some(record) => record.active,
+            None if parent == renderer::FrameId::MAIN => tab_sandbox,
+            // An honest renderer reports a parent before the child that it
+            // embeds; a missing record is a bug or a forgery, and the full set
+            // is the only safe answer.
+            None => renderer::SandboxFlags::parse(Some("")),
+        };
+        let creation = match kind {
+            renderer::FrameKind::Child => parent_active.union(reported),
+            renderer::FrameKind::Auxiliary => parent_active.auxiliary_flags(),
+        };
+        frames.insert(
+            (tab, frame),
+            FrameSandbox {
+                creation,
+                active: creation,
+            },
+        );
+        true
+    }
+
+    /// The active sandboxing flag set of `frame` in `tab`.
+    ///
+    /// The main frame is the tab popup set unioned with the committed
+    /// document's CSP `sandbox`. `None` means the renderer named a child frame
+    /// the browser never saw created, which an honest renderer cannot do.
+    pub(crate) fn frame_sandbox(
+        &self,
+        tab: TabId,
+        frame: renderer::FrameId,
+    ) -> Option<renderer::SandboxFlags> {
+        if frame == renderer::FrameId::MAIN {
+            return Some(self.sandbox(tab).union(self.main_csp(tab)));
+        }
+        self.frames
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&(tab, frame))
+            .map(|record| record.active)
+    }
+
+    /// Replaces the main frame's CSP `sandbox` for a commit. Kept apart from
+    /// the child records because a commit acquires its renderer, which clears
+    /// those records, after this is installed.
+    pub(crate) fn reset_main_sandbox(&self, tab: TabId, csp: renderer::SandboxFlags) {
+        self.main_csp
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(tab, csp);
+    }
+
+    /// Narrows a frame's active set for the response it just navigated to:
+    /// the creation flags unioned with the response's CSP `sandbox`
+    /// directives. A child the browser never saw created is ignored; the
+    /// renderer already applied the flags, and the browser has no creation set
+    /// to rebuild from.
+    pub(crate) fn commit_frame_sandbox(
+        &self,
+        tab: TabId,
+        frame: renderer::FrameId,
+        csp: renderer::SandboxFlags,
+    ) {
+        if frame == renderer::FrameId::MAIN {
+            self.reset_main_sandbox(tab, csp);
+            return;
+        }
+        let mut frames = self.frames.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(record) = frames.get_mut(&(tab, frame)) {
+            record.active = record.creation.union(csp);
+        }
+    }
+
+    /// Drops a child frame the renderer tore down. Returns false only for the
+    /// main frame, whose CSP belongs to the tab and must outlive any one
+    /// document. An unknown child is an idempotent no-op: the renderer can
+    /// report the same teardown from more than one path, and dropping a record
+    /// that is already gone cannot widen anything.
+    pub(crate) fn remove_frame(&self, tab: TabId, frame: renderer::FrameId) -> bool {
+        if frame == renderer::FrameId::MAIN {
+            return false;
+        }
+        self.frames
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&(tab, frame));
+        true
+    }
+
+    /// Drops every child frame record for a tab whose renderer is being
+    /// replaced. Frame ids restart with the new process, so keeping the old
+    /// records would let a reused id inherit another document's flags. The
+    /// main frame's CSP is the commit's own and survives.
+    pub(crate) fn clear_frames(&self, tab: TabId) {
+        self.frames
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|(id, _), _| *id != tab);
+    }
+
     fn remove_sandbox(&self, id: TabId) {
         self.sandboxes
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&id);
+        self.main_csp
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&id);
+        self.clear_frames(id);
     }
 
     /// Queues one `postMessage` delivery on the target tab's mailbox. Returns
@@ -913,5 +1091,114 @@ mod tests {
         assert!(!tabs.sandbox(plain).blocks_navigation());
         tabs.remove_sandbox(sandboxed);
         assert!(!tabs.sandbox(sandboxed).blocks_navigation());
+    }
+
+    /// The browser owns each frame's sandbox set: a child's report can only
+    /// add to its parent's, a response's CSP `sandbox` can only narrow the
+    /// current document, an auxiliary context takes the opener's popup set,
+    /// and a renderer replacement clears records whose frame ids restart
+    /// (<https://html.spec.whatwg.org/multipage/browsers.html#determining-the-creation-sandboxing-flags>,
+    /// <https://w3c.github.io/webappsec-csp/#sandbox>).
+    #[test]
+    fn a_browser_owns_each_frames_sandbox_set() {
+        let tabs = TabRegistry::new();
+        let tab = TabId::new(1);
+        let main = renderer::FrameId::MAIN;
+        let child = renderer::FrameId::new(7);
+        tabs.set_sandbox(tab, renderer::SandboxFlags::empty());
+
+        // An unsandboxed child stays unsandboxed when it reports nothing.
+        assert!(tabs.register_frame(
+            tab,
+            child,
+            main,
+            renderer::FrameKind::Child,
+            renderer::SandboxFlags::empty(),
+        ));
+        assert_eq!(
+            tabs.frame_sandbox(tab, child),
+            Some(renderer::SandboxFlags::empty())
+        );
+
+        // The main frame and a duplicate id are not legitimate reports.
+        assert!(!tabs.register_frame(
+            tab,
+            main,
+            main,
+            renderer::FrameKind::Child,
+            renderer::SandboxFlags::empty(),
+        ));
+        assert!(!tabs.register_frame(
+            tab,
+            child,
+            main,
+            renderer::FrameKind::Child,
+            renderer::SandboxFlags::parse(Some("")),
+        ));
+        assert!(!tabs.remove_frame(tab, main));
+
+        // The reported attribute can only add to the parent's set.
+        let sandboxed =
+            renderer::SandboxFlags::parse(Some("allow-scripts allow-popups allow-same-origin"));
+        let restricted = renderer::FrameId::new(11);
+        assert!(tabs.register_frame(tab, restricted, main, renderer::FrameKind::Child, sandboxed,));
+        let active = tabs.frame_sandbox(tab, restricted).expect("restricted");
+        assert!(active.blocks_navigation());
+        assert!(
+            !active.origin_is_opaque(),
+            "the attribute allows same-origin"
+        );
+
+        // A response's CSP `sandbox` narrows the same frame: the creation
+        // flags still block navigation, and the CSP removes the same-origin
+        // release.
+        let grandchild = renderer::FrameId::new(8);
+        assert!(tabs.register_frame(
+            tab,
+            grandchild,
+            restricted,
+            renderer::FrameKind::Child,
+            renderer::SandboxFlags::empty(),
+        ));
+        tabs.commit_frame_sandbox(
+            tab,
+            grandchild,
+            renderer::SandboxFlags::parse(Some("allow-scripts allow-popups")),
+        );
+        let active = tabs.frame_sandbox(tab, grandchild).expect("grandchild");
+        assert!(active.blocks_navigation(), "the parent flag survives");
+        assert!(active.origin_is_opaque(), "the CSP removed same-origin");
+
+        // An auxiliary context takes exactly the opener's popup set:
+        // `allow-popups-to-escape-sandbox` empties it.
+        let escaping = renderer::SandboxFlags::parse(Some(
+            "allow-scripts allow-popups allow-popups-to-escape-sandbox",
+        ));
+        let opener = renderer::FrameId::new(9);
+        assert!(tabs.register_frame(tab, opener, main, renderer::FrameKind::Child, escaping,));
+        let auxiliary = renderer::FrameId::new(10);
+        assert!(tabs.register_frame(
+            tab,
+            auxiliary,
+            opener,
+            renderer::FrameKind::Auxiliary,
+            renderer::SandboxFlags::empty(),
+        ));
+        assert!(
+            tabs.frame_sandbox(tab, auxiliary)
+                .expect("auxiliary")
+                .is_empty(),
+            "the escaping popup starts unsandboxed"
+        );
+
+        // A renderer replacement restarts frame ids, so the child records must
+        // go; the main frame keeps the tab set and the committed CSP.
+        tabs.reset_main_sandbox(tab, renderer::SandboxFlags::parse(Some("allow-scripts")));
+        tabs.clear_frames(tab);
+        assert_eq!(tabs.frame_sandbox(tab, child), None);
+        assert_eq!(
+            tabs.frame_sandbox(tab, main),
+            Some(renderer::SandboxFlags::parse(Some("allow-scripts")))
+        );
     }
 }

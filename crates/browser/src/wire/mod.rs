@@ -419,9 +419,36 @@ pub enum BrowsingContextCall {
         url: Option<Url>,
         /// What the call's `noopener` and `noreferrer` features asked for.
         opener: OpenerPolicy,
-        /// The calling document's origin, referrer source, policy, and
-        /// sandbox set.
+        /// The calling document's origin, referrer source, and policy. The
+        /// browser derives the sandbox state from its own per-frame copy, so
+        /// this does not carry it.
         source: NavigationSource,
+    },
+    /// A frame the renderer created, reported once before its document can
+    /// run script. The browser stores the frame's active sandbox flag set,
+    /// unions a child's reported `sandbox` attribute with its parent's set,
+    /// and derives an auxiliary context's popup set itself. A later call from
+    /// that frame is checked against this record, never against a fresh
+    /// renderer claim
+    /// (<https://html.spec.whatwg.org/multipage/browsers.html#determining-the-creation-sandboxing-flags>).
+    FrameCreated {
+        /// The new frame.
+        frame: FrameId,
+        /// The frame that created it: its embedder, or the opener of an
+        /// auxiliary context.
+        parent: FrameId,
+        /// Which creation rule applies.
+        kind: renderer::FrameKind,
+        /// The `iframe sandbox` attribute flags for a child, or the popup set
+        /// the renderer applied for an auxiliary context.
+        sandbox: renderer::SandboxFlags,
+    },
+    /// A frame the renderer tore down. The browser drops its sandbox record,
+    /// so a reused frame id starts from the tab's own set.
+    FrameDestroyed {
+        /// The frame that is gone, with every descendant the renderer also
+        /// destroyed.
+        frame: FrameId,
     },
     /// `window.close()` on a window this renderer opened.
     WindowClose {
@@ -512,7 +539,9 @@ impl ServiceReply {
             | ServiceCall::BrowsingContext(
                 BrowsingContextCall::WindowClose { .. }
                 | BrowsingContextCall::WindowMessage { .. }
-                | BrowsingContextCall::WindowName { .. },
+                | BrowsingContextCall::WindowName { .. }
+                | BrowsingContextCall::FrameCreated { .. }
+                | BrowsingContextCall::FrameDestroyed { .. },
             ) => ServiceReply::Unit,
             ServiceCall::Storage(StorageCall::Get { .. })
             | ServiceCall::BrowsingContext(BrowsingContextCall::RemoteSessionGet { .. }) => {

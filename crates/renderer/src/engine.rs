@@ -186,6 +186,16 @@ impl Engine {
                         document,
                     } => (frame, container, document),
                     CreatedFrame::Auxiliary { frame, document } => {
+                        // Report before the auxiliary's realm can run: a
+                        // `window.open` from it must find the browser's
+                        // sandbox record
+                        // (<https://html.spec.whatwg.org/multipage/browsers.html#popup-sandboxing-flag-set>).
+                        self.runtime.services.frame_created(
+                            frame,
+                            parent,
+                            crate::FrameKind::Auxiliary,
+                            document.world().borrow().sandbox,
+                        );
                         self.frames.insert(frame, document);
                         // The auxiliary document was created inside the opening
                         // script, so its realm could only start now.
@@ -196,8 +206,6 @@ impl Engine {
                         continue;
                     }
                 };
-                self.frames.insert(frame, document);
-                self.seed_frame_history(frame);
                 // The container's `sandbox` attribute and the embedder's
                 // active flags decide every document this frame loads
                 // (<https://html.spec.whatwg.org/multipage/browsers.html#determining-the-creation-sandboxing-flags>).
@@ -207,6 +215,17 @@ impl Engine {
                     .map_or_else(crate::protocol::SandboxFlags::default, |document| {
                         crate::document::sandboxing_flags(&document.world(), container)
                     });
+                // Report the frame before its first navigation can run a
+                // script, so the browser owns the set any `window.open` call
+                // is checked against.
+                self.runtime.services.frame_created(
+                    frame,
+                    parent,
+                    crate::FrameKind::Child,
+                    sandbox,
+                );
+                self.frames.insert(frame, document);
+                self.seed_frame_history(frame);
                 // `srcdoc` takes priority over `src`
                 // (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#attr-iframe-srcdoc>).
                 let srcdoc = self
@@ -906,6 +925,10 @@ impl Engine {
                     .forget_frame_world(*frame);
                 self.frames.remove(frame);
                 self.frame_history.remove(frame);
+                // A parent navigation or `window.close()` removes frames
+                // through this queue, not `remove_subtree`, so report them
+                // here as well; the browser's teardown is idempotent.
+                self.runtime.services.frame_destroyed(*frame);
             }
             let frame_ids: Vec<FrameId> = self.frames.keys().copied().collect();
             let mut removed_containers = Vec::new();
@@ -1004,6 +1027,7 @@ impl Engine {
         // Dropping the document closes its ports and its realm.
         self.frames.remove(&child);
         self.frame_history.remove(&child);
+        self.runtime.services.frame_destroyed(child);
     }
 
     fn remove_descendants(&mut self, parent: FrameId) {
@@ -1422,6 +1446,7 @@ impl Engine {
                         url,
                         &origin,
                     );
+                    request.frame = Some(child);
                     request.referrer = referrer;
                     request.method.clone_from(&navigation.method);
                     request.body.clone_from(&navigation.body);

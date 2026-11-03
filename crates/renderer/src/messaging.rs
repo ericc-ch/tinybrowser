@@ -902,6 +902,17 @@ impl Shared {
         }
     }
 
+    /// Removes one child navigable after its descendants, when the DOM removes
+    /// the `iframe` that hosts it. Every removed frame is queued so the engine
+    /// drops its document and tells the browser to forget its sandbox record.
+    pub(crate) fn remove_child_navigable(&mut self, frame: FrameId, container: NodeId) {
+        self.detach_child_frames(frame);
+        self.tree.remove(frame);
+        self.forget_document(frame);
+        self.close_frame_ports(frame);
+        self.removed_frames.push((frame, Some(container)));
+    }
+
     /// Removes an auxiliary top-level context its own script closed, with every
     /// child navigable it owns. A child iframe or the main frame cannot close
     /// its browsing context this way.

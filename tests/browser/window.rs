@@ -1205,3 +1205,38 @@ fn an_unsandboxed_popup_may_navigate_a_sibling_tab_by_name() {
         "an unsandboxed document may navigate a tab in its group"
     );
 }
+
+/// A CSP `sandbox` directive without `allow-popups` blocks a popup exactly
+/// like an `iframe` attribute. The renderer applies the response's directive
+/// to its own active set, and the browser owns the same flags for its check,
+/// so neither path can open the context
+/// (<https://w3c.github.io/webappsec-csp/#sandbox>).
+#[test]
+fn a_csp_sandbox_without_allow_popups_cannot_open_a_popup() {
+    let popup = TestServer::start(
+        vec![("/popup", ok("text/html", b"<!doctype html>popup"))],
+        None,
+    );
+    let page = format!(
+        "<!doctype html><script>window.open('http://{}/popup', '_blank');</script>",
+        popup.address()
+    );
+    let (listener, origin) = server();
+    TestServer::serve_on(
+        listener,
+        vec![(
+            "/page/index.html",
+            ok("text/html", page.as_bytes())
+                .header("Content-Security-Policy", "sandbox allow-scripts"),
+        )],
+    );
+    let (_fixture, _client, _session) = open_page(
+        "tinybrowser-csp-sandbox-popup",
+        &format!("http://{origin}/page/index.html"),
+    );
+    std::thread::sleep(Duration::from_millis(800));
+    assert!(
+        popup.history("/popup").is_empty(),
+        "a CSP sandbox without allow-popups blocks the popup"
+    );
+}

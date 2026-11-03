@@ -2212,7 +2212,6 @@ impl World {
                 origin: crate::protocol::SerializedOrigin::from(&self.origin),
                 referrer: self.referrer_url.clone(),
                 referrer_policy: self.policy.referrer_policy.unwrap_or_default(),
-                sandbox: self.sandbox,
                 frame: self.frame,
             },
         })
@@ -2384,8 +2383,7 @@ impl World {
         let mut shared = self.runtime.shared.borrow_mut();
         for container in containers {
             if let Some(frame) = shared.tree.frame_for_container(*container) {
-                shared.tree.remove(frame);
-                shared.forget_document(frame);
+                shared.remove_child_navigable(frame, *container);
             }
         }
     }
