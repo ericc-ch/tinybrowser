@@ -17,7 +17,9 @@ use crate::protocol::{HeaderMap, Method};
 
 /// A request's CORS mode
 /// (<https://fetch.spec.whatwg.org/#concept-request-mode>).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, Hash, PartialEq, Eq, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "kebab-case")]
 pub enum RequestMode {
     /// A document, frame, or other non-fetch-resource navigation. The response

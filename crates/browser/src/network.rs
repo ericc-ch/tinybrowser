@@ -75,6 +75,11 @@ struct CacheKey {
     method: net::Method,
     /// The request URL.
     url: Url,
+    /// The request's mode. A `no-cors` response is opaque while the same URL
+    /// fetched in `cors` or `navigate` mode is readable, so one mode must not
+    /// answer another from the cache
+    /// (<https://fetch.spec.whatwg.org/#concept-request-response-tainting>).
+    mode: net::cors::RequestMode,
     /// The request's credentials mode. A response fetched with `include` is
     /// not the response an `omit` request may reuse.
     credentials: net::cors::CredentialsMode,
@@ -317,6 +322,7 @@ fn cache_key(
     CacheKey {
         method: request.method.clone(),
         url: request.url.clone(),
+        mode: request.policy.cors().mode,
         credentials: request.policy.cors().credentials,
         initiator: initiator.clone(),
         partition,
