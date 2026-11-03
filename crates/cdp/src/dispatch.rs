@@ -21,16 +21,55 @@ use crate::DEFAULT_BROWSER_CONTEXT_ID;
 /// Largest capture or emulated dimension the renderer accepts.
 const MAX_SCREENSHOT_DIM: f64 = 4096.0;
 
-/// The target a command arrived on. A page session addresses one tab; a
-/// browser session addresses browser-wide state.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum TargetKind {
-    Page,
+/// The target a request arrived on, with what that kind can address.
+///
+/// One value instead of a session enum flattened into a `(kind, tab)` pair:
+/// a page target owns the tab it drives, and a browser target owns no tab at
+/// all, so a handler that needs one cannot be handed a browser target.
+#[derive(Clone)]
+pub(crate) enum Target {
+    /// A page target: the tab the request addresses.
+    Page(TabHandle),
+    /// The browser-wide target.
     Browser,
 }
 
-const PAGE: u8 = 1;
-const BROWSER: u8 = 2;
+/// Which targets a method serves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TargetClass {
+    Page,
+    Browser,
+    Both,
+}
+
+impl TargetClass {
+    /// Whether a request on `target` may run a method of this class.
+    ///
+    /// The match is exhaustive over both closed enums so a new target kind
+    /// must state which methods it serves instead of inheriting a bit it was
+    /// never given.
+    fn accepts(self, target: &Target) -> bool {
+        match (self, target) {
+            (Self::Both, Target::Page(_) | Target::Browser)
+            | (Self::Page, Target::Page(_))
+            | (Self::Browser, Target::Browser) => true,
+            (Self::Page, Target::Browser) | (Self::Browser, Target::Page(_)) => false,
+        }
+    }
+
+    /// Whether two classes can serve one request, which makes two routes for
+    /// the same method ambiguous.
+    #[cfg(test)]
+    fn overlaps(self, other: Self) -> bool {
+        match (self, other) {
+            (Self::Both, Self::Both | Self::Page | Self::Browser)
+            | (Self::Page | Self::Browser, Self::Both)
+            | (Self::Page, Self::Page)
+            | (Self::Browser, Self::Browser) => true,
+            (Self::Page, Self::Browser) | (Self::Browser, Self::Page) => false,
+        }
+    }
+}
 
 /// What one protocol method does on one target kind.
 #[derive(Clone, Copy)]
@@ -137,363 +176,359 @@ pub(crate) enum Accepted {
 
 struct Route {
     method: &'static str,
-    kinds: u8,
+    target: TargetClass,
     handler: Handler,
 }
 
 const ROUTES: &[Route] = &[
     Route {
         method: "Browser.getVersion",
-        kinds: BROWSER,
+        target: TargetClass::Browser,
         handler: Handler::Browser(BrowserHandler::GetVersion),
     },
     Route {
         method: "Browser.close",
-        kinds: BROWSER,
+        target: TargetClass::Browser,
         handler: Handler::Browser(BrowserHandler::Close),
     },
     Route {
         method: "Browser.setDownloadBehavior",
-        kinds: BROWSER,
+        target: TargetClass::Browser,
         handler: Handler::Accept(Accepted::NoDownloadPipeline),
     },
     Route {
         method: "Target.setAutoAttach",
-        kinds: BROWSER,
+        target: TargetClass::Browser,
         handler: Handler::Browser(BrowserHandler::SetAutoAttach),
     },
     Route {
         method: "Target.setAutoAttach",
-        kinds: PAGE,
+        target: TargetClass::Page,
         handler: Handler::Accept(Accepted::PageHasNoChildTargets),
     },
     Route {
         method: "Target.getTargetInfo",
-        kinds: PAGE | BROWSER,
+        target: TargetClass::Both,
         handler: Handler::GetTargetInfo,
     },
     Route {
         method: "Target.getTargets",
-        kinds: BROWSER,
+        target: TargetClass::Browser,
         handler: Handler::Browser(BrowserHandler::GetTargets),
     },
     Route {
         method: "Target.createTarget",
-        kinds: BROWSER,
+        target: TargetClass::Browser,
         handler: Handler::Browser(BrowserHandler::CreateTarget),
     },
     Route {
         method: "Target.closeTarget",
-        kinds: BROWSER,
+        target: TargetClass::Browser,
         handler: Handler::Browser(BrowserHandler::CloseTarget),
     },
     Route {
         method: "Target.attachToTarget",
-        kinds: BROWSER,
+        target: TargetClass::Browser,
         handler: Handler::Browser(BrowserHandler::AttachToTarget),
     },
     Route {
         method: "Target.attachToBrowserTarget",
-        kinds: BROWSER,
+        target: TargetClass::Browser,
         handler: Handler::Browser(BrowserHandler::AttachToBrowserTarget),
     },
     Route {
         method: "Target.detachFromTarget",
-        kinds: BROWSER,
+        target: TargetClass::Browser,
         handler: Handler::Browser(BrowserHandler::DetachFromTarget),
     },
     Route {
         method: "Network.clearBrowserCookies",
-        kinds: PAGE | BROWSER,
+        target: TargetClass::Both,
         handler: Handler::ClearBrowserCookies,
     },
     Route {
         method: "Page.enable",
-        kinds: PAGE,
+        target: TargetClass::Page,
         handler: Handler::Page(PageHandler::Enable),
     },
     Route {
         method: "Page.disable",
-        kinds: PAGE,
+        target: TargetClass::Page,
         handler: Handler::Page(PageHandler::Disable),
     },
     Route {
         method: "Page.navigate",
-        kinds: PAGE,
+        target: TargetClass::Page,
         handler: Handler::Page(PageHandler::Navigate),
     },
     Route {
         method: "Page.navigateToHistoryEntry",
-        kinds: PAGE,
+        target: TargetClass::Page,
         handler: Handler::Page(PageHandler::NavigateToHistoryEntry),
     },
     Route {
         method: "Page.captureScreenshot",
-        kinds: PAGE,
+        target: TargetClass::Page,
         handler: Handler::Page(PageHandler::CaptureScreenshot),
     },
     Route {
         method: "Page.createIsolatedWorld",
-        kinds: PAGE,
+        target: TargetClass::Page,
         handler: Handler::Page(PageHandler::CreateIsolatedWorld),
     },
     Route {
         method: "Page.setLifecycleEventsEnabled",
-        kinds: PAGE,
+        target: TargetClass::Page,
         handler: Handler::Page(PageHandler::SetLifecycleEventsEnabled),
     },
     Route {
         method: "Page.getFrameTree",
-        kinds: PAGE,
+        target: TargetClass::Page,
         handler: Handler::Page(PageHandler::Script(ScriptMethod::GetFrameTree)),
     },
     Route {
         method: "Page.getLayoutMetrics",
-        kinds: PAGE,
+        target: TargetClass::Page,
         handler: Handler::Page(PageHandler::Script(ScriptMethod::GetLayoutMetrics)),
     },
     Route {
         method: "Page.getResourceTree",
-        kinds: PAGE,
+        target: TargetClass::Page,
         handler: Handler::Page(PageHandler::Script(ScriptMethod::GetResourceTree)),
     },
     Route {
         method: "Page.reload",
-        kinds: PAGE,
+        target: TargetClass::Page,
         handler: Handler::Page(PageHandler::Script(ScriptMethod::Reload)),
     },
     Route {
         method: "Page.addScriptToEvaluateOnNewDocument",
-        kinds: PAGE,
+        target: TargetClass::Page,
         handler: Handler::Page(PageHandler::Script(
             ScriptMethod::AddScriptToEvaluateOnNewDocument,
         )),
     },
     Route {
         method: "Page.removeScriptToEvaluateOnNewDocument",
-        kinds: PAGE,
+        target: TargetClass::Page,
         handler: Handler::Page(PageHandler::Script(
             ScriptMethod::RemoveScriptToEvaluateOnNewDocument,
         )),
     },
     Route {
         method: "Page.getNavigationHistory",
-        kinds: PAGE,
+        target: TargetClass::Page,
         handler: Handler::Page(PageHandler::Script(ScriptMethod::GetNavigationHistory)),
     },
     Route {
         method: "Page.setFontFamilies",
-        kinds: PAGE,
+        target: TargetClass::Page,
         handler: Handler::Accept(Accepted::RendererOwnsFonts),
     },
     Route {
         method: "Runtime.enable",
-        kinds: PAGE,
+        target: TargetClass::Page,
         handler: Handler::Page(PageHandler::RuntimeEnable),
     },
     Route {
         method: "Runtime.disable",
-        kinds: PAGE,
+        target: TargetClass::Page,
         handler: Handler::Page(PageHandler::RuntimeDisable),
     },
     Route {
         method: "Runtime.evaluate",
-        kinds: PAGE,
+        target: TargetClass::Page,
         handler: Handler::Page(PageHandler::RuntimeEvaluate),
     },
     Route {
         method: "Runtime.callFunctionOn",
-        kinds: PAGE,
+        target: TargetClass::Page,
         handler: Handler::Page(PageHandler::RuntimeCallFunctionOn),
     },
     Route {
         method: "Runtime.getProperties",
-        kinds: PAGE,
+        target: TargetClass::Page,
         handler: Handler::Page(PageHandler::Script(ScriptMethod::GetProperties)),
     },
     Route {
         method: "Runtime.releaseObject",
-        kinds: PAGE,
+        target: TargetClass::Page,
         handler: Handler::Page(PageHandler::RuntimeReleaseObject),
     },
     Route {
         method: "Runtime.releaseObjectGroup",
-        kinds: PAGE,
+        target: TargetClass::Page,
         handler: Handler::Page(PageHandler::RuntimeReleaseObjectGroup),
     },
     Route {
         method: "Runtime.runIfWaitingForDebugger",
-        kinds: PAGE,
+        target: TargetClass::Page,
         handler: Handler::Accept(Accepted::WaitingForDebugger),
     },
     Route {
         method: "DOM.getDocument",
-        kinds: PAGE,
+        target: TargetClass::Page,
         handler: Handler::Page(PageHandler::Script(ScriptMethod::DomGetDocument)),
     },
     Route {
         method: "DOM.querySelector",
-        kinds: PAGE,
+        target: TargetClass::Page,
         handler: Handler::Page(PageHandler::Script(ScriptMethod::DomQuerySelector)),
     },
     Route {
         method: "DOM.querySelectorAll",
-        kinds: PAGE,
+        target: TargetClass::Page,
         handler: Handler::Page(PageHandler::Script(ScriptMethod::DomQuerySelectorAll)),
     },
     Route {
         method: "DOM.describeNode",
-        kinds: PAGE,
+        target: TargetClass::Page,
         handler: Handler::Page(PageHandler::Script(ScriptMethod::DomDescribeNode)),
     },
     Route {
         method: "DOM.getOuterHTML",
-        kinds: PAGE,
+        target: TargetClass::Page,
         handler: Handler::Page(PageHandler::Script(ScriptMethod::DomGetOuterHtml)),
     },
     Route {
         method: "DOM.getAttributes",
-        kinds: PAGE,
+        target: TargetClass::Page,
         handler: Handler::Page(PageHandler::Script(ScriptMethod::DomGetAttributes)),
     },
     Route {
         method: "DOM.resolveNode",
-        kinds: PAGE,
+        target: TargetClass::Page,
         handler: Handler::Page(PageHandler::Script(ScriptMethod::DomResolveNode)),
     },
     Route {
         method: "DOM.getNodeForLocation",
-        kinds: PAGE,
+        target: TargetClass::Page,
         handler: Handler::Page(PageHandler::Script(ScriptMethod::DomGetNodeForLocation)),
     },
     Route {
         method: "DOM.getBoxModel",
-        kinds: PAGE,
+        target: TargetClass::Page,
         handler: Handler::Page(PageHandler::Script(ScriptMethod::DomGetBoxModel)),
     },
     Route {
         method: "DOM.getContentQuads",
-        kinds: PAGE,
+        target: TargetClass::Page,
         handler: Handler::Page(PageHandler::Script(ScriptMethod::DomGetContentQuads)),
     },
     Route {
         method: "Input.dispatchMouseEvent",
-        kinds: PAGE,
+        target: TargetClass::Page,
         handler: Handler::Page(PageHandler::Script(ScriptMethod::InputMouseEvent)),
     },
     Route {
         method: "Input.dispatchKeyEvent",
-        kinds: PAGE,
+        target: TargetClass::Page,
         handler: Handler::Page(PageHandler::Script(ScriptMethod::InputKeyEvent)),
     },
     Route {
         method: "Input.insertText",
-        kinds: PAGE,
+        target: TargetClass::Page,
         handler: Handler::Page(PageHandler::Script(ScriptMethod::InputInsertText)),
     },
     Route {
         method: "Input.dispatchTouchEvent",
-        kinds: PAGE,
+        target: TargetClass::Page,
         handler: Handler::Page(PageHandler::Script(ScriptMethod::InputTouchEvent)),
     },
     Route {
         method: "Input.emulateTouchFromMouseEvent",
-        kinds: PAGE,
+        target: TargetClass::Page,
         handler: Handler::Page(PageHandler::Script(
             ScriptMethod::InputEmulateTouchFromMouse,
         )),
     },
     Route {
         method: "CSS.enable",
-        kinds: PAGE,
+        target: TargetClass::Page,
         handler: Handler::Page(PageHandler::CssEnable),
     },
     Route {
         method: "CSS.disable",
-        kinds: PAGE,
+        target: TargetClass::Page,
         handler: Handler::Page(PageHandler::CssDisable),
     },
     Route {
         method: "CSS.getComputedStyleForNode",
-        kinds: PAGE,
+        target: TargetClass::Page,
         handler: Handler::Page(PageHandler::Script(
             ScriptMethod::CssGetComputedStyleForNode,
         )),
     },
     Route {
         method: "Tracing.end",
-        kinds: PAGE,
+        target: TargetClass::Page,
         handler: Handler::Page(PageHandler::TracingEnd),
     },
     Route {
         method: "Storage.getStorageKey",
-        kinds: PAGE,
+        target: TargetClass::Page,
         handler: Handler::Page(PageHandler::Script(ScriptMethod::GetStorageKey)),
     },
     Route {
         method: "Log.enable",
-        kinds: PAGE | BROWSER,
+        target: TargetClass::Both,
         handler: Handler::Accept(Accepted::DomainWithoutEvents),
     },
     Route {
         method: "Network.enable",
-        kinds: PAGE | BROWSER,
+        target: TargetClass::Both,
         handler: Handler::Accept(Accepted::DomainWithoutEvents),
     },
     Route {
         method: "Network.clearBrowserCache",
-        kinds: PAGE | BROWSER,
+        target: TargetClass::Both,
         handler: Handler::Accept(Accepted::NoHttpCache),
     },
     Route {
         method: "Network.setCacheDisabled",
-        kinds: PAGE | BROWSER,
+        target: TargetClass::Both,
         handler: Handler::Accept(Accepted::CacheAlreadyDisabled),
     },
     Route {
         method: "Emulation.setFocusEmulationEnabled",
-        kinds: PAGE | BROWSER,
+        target: TargetClass::Both,
         handler: Handler::Accept(Accepted::FocusIsNotEngineState),
     },
     Route {
         method: "Emulation.setEmulatedMedia",
-        kinds: PAGE,
+        target: TargetClass::Page,
         handler: Handler::Accept(Accepted::DefaultEmulatedMedia),
     },
     Route {
         method: "Emulation.setDeviceMetricsOverride",
-        kinds: PAGE,
+        target: TargetClass::Page,
         handler: Handler::Page(PageHandler::Script(ScriptMethod::SetDeviceMetricsOverride)),
     },
     Route {
         method: "Emulation.clearDeviceMetricsOverride",
-        kinds: PAGE,
+        target: TargetClass::Page,
         handler: Handler::Page(PageHandler::Script(
             ScriptMethod::ClearDeviceMetricsOverride,
         )),
     },
     Route {
         method: "Overlay.enable",
-        kinds: PAGE | BROWSER,
+        target: TargetClass::Both,
         handler: Handler::Accept(Accepted::DomainWithoutEvents),
     },
     Route {
         method: "Overlay.disable",
-        kinds: PAGE | BROWSER,
+        target: TargetClass::Both,
         handler: Handler::Accept(Accepted::DomainWithoutEvents),
     },
 ];
 
 /// Looks up the handler for `method` on `kind`. An unregistered pair is
 /// `MethodNotFound`; there is no fallback table.
-pub(crate) fn route(method: &str, kind: TargetKind) -> Option<Handler> {
-    let flag = match kind {
-        TargetKind::Page => PAGE,
-        TargetKind::Browser => BROWSER,
-    };
+pub(crate) fn route(method: &str, target: &Target) -> Option<Handler> {
     ROUTES
         .iter()
-        .find(|route| route.method == method && route.kinds & flag != 0)
+        .find(|route| route.method == method && route.target.accepts(target))
         .map(|route| route.handler)
 }
 
@@ -895,7 +930,7 @@ fn capture_side(extent: f64) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{BROWSER, PAGE, ROUTES, capture_side, required_metric};
+    use super::{ROUTES, capture_side, required_metric};
     use serde_json::json;
 
     #[test]
@@ -919,10 +954,9 @@ mod tests {
     #[test]
     fn every_registered_pair_has_one_handler() {
         for (index, route) in ROUTES.iter().enumerate() {
-            assert!(route.kinds & (PAGE | BROWSER) != 0);
             for other in &ROUTES[index + 1..] {
                 assert!(
-                    route.method != other.method || route.kinds & other.kinds == 0,
+                    route.method != other.method || !route.target.overlaps(other.target),
                     "{} has overlapping handlers for the same target kind",
                     route.method
                 );

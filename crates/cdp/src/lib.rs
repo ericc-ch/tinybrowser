@@ -40,10 +40,10 @@ use tungstenite::protocol::{Message, Role, WebSocket as ClientSocket};
 mod dispatch;
 use dispatch::{
     BrowserHandler, DispatchError, Handler, PageHandler, RUNTIME_CLEAR_HANDLES, RUNTIME_HANDLE,
-    RUNTIME_HANDLE_READ, RUNTIME_HANDLE_SCHEDULE, RUNTIME_READ, RUNTIME_SCHEDULE, TargetKind,
-    accept, arguments_expression, attach_session, capture_screenshot, css_stylesheets,
-    exception_reply, exception_text_reply, json_io, json_string, open_url, requested_frame, route,
-    run_script, runtime_release_object, runtime_release_object_group, target_id, target_info,
+    RUNTIME_HANDLE_READ, RUNTIME_HANDLE_SCHEDULE, RUNTIME_READ, RUNTIME_SCHEDULE, Target, accept,
+    arguments_expression, attach_session, capture_screenshot, css_stylesheets, exception_reply,
+    exception_text_reply, json_io, json_string, open_url, requested_frame, route, run_script,
+    runtime_release_object, runtime_release_object_group, target_id, target_info,
     wait_for_navigation, ws_io,
 };
 
@@ -440,19 +440,10 @@ fn connect_ws(addr: SocketAddr, path: &str) -> io::Result<Client> {
     })
 }
 
-/// One flattened session's routing target. A browser session carries no tab:
-/// its commands go through browser dispatch, exactly as the root browser
-/// socket does.
-#[derive(Clone)]
-enum Session {
-    Tab(TabHandle),
-    Browser,
-}
-
 /// Per-WebSocket async protocol state.
 struct Conn {
     browser: BrowserHandle,
-    sessions: HashMap<String, Session>,
+    sessions: HashMap<String, Target>,
     next_session: u64,
     tab: Option<TabHandle>,
     stop: Shutdown,
@@ -738,7 +729,7 @@ impl Conn {
         if auto_attach {
             for id in self.browser.tabs().await.unwrap_or_default() {
                 if let Ok(tab) = self.browser.tab(id).await {
-                    let session_id = self.mint(Session::Tab(tab.clone()));
+                    let session_id = self.mint(Target::Page(tab.clone()));
                     self.push_attached(session, &session_id, &tab).await;
                 }
             }
@@ -747,7 +738,7 @@ impl Conn {
     }
 
     /// Registers a flattened session and returns its id.
-    fn mint(&mut self, session: Session) -> String {
+    fn mint(&mut self, session: Target) -> String {
         let session_id = format!("s{}", self.next_session);
         self.next_session = self.next_session.saturating_add(1);
         self.sessions.insert(session_id.clone(), session);
@@ -833,23 +824,19 @@ impl Conn {
         if method != "Browser.close" && self.browser.is_closed() {
             return Err(DispatchError::Failed("browser closed".into()));
         }
-        let (kind, tab) = match session {
-            Some(session) => match self
+        let target = match session {
+            Some(session) => self
                 .sessions
                 .get(session)
                 .cloned()
-                .ok_or_else(|| DispatchError::Failed("unknown session".into()))?
-            {
-                Session::Tab(tab) => (TargetKind::Page, Some(tab)),
-                Session::Browser => (TargetKind::Browser, None),
-            },
+                .ok_or_else(|| DispatchError::Failed("unknown session".into()))?,
             None => match self.tab.clone() {
-                Some(tab) => (TargetKind::Page, Some(tab)),
-                None => (TargetKind::Browser, None),
+                Some(tab) => Target::Page(tab),
+                None => Target::Browser,
             },
         };
-        let handler = route(method, kind).ok_or(DispatchError::MethodNotFound)?;
-        self.dispatch_handler(handler, params, tab.as_ref(), session)
+        let handler = route(method, &target).ok_or(DispatchError::MethodNotFound)?;
+        self.dispatch_handler(handler, params, &target, session)
             .await
     }
 
@@ -857,7 +844,7 @@ impl Conn {
         &mut self,
         handler: Handler,
         params: &Value,
-        tab: Option<&TabHandle>,
+        target: &Target,
         session: Option<&str>,
     ) -> Result<Value, DispatchError> {
         match handler {
@@ -869,20 +856,22 @@ impl Conn {
                     .map_err(|error| DispatchError::Failed(error.to_string()))?;
                 Ok(json!({}))
             }
-            Handler::GetTargetInfo => match tab {
-                Some(tab) => {
+            Handler::GetTargetInfo => match target {
+                Target::Page(tab) => {
                     let mut info = target_info(&self.browser, tab.id()).await;
                     if let Some(object) = info.as_object_mut() {
                         object.insert("attached".into(), json!(true));
                     }
                     Ok(json!({"targetInfo": info}))
                 }
-                None => self.target_info_for(params).await,
+                Target::Browser => self.target_info_for(params).await,
             },
-            Handler::Page(handler) => {
-                let tab = tab.ok_or(DispatchError::MethodNotFound)?;
-                self.dispatch_page(handler, params, tab, session).await
-            }
+            Handler::Page(handler) => match target {
+                Target::Page(tab) => self.dispatch_page(handler, params, tab, session).await,
+                // `route` answers a page handler only for a page target, so a
+                // browser target cannot reach here.
+                Target::Browser => Err(DispatchError::MethodNotFound),
+            },
             Handler::Browser(handler) => self.dispatch_browser(handler, params, session).await,
         }
     }
@@ -1086,10 +1075,10 @@ impl Conn {
                     .tab(id)
                     .await
                     .map_err(|err| DispatchError::Failed(err.to_string()))?;
-                Ok(json!({ "sessionId": self.mint(Session::Tab(tab)) }))
+                Ok(json!({ "sessionId": self.mint(Target::Page(tab)) }))
             }
             BrowserHandler::AttachToBrowserTarget => {
-                Ok(json!({ "sessionId": self.mint(Session::Browser) }))
+                Ok(json!({ "sessionId": self.mint(Target::Browser) }))
             }
             BrowserHandler::DetachFromTarget => {
                 if let Some(session) = params.get("sessionId").and_then(Value::as_str) {
@@ -1122,7 +1111,7 @@ impl Conn {
             return Err(error);
         }
         if self.auto_attach {
-            let session_id = self.mint(Session::Tab(tab.clone()));
+            let session_id = self.mint(Target::Page(tab.clone()));
             self.push_attached(session, &session_id, &tab).await;
         }
         Ok(json!({ "targetId": tab.id().to_string() }))
@@ -1141,8 +1130,8 @@ impl Conn {
                 .sessions
                 .iter()
                 .filter(|(_, session)| match session {
-                    Session::Tab(tab) => tab.id() == id,
-                    Session::Browser => false,
+                    Target::Page(tab) => tab.id() == id,
+                    Target::Browser => false,
                 })
                 .map(|(session, _)| session.clone())
                 .collect();
@@ -1162,8 +1151,8 @@ impl Conn {
             .await
             .map_err(|err| DispatchError::Failed(err.to_string()))?;
         self.sessions.retain(|_, session| match session {
-            Session::Tab(tab) => tab.id() != id,
-            Session::Browser => true,
+            Target::Page(tab) => tab.id() != id,
+            Target::Browser => true,
         });
         self.unsubscribe_tab_id(id);
         self.loader_ids.remove(&id);
@@ -1744,7 +1733,7 @@ mod tests {
         let (browser, data_home) = test_browser();
         let mut conn = test_conn(&browser);
         let tab = browser.handle().create_tab().await.expect("tab");
-        let session = conn.mint(Session::Tab(tab));
+        let session = conn.mint(Target::Page(tab));
 
         let default_media = json!({
             "id": 1,
