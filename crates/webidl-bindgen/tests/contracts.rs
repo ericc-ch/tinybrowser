@@ -23,6 +23,38 @@ fn generated_trait(rust: &str) -> String {
 }
 
 #[test]
+fn an_included_generated_module_needs_no_hand_written_implementation() {
+    let idl = [Source {
+        name: "fixture.idl",
+        text: r"
+        [Exposed=*] interface Parent { readonly attribute DOMString label; };
+        [Exposed=*] interface Child : Parent { };
+    ",
+    }];
+    let rust = [Source {
+        name: "fixture.rs",
+        text: r#"
+        impl<'js> parent_generated::Parent<'js> for Payload<'js> {
+            fn get_label(&self, ctx: &Ctx<'js>) -> Result<String<'js>> { read(ctx) }
+        }
+        include!(concat!(env!("OUT_DIR"), "/Child.rs"));
+    "#,
+    }];
+    let bindings = compile_contracts(&idl, &rust).expect("compile fixture");
+    let child = bindings
+        .iter()
+        .find(|binding| binding.interface == "Child")
+        .expect("the included module is generated");
+    // The payload is the nearest implemented ancestor's, because the engine
+    // object that implements `Parent` is the same object `Child` names.
+    assert!(child.rust.contains("use super::Payload"));
+    assert!(
+        !child.rust.contains("trait Child"),
+        "an interface with no members has no contract trait"
+    );
+}
+
+#[test]
 fn contracts_follow_implementations_and_resolved_declarations() {
     let idl = [Source {
         name: "fixture.idl",

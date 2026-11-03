@@ -191,6 +191,7 @@ pub(crate) fn compile(idl: &[Source<'_>], rust: &[Source<'_>]) -> Result<Vec<Bin
     let database = Database::parse(idl)?;
     let mut implementations = BTreeMap::new();
     let mut classes = BTreeMap::new();
+    let mut declared = BTreeSet::new();
     for source in rust {
         let syntax = syn::parse_file(source.text)
             .map_err(|error| Error(format!("{}: invalid Rust: {error}", source.name)))?;
@@ -200,6 +201,35 @@ pub(crate) fn compile(idl: &[Source<'_>], rust: &[Source<'_>]) -> Result<Vec<Bin
             &mut implementations,
             &mut classes,
         )?;
+        declared_modules(&syntax.items, &mut declared);
+    }
+    // An interface whose members are all generator-supplied has no hand-written
+    // `impl` block, because there is no trait for it to implement. Its generated
+    // module is still installed, and the `include!` that installs it is the
+    // declaration that the module must exist. Its payload is the nearest
+    // implemented ancestor's: a platform type that implements an interface also
+    // implements everything that interface inherits from, which is why the same
+    // payload is the only sound choice.
+    for name in declared {
+        if implementations.contains_key(&name) {
+            continue;
+        }
+        let Some((payload, lifetime)) = inherited_payload(&database, &name, &implementations)?
+        else {
+            return Err(Error(format!(
+                "{name} needs a generated module but has no implemented ancestor to take a payload from"
+            )));
+        };
+        implementations.insert(
+            name.clone(),
+            Implementation {
+                interface: name,
+                payload,
+                lifetime,
+                payloads: Vec::new(),
+                methods: BTreeMap::new(),
+            },
+        );
     }
     let mut usage: BTreeMap<String, usize> = BTreeMap::new();
     for implementation in implementations.values() {
@@ -234,6 +264,93 @@ pub(crate) fn compile(idl: &[Source<'_>], rust: &[Source<'_>]) -> Result<Vec<Bin
             })
         })
         .collect()
+}
+
+/// Collects the interface names whose generated module a source `include!`s.
+///
+/// The include is what actually needs the file: a missing module is a compile
+/// error there, so this set is the complete list of modules the build must
+/// write, including the interfaces that have no hand-written implementation.
+fn declared_modules(items: &[syn::Item], declared: &mut BTreeSet<String>) {
+    for item in items {
+        match item {
+            syn::Item::Mod(module) => {
+                if let Some((_, items)) = &module.content {
+                    declared_modules(items, declared);
+                }
+            }
+            syn::Item::Macro(item) => {
+                if let Some(name) = included_module(&item.mac) {
+                    declared.insert(name);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The file stem of the one `*.rs` string in an `include!` invocation, if this
+/// macro is one.
+fn included_module(mac: &syn::Macro) -> Option<String> {
+    if !mac.path.is_ident("include") {
+        return None;
+    }
+    // The file name is nested inside `concat!(env!("OUT_DIR"), "/Name.rs")`,
+    // so the literal search has to walk groups rather than only the top level.
+    let literal = module_path(&mac.tokens)?;
+    std::path::Path::new(&literal.value())
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(str::to_owned)
+}
+
+/// The one string literal ending in `.rs` anywhere in a token stream.
+fn module_path(tokens: &proc_macro2::TokenStream) -> Option<syn::LitStr> {
+    for token in tokens.clone() {
+        match token {
+            proc_macro2::TokenTree::Literal(literal) => {
+                let Ok(literal) = syn::parse_str::<syn::LitStr>(&literal.to_string()) else {
+                    continue;
+                };
+                let value = literal.value();
+                let path = std::path::Path::new(&value);
+                if path.extension().is_some_and(|extension| extension == "rs") {
+                    return Some(literal);
+                }
+            }
+            proc_macro2::TokenTree::Group(group) => {
+                if let Some(literal) = module_path(&group.stream()) {
+                    return Some(literal);
+                }
+            }
+            proc_macro2::TokenTree::Ident(_) | proc_macro2::TokenTree::Punct(_) => {}
+        }
+    }
+    None
+}
+
+/// The payload and lifetime of the nearest implemented ancestor of `name`.
+///
+/// Walking `interface.inheritance` is what makes an interface with no
+/// implementation of its own bindable: the engine implements the ancestor, and
+/// every platform type implements a child interface the same way because the
+/// child interface's members are a superset reached through the same object.
+fn inherited_payload(
+    database: &Database<'_>,
+    name: &str,
+    implementations: &BTreeMap<String, Implementation>,
+) -> Result<Option<(syn::Ident, bool)>, Error> {
+    let mut parent = database.interface(name)?.parent;
+    while let Some(candidate) = parent {
+        if let Some(implementation) = implementations.get(candidate) {
+            return Ok(Some((
+                implementation.payload.clone(),
+                implementation.lifetime,
+            )));
+        }
+        parent = database.interface(candidate)?.parent;
+    }
+    Ok(None)
 }
 
 fn discover(
