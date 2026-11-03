@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::f32::consts::FRAC_PI_4;
 use std::sync::Arc;
 
-use num_traits::ToPrimitive as _;
+use num_traits::ToPrimitive;
 
 /// Shadows larger than this are skipped rather than allocating unbounded
 /// temporary bitmaps from hostile coordinates.
@@ -769,6 +769,7 @@ impl Canvas2D {
             sigma,
             min_x as f32 - margin as f32,
             min_y as f32 - margin as f32,
+            self.state.alpha,
         );
     }
 
@@ -2053,51 +2054,159 @@ impl Canvas2D {
         builder.finish()
     }
 
-    /// Applies a `colorMatrix` filter to a single drawing operation. The
-    /// operation renders into a transparent layer, the matrix runs on that
-    /// layer, and the result composites with the state's blend mode
-    /// (<https://html.spec.whatwg.org/multipage/canvas.html#filters>).
-    fn with_draw_filter(&mut self, draw: impl FnOnce(&mut Self)) {
+    /// Applies a `colorMatrix` filter to a single drawing operation, bounded to
+    /// the operation's device rect. The operation renders into a transparent
+    /// layer, the matrix runs on that layer, the shadow is rendered from the
+    /// filtered image, and the result composites once with the state's blend
+    /// mode (<https://html.spec.whatwg.org/multipage/canvas.html#drawing-model>).
+    fn with_draw_filter(
+        &mut self,
+        bounds: tiny_skia::Rect,
+        draw: impl FnOnce(&mut Self, Transform),
+    ) {
         let Some(matrix) = self.state.filter_matrix else {
-            draw(self);
+            draw(self, Transform::identity());
             return;
         };
-        let parent = self.pixmap.take();
-        self.pixmap = make_pixmap(self.width, self.height);
-        // The operation paints into a transparent layer, so its own compositing
-        // must be source-over. The state's blend mode applies once, when the
-        // filtered layer composites onto the parent
-        // (<https://html.spec.whatwg.org/multipage/canvas.html#drawing-model>).
-        let blend = std::mem::replace(&mut self.state.blend, BlendMode::SourceOver);
-        draw(self);
-        self.state.blend = blend;
-        let mut layer = self.pixmap.take();
-        if let Some(pixmap) = layer.as_mut() {
-            apply_color_matrix(pixmap, &matrix);
-        }
-        let Some(mut parent_pixmap) = parent else {
-            self.pixmap = None;
+        let Some((left, top, width, height)) = self.filter_bounds(bounds) else {
             return;
         };
-        if let Some(layer_pixmap) = layer {
-            parent_pixmap.draw_pixmap(
-                0,
-                0,
-                layer_pixmap.as_ref(),
-                &PixmapPaint {
-                    opacity: 1.0,
-                    blend_mode: blend,
-                    quality: FilterQuality::Nearest,
-                },
-                Transform::identity(),
-                self.state.clip.as_deref(),
+        let Some(layer) = make_pixmap(width, height) else {
+            return;
+        };
+        let parent = self.pixmap.replace(layer);
+        let saved_transform = self.state.transform;
+        let saved_blend = std::mem::replace(&mut self.state.blend, BlendMode::SourceOver);
+        let saved_shadow = self.state.shadow.clone();
+        let saved_shadow_blur = self.state.shadow_blur;
+        let saved_clip = self.state.clip.take();
+        // The canvas clip is in canvas coordinates; the draw runs in the
+        // layer's own coordinates, so crop it to the layer once instead of
+        // applying it at every paint.
+        self.state.clip = saved_clip
+            .as_ref()
+            .and_then(|clip| crop_clip(clip, left, top, width, height))
+            .map(Arc::new);
+        // The shadow is rendered from the filtered image after the matrix, so
+        // the draw itself must not paint it.
+        self.state.shadow = CanvasColor::new([0, 0, 0, 0]);
+        self.state.shadow_blur = 0.0;
+        let offset = Transform::from_translate(-to_f32(left), -to_f32(top));
+        self.state.transform = saved_transform.pre_concat(offset);
+        draw(self, offset);
+        self.state.transform = saved_transform;
+        self.state.blend = saved_blend;
+        self.state.shadow = saved_shadow;
+        self.state.shadow_blur = saved_shadow_blur;
+        self.state.clip = saved_clip;
+        let Some(mut layer) = self.pixmap.take() else {
+            self.pixmap = parent;
+            return;
+        };
+        self.pixmap = parent;
+        apply_color_matrix(&mut layer, &matrix);
+
+        // Drawing model step 5: the shadow comes from the filtered image.
+        if self.shadow_drawn() {
+            self.finish_shadow(
+                layer.clone(),
+                self.state.shadow_blur / 2.0,
+                to_f32(left),
+                to_f32(top),
+                1.0,
             );
         }
-        self.pixmap = Some(parent_pixmap);
+
+        // Drawing model step 7: composite the filtered image once.
+        if clears_uncovered(self.state.blend)
+            && let Some(coverage) = self.coverage_mask(&layer, left, top)
+        {
+            self.clear_uncovered_mask(&coverage);
+        }
+        let Some(parent_pixmap) = &mut self.pixmap else {
+            return;
+        };
+        parent_pixmap.draw_pixmap(
+            left,
+            top,
+            layer.as_ref(),
+            &PixmapPaint {
+                opacity: 1.0,
+                blend_mode: self.state.blend,
+                quality: FilterQuality::Nearest,
+            },
+            Transform::identity(),
+            self.state.clip.as_deref(),
+        );
+    }
+
+    /// The integer device rect a filtered draw can touch, padded for
+    /// antialiasing and clamped to the canvas. `None` when the draw has no
+    /// finite area, so no layer is allocated.
+    fn filter_bounds(&self, bounds: tiny_skia::Rect) -> Option<(i32, i32, u32, u32)> {
+        if !(bounds.left().is_finite()
+            && bounds.top().is_finite()
+            && bounds.right().is_finite()
+            && bounds.bottom().is_finite())
+        {
+            return None;
+        }
+        let canvas_width = to_f32(self.width);
+        let canvas_height = to_f32(self.height);
+        let left = (bounds.left() - 1.0).clamp(0.0, canvas_width).floor();
+        let top = (bounds.top() - 1.0).clamp(0.0, canvas_height).floor();
+        let right = (bounds.right() + 1.0).clamp(0.0, canvas_width).ceil();
+        let bottom = (bounds.bottom() + 1.0).clamp(0.0, canvas_height).ceil();
+        let width = (right - left).to_u32()?;
+        let height = (bottom - top).to_u32()?;
+        if width == 0 || height == 0 {
+            return None;
+        }
+        Some((left.to_i32()?, top.to_i32()?, width, height))
+    }
+
+    /// The layer's alpha placed into a full-canvas coverage mask, for the
+    /// composite operations that clear where the source does not cover.
+    fn coverage_mask(&self, layer: &Pixmap, left: i32, top: i32) -> Option<Mask> {
+        let mut coverage = Mask::new(self.width, self.height)?;
+        let width = layer.width() as usize;
+        let height = layer.height() as usize;
+        let stride = self.width as usize;
+        let data = layer.data();
+        for y in 0..height {
+            let canvas_y = top + i32::try_from(y).ok()?;
+            if canvas_y < 0 || canvas_y >= i32::try_from(self.height).ok()? {
+                continue;
+            }
+            for x in 0..width {
+                let canvas_x = left + i32::try_from(x).ok()?;
+                if canvas_x < 0 || canvas_x >= i32::try_from(self.width).ok()? {
+                    continue;
+                }
+                let alpha = data[(y * width + x) * 4 + 3];
+                let index =
+                    usize::try_from(canvas_y).ok()? * stride + usize::try_from(canvas_x).ok()?;
+                coverage.data_mut()[index] = alpha;
+            }
+        }
+        Some(coverage)
+    }
+
+    fn shadow_drawn(&self) -> bool {
+        self.state.shadow.rgba[3] != 0
+            && (self.state.shadow_blur != 0.0
+                || self.state.shadow_x != 0.0
+                || self.state.shadow_y != 0.0)
     }
 
     fn fill_path(&mut self, path: &Path, even_odd: bool) {
-        self.with_draw_filter(|canvas| canvas.fill_path_inner(path, even_odd));
+        let bounds = path.bounds();
+        self.with_draw_filter(bounds, |canvas, offset| {
+            let Some(path) = path.clone().transform(offset) else {
+                return;
+            };
+            canvas.fill_path_inner(&path, even_odd);
+        });
     }
 
     fn fill_path_inner(&mut self, path: &Path, even_odd: bool) {
@@ -2175,20 +2284,19 @@ impl Canvas2D {
     /// canvas, not just the shape
     /// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-globalcompositeoperation>).
     fn clear_uncovered(&mut self, path: &Path, rule: FillRule) {
-        if !matches!(
-            self.state.blend,
-            BlendMode::Source
-                | BlendMode::SourceIn
-                | BlendMode::SourceOut
-                | BlendMode::DestinationIn
-                | BlendMode::DestinationAtop
-        ) {
+        if !clears_uncovered(self.state.blend) {
             return;
         }
         let Some(mut shape) = Mask::new(self.width, self.height) else {
             return;
         };
         shape.fill_path(path, rule, true, Transform::identity());
+        self.clear_uncovered_mask(&shape);
+    }
+
+    /// Clears the destination where `shape` has no coverage, for the composite
+    /// operations that would otherwise leave the untouched canvas in place.
+    fn clear_uncovered_mask(&mut self, shape: &Mask) {
         let clip = match &self.state.clip {
             None => None,
             Some(clip) => {
@@ -2238,12 +2346,14 @@ impl Canvas2D {
             let size = tiny_skia::IntSize::from_wh(clip.width(), clip.height())?;
             Mask::from_vec(clip.data().to_vec(), size)?
         } else {
-            let mut mask = Mask::new(self.width, self.height)?;
+            let (pixmap_width, pixmap_height) = self.pixmap_size();
+            let mut mask = Mask::new(pixmap_width, pixmap_height)?;
             #[expect(
                 clippy::cast_precision_loss,
                 reason = "canvas sides are far below 2^24"
             )]
-            let full = tiny_skia::Rect::from_xywh(0.0, 0.0, self.width as f32, self.height as f32)?;
+            let full =
+                tiny_skia::Rect::from_xywh(0.0, 0.0, pixmap_width as f32, pixmap_height as f32)?;
             mask.fill_path(
                 &PathBuilder::from_rect(full),
                 FillRule::Winding,
@@ -2256,8 +2366,40 @@ impl Canvas2D {
         Some(mask)
     }
 
+    /// The size of the pixmap the drawing operations currently target. A
+    /// filtered draw targets its bounded layer; everything else targets the
+    /// canvas.
+    fn pixmap_size(&self) -> (u32, u32) {
+        self.pixmap
+            .as_ref()
+            .map_or((self.width, self.height), |pixmap| {
+                (pixmap.width(), pixmap.height())
+            })
+    }
+
     fn stroke_path(&mut self, path: &Path) {
-        self.with_draw_filter(|canvas| canvas.stroke_path_inner(path));
+        let scale = self
+            .state
+            .transform
+            .sx
+            .abs()
+            .max(self.state.transform.sy.abs());
+        let padding = self.state.line_width * scale * self.state.miter_limit.max(1.0) + 1.0;
+        let bounds = path.bounds();
+        let Some(bounds) = tiny_skia::Rect::from_ltrb(
+            bounds.left() - padding,
+            bounds.top() - padding,
+            bounds.right() + padding,
+            bounds.bottom() + padding,
+        ) else {
+            return;
+        };
+        self.with_draw_filter(bounds, |canvas, offset| {
+            let Some(path) = path.clone().transform(offset) else {
+                return;
+            };
+            canvas.stroke_path_inner(&path);
+        });
     }
 
     fn stroke_path_inner(&mut self, path: &Path) {
@@ -2764,7 +2906,50 @@ impl Canvas2D {
 
     /// `drawImage`, with the source already decoded to straight RGBA.
     pub(crate) fn draw_image(&mut self, source: &SourceImage, src: Rect, dst: Rect) {
-        self.with_draw_filter(|canvas| {
+        let bounds = if let Some(path) = self.rect_path(dst.x, dst.y, dst.width, dst.height) {
+            path.bounds()
+        } else {
+            let mut left = dst.x;
+            let mut top = dst.y;
+            let mut right = dst.x + dst.width;
+            let mut bottom = dst.y + dst.height;
+            if left > right {
+                std::mem::swap(&mut left, &mut right);
+            }
+            if top > bottom {
+                std::mem::swap(&mut top, &mut bottom);
+            }
+            let mut corners = [
+                Point::from_xy(left, top),
+                Point::from_xy(right, top),
+                Point::from_xy(right, bottom),
+                Point::from_xy(left, bottom),
+            ];
+            for corner in &mut corners {
+                self.state.transform.map_point(corner);
+            }
+            let left = corners
+                .iter()
+                .map(|point| point.x)
+                .fold(f32::INFINITY, f32::min);
+            let top = corners
+                .iter()
+                .map(|point| point.y)
+                .fold(f32::INFINITY, f32::min);
+            let right = corners
+                .iter()
+                .map(|point| point.x)
+                .fold(f32::NEG_INFINITY, f32::max);
+            let bottom = corners
+                .iter()
+                .map(|point| point.y)
+                .fold(f32::NEG_INFINITY, f32::max);
+            let Some(bounds) = tiny_skia::Rect::from_ltrb(left, top, right, bottom) else {
+                return;
+            };
+            bounds
+        };
+        self.with_draw_filter(bounds, |canvas, _| {
             canvas.draw_image_inner(source, src, dst);
         });
     }
@@ -2929,7 +3114,7 @@ impl Canvas2D {
             Transform::identity(),
             None,
         );
-        self.finish_shadow(mask, sigma, left, top);
+        self.finish_shadow(mask, sigma, left, top, self.state.alpha);
     }
 
     /// Paints the shadow pass for a shape before the shape itself
@@ -3010,12 +3195,12 @@ impl Canvas2D {
                 mask.fill_path(&user_path, &paint, rule, target, None);
             }
         }
-        self.finish_shadow(mask, sigma, left, top);
+        self.finish_shadow(mask, sigma, left, top, self.state.alpha);
     }
 
     /// Tints, blurs, offsets, and composites a shadow mask. The mask covers
     /// the canvas region starting at `(left, top)`.
-    fn finish_shadow(&mut self, mut mask: Pixmap, sigma: f32, left: f32, top: f32) {
+    fn finish_shadow(&mut self, mut mask: Pixmap, sigma: f32, left: f32, top: f32, opacity: f32) {
         Self::tint_shadow(&mut mask, self.state.shadow.rgba);
         blur_pixmap(&mut mask, sigma);
         let offset =
@@ -3025,7 +3210,7 @@ impl Canvas2D {
                 mask.as_ref(),
                 SpreadMode::Pad,
                 FilterQuality::Nearest,
-                self.state.alpha,
+                opacity,
                 offset,
             ),
             blend_mode: self.state.blend,
@@ -3499,6 +3684,55 @@ fn dash_and_stroke(path: &Path, stroke: &Stroke, transform: Transform) -> Option
         path
     };
     input.stroke(stroke, scale)
+}
+
+/// The composite operations that clear where the source does not cover
+/// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-globalcompositeoperation>).
+fn clears_uncovered(blend: BlendMode) -> bool {
+    matches!(
+        blend,
+        BlendMode::Source
+            | BlendMode::SourceIn
+            | BlendMode::SourceOut
+            | BlendMode::DestinationIn
+            | BlendMode::DestinationAtop
+    )
+}
+
+/// A layer coordinate or size as a float. Device coordinates are far inside the
+/// exact `f32` integer range.
+fn to_f32<T: ToPrimitive>(value: T) -> f32 {
+    value.to_f32().unwrap_or(0.0)
+}
+
+/// The canvas clip cropped to a filtered layer's device rect.
+fn crop_clip(clip: &Mask, left: i32, top: i32, width: u32, height: u32) -> Option<Mask> {
+    let mut out = Mask::new(width, height)?;
+    let target_width = usize::try_from(width).ok()?;
+    let source_width = usize::try_from(clip.width()).ok()?;
+    let source_height = usize::try_from(clip.height()).ok()?;
+    for y in 0..usize::try_from(height).ok()? {
+        let source_y = top.checked_add(i32::try_from(y).ok()?)?;
+        if source_y < 0 {
+            continue;
+        }
+        let source_y = usize::try_from(source_y).ok()?;
+        if source_y >= source_height {
+            continue;
+        }
+        for x in 0..target_width {
+            let source_x = left.checked_add(i32::try_from(x).ok()?)?;
+            if source_x < 0 {
+                continue;
+            }
+            let source_x = usize::try_from(source_x).ok()?;
+            if source_x >= source_width {
+                continue;
+            }
+            out.data_mut()[y * target_width + x] = clip.data()[source_y * source_width + source_x];
+        }
+    }
+    Some(out)
 }
 
 fn to_premultiplied(straight: &[u8]) -> Vec<u8> {
@@ -3983,5 +4217,25 @@ mod tests {
         // The shadow uses the alpha captured at beginLayer and lands below the
         // layer bitmap.
         assert_eq!(pixel(0, 5), &[0, 255, 0, 128]);
+    }
+
+    /// A filtered draw renders into a layer bounded to its own device rect, so
+    /// the shape must still land where it was drawn and must not spill outside
+    /// the rect.
+    #[test]
+    fn a_filtered_draw_stays_inside_its_device_rect() {
+        let mut canvas = Canvas2D::new(32, 32);
+        canvas.set_fill_style(StyleValue::Color([255, 0, 0, 255]));
+        canvas.set_filter_matrix(Some(ColorMatrix::IDENTITY));
+        canvas.fill_rect(8.0, 8.0, 4.0, 4.0);
+        let pixels = canvas.read_pixels(0, 0, 32, 32).unwrap();
+        let alpha = |x: usize, y: usize| pixels[(y * 32 + x) * 4 + 3];
+        assert_eq!(alpha(10, 10), 255, "the filtered shape moved");
+        assert_eq!(alpha(0, 0), 0, "the filtered layer leaked into the canvas");
+        assert_eq!(
+            alpha(20, 20),
+            0,
+            "the filtered layer leaked into the canvas"
+        );
     }
 }
