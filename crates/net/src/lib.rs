@@ -7,6 +7,7 @@ mod client;
 pub mod cors;
 mod error;
 mod identity;
+pub mod orb;
 mod protocol;
 pub mod referrer;
 mod resolve;

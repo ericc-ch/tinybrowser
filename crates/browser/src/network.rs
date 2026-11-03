@@ -740,6 +740,21 @@ impl TabNetworkHandle {
         initiator: &url::Origin,
         owner: RendererAssignmentId,
     ) -> Result<DialOutcome, DialFailure> {
+        self.dial_request_unfiltered(request, initiator, owner)
+            .await
+            .map(|outcome| orb_filter(request, outcome))
+    }
+
+    /// The dial itself. Its answer is the *internal* response for engine
+    /// consumers, so [`dial_request`](Self::dial_request) filters it before it
+    /// leaves the browser. Cache writes and sheet bookkeeping see the
+    /// unfiltered answer, which is what a later same-origin request reuses.
+    async fn dial_request_unfiltered(
+        &self,
+        request: &DialRequest,
+        initiator: &url::Origin,
+        owner: RendererAssignmentId,
+    ) -> Result<DialOutcome, DialFailure> {
         let started = Instant::now();
         let _keepalive = KeepaliveReservation::acquire(request)?;
         let (mode, stored, etag) = match self.cache_read(request, initiator, owner)? {
@@ -1351,6 +1366,56 @@ fn referrer_authorized(
     loaded.contains(&stripped)
 }
 
+/// Applies Opaque Response Blocking to one engine-facing opaque response, and
+/// trims the head such a response delivers to what its consumer can use.
+///
+/// A page `fetch` already receives the filtered view, whose body is null and
+/// whose headers are masked. Every other dial receives the unsafe internal
+/// response so the engine can decode an image, compile a script, or parse a
+/// sheet, and without this check it could ask for any cross-origin document and
+/// read it. Chromium runs ORB in the network service before a byte reaches a
+/// renderer; this is the same boundary
+/// (<https://github.com/annevk/orb>).
+fn orb_filter(request: &DialRequest, outcome: DialOutcome) -> DialOutcome {
+    if request.policy.exposes_response() || !outcome.response_type.is_opaque() {
+        return outcome;
+    }
+    let nosniff = outcome.headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("x-content-type-options")
+            && value
+                .split(',')
+                .any(|option| option.trim().eq_ignore_ascii_case("nosniff"))
+    });
+    let body = match &outcome.body {
+        ResponseBody::Bytes(bytes) => Some(bytes.as_slice()),
+        // An undecodable body has no readable bytes, and a streamed one has
+        // not been read yet: the MIME-type rules still apply, and the sniffing
+        // rules wait for bytes that never arrive (Chromium's `SniffMore`).
+        ResponseBody::Undecodable | ResponseBody::Streamed(_) => None,
+    };
+    if net::orb::blocks(outcome.content_type.as_deref(), nosniff, body) {
+        return DialOutcome {
+            content_type: None,
+            headers: Vec::new(),
+            body: ResponseBody::Bytes(Vec::new()),
+            ..outcome
+        };
+    }
+    // An opaque head carries the whole served header list, which names
+    // cookies, cache policy, and origins the consumer has no say over. The
+    // engine may only act on what decides how the body is interpreted.
+    let headers = outcome
+        .headers
+        .iter()
+        .filter(|(name, _)| {
+            name.eq_ignore_ascii_case("content-type")
+                || name.eq_ignore_ascii_case("x-content-type-options")
+        })
+        .cloned()
+        .collect();
+    DialOutcome { headers, ..outcome }
+}
+
 /// The cache write a streamed body performs once its bytes are complete.
 struct PendingStore {
     outcome: DialOutcome,
@@ -1657,6 +1722,74 @@ mod tests {
         assert!(
             referrer_authorized(&fragment, &loader, &sheets),
             "the comparison is on the fragment-stripped URL"
+        );
+    }
+
+    /// A cross-origin `no-cors` subresource receives the *internal* response,
+    /// so without ORB a page could label a dial an image and read a
+    /// cross-origin document
+    /// (<https://github.com/annevk/orb>).
+    #[test]
+    fn orb_stops_an_opaque_document_and_trims_an_opaque_head() {
+        fn opaque(content_type: &str, body: &[u8]) -> DialOutcome {
+            DialOutcome {
+                status: 200,
+                status_text: "OK".into(),
+                final_url: Url::parse("http://b.test/img").expect("image URL"),
+                content_type: Some(content_type.to_owned()),
+                headers: vec![
+                    ("content-type".to_owned(), content_type.to_owned()),
+                    ("set-cookie".to_owned(), "leak=1".to_owned()),
+                    ("cache-control".to_owned(), "max-age=60".to_owned()),
+                ],
+                body: ResponseBody::Bytes(body.to_vec()),
+                response_type: net::cors::ResponseType::Opaque,
+                crossed_origin: true,
+                redirect_count: 0,
+                referrer: None,
+            }
+        }
+
+        let request = dial(
+            RequestPolicy::Image { crossorigin: None },
+            "http://b.test/img",
+        );
+        let blocked = orb_filter(&request, opaque("image/png", b"<!doctype html>"));
+        assert!(
+            matches!(&blocked.body, ResponseBody::Bytes(bytes) if bytes.is_empty()),
+            "a document labelled as an image keeps no body"
+        );
+        assert!(blocked.headers.is_empty(), "a blocked response has no head");
+        assert_eq!(blocked.content_type, None);
+
+        let kept = orb_filter(
+            &request,
+            opaque("image/png", b"\x89PNG\r\n\x1a\nimage bytes"),
+        );
+        assert!(
+            matches!(&kept.body, ResponseBody::Bytes(bytes) if !bytes.is_empty()),
+            "a real image keeps its body"
+        );
+        assert_eq!(
+            kept.headers,
+            [("content-type".to_owned(), "image/png".to_owned())],
+            "an opaque head keeps only what decides how the body is read"
+        );
+
+        // A page `fetch` reads the filtered view, which the fetch layer already
+        // masks; ORB must not touch it twice.
+        let fetch = dial(
+            RequestPolicy::Fetch(renderer::CorsRequest {
+                mode: renderer::CorsMode::NoCors,
+                credentials: net::cors::CredentialsMode::Include,
+                redirect: net::cors::RedirectMode::Follow,
+            }),
+            "http://b.test/img",
+        );
+        let untouched = orb_filter(&fetch, opaque("text/html", b"<!doctype html>"));
+        assert!(
+            matches!(&untouched.body, ResponseBody::Bytes(bytes) if !bytes.is_empty()),
+            "the page-facing path keeps its own filtering"
         );
     }
 
@@ -2107,6 +2240,60 @@ mod tests {
         assert!(
             matches!(&next.body, ResponseBody::Bytes(body) if body == b"ok"),
             "the next dial reads its body"
+        );
+        server.abort();
+    }
+
+    /// A cross-origin `no-cors` subresource that is really a document never
+    /// reaches the engine, and the opaque head it does see is trimmed to what
+    /// decides how a body is interpreted
+    /// (<https://github.com/annevk/orb>).
+    #[tokio::test]
+    async fn orb_blocks_a_cross_origin_document_before_the_engine_reads_it() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let body: &[u8] = b"<!doctype html><p>secret</p>";
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            tokio::spawn(async move {
+                let mut buffer = [0u8; 1024];
+                let _ = socket.read(&mut buffer).await;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/html\r\nSet-Cookie: a=1\r\n\r\n",
+                    body.len()
+                );
+                socket
+                    .write_all(head.as_bytes())
+                    .await
+                    .expect("response head");
+                socket.write_all(body).await.expect("response body");
+            });
+        });
+        let context = NetworkContext::new(AgentOptions::default());
+        let handle = context.tab_handle();
+        let initiator = Url::parse("http://a.test/page").expect("page URL").origin();
+        let owner = RendererAssignmentId::new(1);
+
+        let image = dial(
+            RequestPolicy::Image { crossorigin: None },
+            &format!("http://{address}/doc"),
+        );
+        let outcome = handle
+            .dial_request(&image, &initiator, owner)
+            .await
+            .expect("image dial");
+        assert!(
+            matches!(&outcome.body, ResponseBody::Bytes(body) if body.is_empty()),
+            "a document labelled as an image reaches the engine empty"
+        );
+        assert_eq!(outcome.content_type, None, "a blocked response has no type");
+        assert!(
+            outcome.headers.is_empty(),
+            "a blocked response has no header list"
         );
         server.abort();
     }
