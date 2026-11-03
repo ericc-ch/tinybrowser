@@ -9,12 +9,13 @@ use std::time::Duration;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use browser::{
-    BrowserHandle, DEFAULT_VIEWPORT, FrameId, RemoteValue, ScreenshotClip, ScreenshotRequest,
-    TabError, TabEvent, TabHandle, TabId,
+    BrowserHandle, DEFAULT_VIEWPORT, FrameId, RemoteValue, ScreenshotRequest, TabError, TabEvent,
+    TabHandle, TabId,
 };
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
+
+use crate::params::CallArgument;
 
 use crate::DEFAULT_BROWSER_CONTEXT_ID;
 
@@ -534,9 +535,10 @@ pub(crate) fn route(method: &str, target: &Target) -> Option<Handler> {
 
 /// Answers an accepted no-op. Conditional entries prove their premise from the
 /// params and otherwise report `MethodNotFound`, exactly like a real handler
-/// that cannot honor the request.
+/// that cannot honor the request. A malformed request is still an
+/// invalid-params error, never a "method not found".
 pub(crate) fn accept(reason: Accepted, params: &Value) -> Result<Value, DispatchError> {
-    if premise_holds(reason, params) {
+    if premise_holds(reason, params)? {
         Ok(json!({}))
     } else {
         Err(DispatchError::MethodNotFound)
@@ -545,11 +547,15 @@ pub(crate) fn accept(reason: Accepted, params: &Value) -> Result<Value, Dispatch
 
 /// Whether an accepted no-op applies. Conditional variants prove their premise
 /// here, once; the rest hold unconditionally.
-fn premise_holds(reason: Accepted, params: &Value) -> bool {
+fn premise_holds(reason: Accepted, params: &Value) -> Result<bool, DispatchError> {
     match reason {
-        Accepted::DefaultEmulatedMedia => emulated_media_is_default(params),
+        Accepted::DefaultEmulatedMedia => {
+            let params: crate::params::SetEmulatedMedia = crate::params::parse(params)?;
+            Ok(emulated_media_is_default(&params))
+        }
         Accepted::CacheAlreadyDisabled => {
-            params.get("cacheDisabled").and_then(Value::as_bool) == Some(true)
+            let params: crate::params::SetCacheDisabled = crate::params::parse(params)?;
+            Ok(params.cache_disabled)
         }
         Accepted::WaitingForDebugger
         | Accepted::DomainWithoutEvents
@@ -557,7 +563,7 @@ fn premise_holds(reason: Accepted, params: &Value) -> bool {
         | Accepted::PageHasNoChildTargets
         | Accepted::RendererOwnsFonts
         | Accepted::NoDownloadPipeline
-        | Accepted::NoHttpCache => true,
+        | Accepted::NoHttpCache => Ok(true),
     }
 }
 
@@ -682,37 +688,19 @@ async fn navigation_history(tab: &TabHandle) -> Result<Value, DispatchError> {
     Ok(json!({"currentIndex": history.current_index(), "entries": entries}))
 }
 
-/// Which properties a `Runtime.getProperties` request wants.
-#[derive(Debug, Default, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", default)]
-struct PropertyFilter {
-    own_properties: bool,
-    non_indexed_properties_only: bool,
-}
-
-/// How a `Runtime.getProperties` request wants them rendered.
-#[derive(Debug, Default, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", default)]
-struct PropertyRender {
-    accessor_properties_only: bool,
-    generate_preview: bool,
-}
-
-/// `Runtime.getProperties` params, parsed once at the protocol boundary.
-#[derive(Debug, Default, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", default)]
-pub(crate) struct GetPropertiesParams {
-    pub(crate) object_id: String,
-    pub(crate) object_group: String,
-    #[serde(flatten)]
-    filter: PropertyFilter,
-    #[serde(flatten)]
-    render: PropertyRender,
-}
-
-fn get_properties_script(params: &GetPropertiesParams) -> String {
-    let arguments = serde_json::to_string(params).unwrap_or_else(|_| "{}".to_owned());
-    RUNTIME_GET_PROPERTIES.replace("__ARGS__", &arguments)
+fn get_properties_script(params: &crate::params::GetProperties) -> String {
+    // The page helper reads booleans and an object-group string. The protocol
+    // has no `objectGroup` here, so property handles stay out of a group; the
+    // absent optional flags take their documented `false`.
+    let arguments = json!({
+        "objectId": params.object_id,
+        "objectGroup": "",
+        "ownProperties": params.own_properties.unwrap_or(false),
+        "nonIndexedPropertiesOnly": params.non_indexed_properties_only.unwrap_or(false),
+        "accessorPropertiesOnly": params.accessor_properties_only.unwrap_or(false),
+        "generatePreview": params.generate_preview.unwrap_or(false),
+    });
+    RUNTIME_GET_PROPERTIES.replace("__ARGS__", &arguments.to_string())
 }
 
 /// `Runtime.getProperties`: own and inherited properties of a page-side handle,
@@ -721,12 +709,9 @@ fn get_properties_script(params: &GetPropertiesParams) -> String {
 /// JavaScript has no reflection API for private names.
 /// <https://chromedevtools.github.io/devtools-protocol/tot/Runtime/#method-getProperties>
 async fn runtime_get_properties(tab: &TabHandle, params: &Value) -> Result<Value, DispatchError> {
-    let params: GetPropertiesParams = serde_json::from_value(params.clone())
-        .map_err(|error| DispatchError::Failed(error.to_string()))?;
+    let params: crate::params::GetProperties = crate::params::parse(params)?;
     if params.object_id.is_empty() {
-        return Err(DispatchError::Failed(
-            "Runtime.getProperties requires objectId".into(),
-        ));
+        return Err(DispatchError::InvalidParams("objectId".to_owned()));
     }
     let reply = execute_json(tab, &get_properties_script(&params)).await?;
     match reply.get("ok").and_then(Value::as_bool) {
@@ -749,11 +734,11 @@ pub(crate) async fn runtime_release_object(
     tab: &TabHandle,
     params: &Value,
 ) -> Result<Value, DispatchError> {
-    let object_id = params
-        .get("objectId")
-        .and_then(Value::as_str)
-        .ok_or_else(|| DispatchError::Failed("Runtime.releaseObject requires objectId".into()))?;
-    let script = RUNTIME_RELEASE.replace("__ARGS__", &json!({"objectId": object_id}).to_string());
+    let params: crate::params::ReleaseObject = crate::params::parse(params)?;
+    let script = RUNTIME_RELEASE.replace(
+        "__ARGS__",
+        &json!({"objectId": params.object_id}).to_string(),
+    );
     tab.execute_browser_script(&script)
         .await
         .map_err(|error| DispatchError::Failed(error.to_string()))?;
@@ -765,15 +750,10 @@ pub(crate) async fn runtime_release_object_group(
     tab: &TabHandle,
     params: &Value,
 ) -> Result<Value, DispatchError> {
-    let object_group = params
-        .get("objectGroup")
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            DispatchError::Failed("Runtime.releaseObjectGroup requires objectGroup".into())
-        })?;
+    let params: crate::params::ReleaseObjectGroup = crate::params::parse(params)?;
     let script = RUNTIME_RELEASE.replace(
         "__ARGS__",
-        &json!({"objectGroup": object_group}).to_string(),
+        &json!({"objectGroup": params.object_group}).to_string(),
     );
     tab.execute_browser_script(&script)
         .await
@@ -795,24 +775,17 @@ async fn execute_json(tab: &TabHandle, script: &str) -> Result<Value, DispatchEr
 
 /// True when `Emulation.setEmulatedMedia` selects the engine defaults: empty
 /// media and every feature value empty.
-fn emulated_media_is_default(params: &Value) -> bool {
+fn emulated_media_is_default(params: &crate::params::SetEmulatedMedia) -> bool {
     if params
-        .get("media")
-        .and_then(Value::as_str)
+        .media
+        .as_deref()
         .is_some_and(|media| !media.is_empty())
     {
         return false;
     }
-    match params.get("features") {
-        None | Some(Value::Null) => true,
-        Some(Value::Array(features)) => features.iter().all(|feature| {
-            feature
-                .get("value")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .is_empty()
-        }),
-        Some(_) => false,
+    match &params.features {
+        None => true,
+        Some(features) => features.iter().all(|feature| feature.value.is_empty()),
     }
 }
 
@@ -824,17 +797,9 @@ fn emulated_media_is_default(params: &Value) -> bool {
 /// source is empty) run in the main world. That is a known isolation gap
 /// (docs/progress.md).
 async fn add_init_script(params: &Value, tab: &TabHandle) -> Result<Value, DispatchError> {
-    let source = params
-        .get("source")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
-    let run_immediately = params
-        .get("runImmediately")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let params: crate::params::AddInitScript = crate::params::parse(params)?;
     let id = tab
-        .add_init_script(source, run_immediately)
+        .add_init_script(params.source, params.run_immediately.unwrap_or(false))
         .await
         .map_err(|error| DispatchError::Failed(error.to_string()))?;
     Ok(json!({"identifier": id.to_string()}))
@@ -842,15 +807,14 @@ async fn add_init_script(params: &Value, tab: &TabHandle) -> Result<Value, Dispa
 
 /// `Page.removeScriptToEvaluateOnNewDocument`: forget a registered script.
 async fn remove_init_script(params: &Value, tab: &TabHandle) -> Result<Value, DispatchError> {
-    if let Some(id) = params
-        .get("identifier")
-        .and_then(Value::as_str)
-        .and_then(|value| value.parse::<u64>().ok())
-    {
-        tab.remove_init_script(id)
-            .await
-            .map_err(|error| DispatchError::Failed(error.to_string()))?;
-    }
+    let params: crate::params::RemoveInitScript = crate::params::parse(params)?;
+    let id = params
+        .identifier
+        .parse::<u64>()
+        .map_err(|_| DispatchError::InvalidParams("identifier".to_owned()))?;
+    tab.remove_init_script(id)
+        .await
+        .map_err(|error| DispatchError::Failed(error.to_string()))?;
     Ok(json!({}))
 }
 
@@ -861,19 +825,19 @@ async fn remove_init_script(params: &Value, tab: &TabHandle) -> Result<Value, Di
 /// rather than silently approximated
 /// (<https://chromedevtools.github.io/devtools-protocol/tot/Emulation/#method-setDeviceMetricsOverride>).
 async fn set_device_metrics(params: &Value, tab: &TabHandle) -> Result<Value, DispatchError> {
-    let width = required_metric(params, "width")?;
-    let height = required_metric(params, "height")?;
+    let params: crate::params::SetDeviceMetrics = crate::params::parse(params)?;
+    let width = narrow_metric(params.width, "width")?;
+    let height = narrow_metric(params.height, "height")?;
     if width == 0 || height == 0 {
         return clear_device_metrics(tab).await;
     }
-    if params.get("mobile").and_then(Value::as_bool) == Some(true) {
+    if params.mobile == Some(true) {
         return Err(DispatchError::Failed(
             "mobile emulation is not supported".into(),
         ));
     }
     if params
-        .get("deviceScaleFactor")
-        .and_then(Value::as_f64)
+        .device_scale_factor
         .is_some_and(|scale| (scale - 1.0).abs() > f64::EPSILON)
     {
         return Err(DispatchError::Failed(
@@ -901,17 +865,15 @@ async fn set_viewport(tab: &TabHandle, width: u32, height: u32) -> Result<Value,
     Ok(json!({}))
 }
 
-/// One required integer emulation metric.
-fn required_metric(params: &Value, name: &str) -> Result<u32, DispatchError> {
-    params
-        .get(name)
-        .and_then(Value::as_u64)
-        .and_then(|value| u32::try_from(value).ok())
-        .ok_or_else(|| {
-            DispatchError::Failed(format!(
-                "Emulation.setDeviceMetricsOverride requires an integer {name}"
-            ))
-        })
+/// One emulation metric as the renderer's `u32` viewport dimension. The
+/// protocol's integer decoding happened in [`crate::params::SetDeviceMetrics`];
+/// this only narrows a value that does not fit.
+fn narrow_metric(value: u64, name: &str) -> Result<u32, DispatchError> {
+    u32::try_from(value).map_err(|_| {
+        DispatchError::Failed(format!(
+            "Emulation.setDeviceMetricsOverride {name} does not fit 32 bits"
+        ))
+    })
 }
 
 /// Capture surface side from a clip extent: at least 1, at most the renderer
@@ -930,17 +892,61 @@ fn capture_side(extent: f64) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{ROUTES, capture_side, required_metric};
+    use super::{ROUTES, arguments_expression, capture_side, get_properties_script};
+    use crate::params::{self, CallArgument, GetProperties, SetDeviceMetrics};
     use serde_json::json;
 
     #[test]
-    fn emulation_metrics_require_integers() {
-        let params = json!({"width": 1024, "height": 768});
-        assert_eq!(required_metric(&params, "width").expect("width"), 1024);
-        assert_eq!(required_metric(&params, "height").expect("height"), 768);
-        assert!(required_metric(&json!({}), "width").is_err());
-        assert!(required_metric(&json!({"width": 10.5}), "width").is_err());
-        assert!(required_metric(&json!({"width": -1}), "width").is_err());
+    fn device_metrics_require_integers_in_range() {
+        let params: SetDeviceMetrics =
+            params::parse(&json!({"width": 1024, "height": 768})).expect("integer metrics");
+        assert_eq!(params.width, 1024);
+        assert_eq!(params.height, 768);
+        assert!(params::parse::<SetDeviceMetrics>(&json!({"height": 768})).is_err());
+        assert!(params::parse::<SetDeviceMetrics>(&json!({"width": 10.5, "height": 1})).is_err());
+        assert!(params::parse::<SetDeviceMetrics>(&json!({"width": -1, "height": 1})).is_err());
+        assert!(params::parse::<SetDeviceMetrics>(&json!({"width": 1, "height": 1})).is_ok());
+    }
+
+    /// The page helper reads six keys with fixed types; a `null` where it
+    /// expects `false` changes how it walks the chain.
+    #[test]
+    fn get_properties_arguments_keep_the_helper_shape() {
+        let params: GetProperties = params::parse(&json!({"objectId": "h1"})).expect("params");
+        let script = get_properties_script(&params);
+        for expected in [
+            r#""objectId":"h1""#,
+            r#""objectGroup":"""#,
+            r#""ownProperties":false"#,
+            r#""nonIndexedPropertiesOnly":false"#,
+            r#""accessorPropertiesOnly":false"#,
+            r#""generatePreview":false"#,
+        ] {
+            assert!(
+                script.contains(expected),
+                "{expected} missing from {script}"
+            );
+        }
+    }
+
+    /// Each `CallArgument` variant becomes the JS expression the protocol
+    /// names, and an unserializable primitive is not silently lost.
+    #[test]
+    fn call_arguments_translate_each_variant() {
+        let arguments: Vec<CallArgument> = serde_json::from_value(json!([
+            {"objectId": "h1"},
+            {"value": {"a": 1}},
+            {"value": null},
+            {"unserializableValue": "NaN"},
+            {"unserializableValue": "-0"},
+            {"unserializableValue": "123n"},
+            {},
+        ]))
+        .expect("arguments");
+        assert_eq!(
+            arguments_expression(&arguments),
+            r#"[host.__tb_handles["h1"], {"a":1}, null, NaN, -0, 123n, undefined]"#
+        );
     }
 
     #[test]
@@ -1020,14 +1026,9 @@ pub(crate) async fn input_mouse_event(
     tab: &TabHandle,
     params: &Value,
 ) -> Result<Value, DispatchError> {
-    let kind = params.get("type").and_then(Value::as_str).unwrap_or("");
-    let x = params.get("x").and_then(Value::as_f64).unwrap_or(0.0);
-    let y = params.get("y").and_then(Value::as_f64).unwrap_or(0.0);
-    let button = match params
-        .get("button")
-        .and_then(Value::as_str)
-        .unwrap_or("left")
-    {
+    let params: crate::params::MouseEvent = crate::params::parse(params)?;
+    let kind = params.kind.as_str();
+    let button = match params.button.as_deref().unwrap_or("left") {
         "middle" => 1,
         "right" => 2,
         "back" => 3,
@@ -1036,13 +1037,14 @@ pub(crate) async fn input_mouse_event(
     };
     if kind == "mouseWheel" {
         let actions = json!({"actions": [{"type": "wheel", "id": "wheel", "actions": [{
-            "type": "scroll", "x": x, "y": y,
-            "deltaX": params.get("deltaX").and_then(Value::as_f64).unwrap_or(0.0),
-            "deltaY": params.get("deltaY").and_then(Value::as_f64).unwrap_or(0.0),
+            "type": "scroll", "x": params.x, "y": params.y,
+            "deltaX": params.delta_x.unwrap_or(0.0),
+            "deltaY": params.delta_y.unwrap_or(0.0),
         }]}]});
         return run_actions(tab, &actions).await;
     }
-    let mut items = vec![json!({"type": "pointerMove", "origin": "viewport", "x": x, "y": y})];
+    let mut items =
+        vec![json!({"type": "pointerMove", "origin": "viewport", "x": params.x, "y": params.y})];
     match kind {
         "mousePressed" => items.push(json!({"type": "pointerDown", "button": button})),
         "mouseReleased" => items.push(json!({"type": "pointerUp", "button": button})),
@@ -1061,9 +1063,10 @@ pub(crate) async fn input_key_event(
     tab: &TabHandle,
     params: &Value,
 ) -> Result<Value, DispatchError> {
-    let kind = params.get("type").and_then(Value::as_str).unwrap_or("");
-    let key = params.get("key").and_then(Value::as_str).unwrap_or("");
-    let text = params.get("text").and_then(Value::as_str).unwrap_or("");
+    let params: crate::params::KeyEvent = crate::params::parse(params)?;
+    let kind = params.kind.as_str();
+    let key = params.key.as_deref().unwrap_or("");
+    let text = params.text.as_deref().unwrap_or("");
     let value = if kind == "char" { text } else { key };
     if value.is_empty() {
         return Ok(json!({}));
@@ -1081,12 +1084,12 @@ pub(crate) async fn input_insert_text(
     tab: &TabHandle,
     params: &Value,
 ) -> Result<Value, DispatchError> {
-    let text = params.get("text").and_then(Value::as_str).unwrap_or("");
-    if text.is_empty() {
+    let params: crate::params::InsertText = crate::params::parse(params)?;
+    if params.text.is_empty() {
         return Ok(json!({}));
     }
     let actions = json!({"actions": [{"type": "key", "id": "keyboard", "actions": [
-        {"type": "insertText", "value": text},
+        {"type": "insertText", "value": params.text},
     ]}]});
     run_actions(tab, &actions).await
 }
@@ -1096,17 +1099,13 @@ pub(crate) async fn input_touch_event(
     tab: &TabHandle,
     params: &Value,
 ) -> Result<Value, DispatchError> {
-    let kind = params.get("type").and_then(Value::as_str).unwrap_or("");
-    let Some(point) = params
-        .get("touchPoints")
-        .and_then(Value::as_array)
-        .and_then(|points| points.first())
-    else {
+    let params: crate::params::TouchEvent = crate::params::parse(params)?;
+    let kind = params.kind.as_str();
+    let Some(point) = params.touch_points.first() else {
         return Ok(json!({}));
     };
-    let x = point.get("x").and_then(Value::as_f64).unwrap_or(0.0);
-    let y = point.get("y").and_then(Value::as_f64).unwrap_or(0.0);
-    let mut items = vec![json!({"type": "pointerMove", "origin": "viewport", "x": x, "y": y})];
+    let mut items =
+        vec![json!({"type": "pointerMove", "origin": "viewport", "x": point.x, "y": point.y})];
     match kind {
         "touchStart" => items.push(json!({"type": "pointerDown", "button": 0})),
         "touchEnd" => items.push(json!({"type": "pointerUp", "button": 0})),
@@ -1125,10 +1124,10 @@ pub(crate) async fn input_emulate_touch_from_mouse(
     tab: &TabHandle,
     params: &Value,
 ) -> Result<Value, DispatchError> {
-    let kind = params.get("type").and_then(Value::as_str).unwrap_or("");
-    let x = params.get("x").and_then(Value::as_f64).unwrap_or(0.0);
-    let y = params.get("y").and_then(Value::as_f64).unwrap_or(0.0);
-    let mut items = vec![json!({"type": "pointerMove", "origin": "viewport", "x": x, "y": y})];
+    let params: crate::params::EmulateTouchFromMouse = crate::params::parse(params)?;
+    let kind = params.kind.as_str();
+    let mut items =
+        vec![json!({"type": "pointerMove", "origin": "viewport", "x": params.x, "y": params.y})];
     match kind {
         "mousePressed" => items.push(json!({"type": "pointerDown", "button": 0})),
         "mouseReleased" => items.push(json!({"type": "pointerUp", "button": 0})),
@@ -1169,39 +1168,29 @@ async fn dom_eval(tab: &TabHandle, script: &str) -> Result<Value, DispatchError>
 }
 
 /// The `nodeId` a DOM method targets, defaulting to the document node.
-fn requested_node(params: &Value) -> u64 {
-    params.get("nodeId").and_then(Value::as_u64).unwrap_or(1)
+fn requested_node(node: &crate::params::NodeTarget) -> u64 {
+    node.node.unwrap_or(1)
 }
 
 /// A page-side expression resolving the node a DOM method requires, from any
 /// of `objectId` (a remote handle), `backendNodeId`, or `nodeId`.
-fn required_node_expression(params: &Value) -> Result<String, DispatchError> {
-    if params.get("objectId").and_then(Value::as_str).is_some()
-        || params
-            .get("backendNodeId")
-            .and_then(Value::as_u64)
-            .is_some()
-        || params.get("nodeId").and_then(Value::as_u64).is_some()
-    {
-        Ok(requested_node_expression(params))
+fn required_node_expression(node: &crate::params::NodeTarget) -> Result<String, DispatchError> {
+    if node.object.is_some() || node.backend.is_some() || node.node.is_some() {
+        Ok(requested_node_expression(node))
     } else {
         Err(DispatchError::InvalidParams(
-            "nodeId, backendNodeId, or objectId",
+            "nodeId, backendNodeId, or objectId".to_owned(),
         ))
     }
 }
 
 /// A page-side expression resolving the node a DOM method targets, from any of
 /// `objectId` (a remote handle), `backendNodeId`, or `nodeId`.
-fn requested_node_expression(params: &Value) -> String {
-    if let Some(id) = params.get("objectId").and_then(Value::as_str) {
+fn requested_node_expression(node: &crate::params::NodeTarget) -> String {
+    if let Some(id) = &node.object {
         return format!("(host.__tb_handles || {{}})[{}]", json_string(id));
     }
-    let id = params
-        .get("backendNodeId")
-        .and_then(Value::as_u64)
-        .or_else(|| params.get("nodeId").and_then(Value::as_u64))
-        .unwrap_or(1);
+    let id = node.backend.or(node.node).unwrap_or(1);
     format!("(host.__tb_dom_nodes || [])[{id}]")
 }
 
@@ -1231,14 +1220,6 @@ const REGISTER_PRELUDE: &str = r"(function(){
   return host.__tbDomRegister;
 })()";
 
-/// The `selector` parameter a DOM query method requires.
-fn requested_selector(params: &Value) -> Result<String, DispatchError> {
-    let Some(selector) = params.get("selector").and_then(Value::as_str) else {
-        return Err(DispatchError::InvalidParams("selector"));
-    };
-    Ok(json_string(selector))
-}
-
 /// `DOM.querySelector`: the first matching node's id.
 pub(crate) async fn dom_query_selector(
     tab: &TabHandle,
@@ -1252,11 +1233,11 @@ pub(crate) async fn dom_query_selector(
       if (!found) return host.stringify({__proto__: null, nodeId: 0});
       return host.stringify({__proto__: null, nodeId: register(found)});
     })()";
-    let selector = requested_selector(params)?;
+    let params: crate::params::QuerySelector = crate::params::parse(params)?;
     let script = SCRIPT
         .replace("__REGISTER__", REGISTER_PRELUDE)
-        .replace("__NODE__", &requested_node(params).to_string())
-        .replace("__SELECTOR__", &selector);
+        .replace("__NODE__", &params.node_id.to_string())
+        .replace("__SELECTOR__", &json_string(&params.selector));
     dom_eval(tab, &script).await
 }
 
@@ -1273,11 +1254,11 @@ pub(crate) async fn dom_query_selector_all(
       for (const found of n.querySelectorAll(__SELECTOR__)) host.push(nodeIds, register(found));
       return host.stringify({__proto__: null, nodeIds: nodeIds});
     })()";
-    let selector = requested_selector(params)?;
+    let params: crate::params::QuerySelector = crate::params::parse(params)?;
     let script = SCRIPT
         .replace("__REGISTER__", REGISTER_PRELUDE)
-        .replace("__NODE__", &requested_node(params).to_string())
-        .replace("__SELECTOR__", &selector);
+        .replace("__NODE__", &params.node_id.to_string())
+        .replace("__SELECTOR__", &json_string(&params.selector));
     dom_eval(tab, &script).await
 }
 
@@ -1297,7 +1278,8 @@ pub(crate) async fn dom_describe_node(
       if (n.nodeType === 1) { entry.localName = n.localName; entry.attributes = host.array(); }
       return host.stringify({__proto__: null, node: entry});
     })()";
-    let script = TEMPLATE.replace("__NODE__", &requested_node(params).to_string());
+    let node: crate::params::NodeTarget = crate::params::parse(params)?;
+    let script = TEMPLATE.replace("__NODE__", &requested_node(&node).to_string());
     dom_eval(tab, &script).await
 }
 
@@ -1314,7 +1296,8 @@ pub(crate) async fn dom_outer_html(
       if (html === undefined) throw new Error('Node does not support outerHTML');
       return host.stringify({__proto__: null, outerHTML: html});
     })()";
-    let script = TEMPLATE.replace("__NODE__", &required_node_expression(params)?);
+    let node: crate::params::NodeTarget = crate::params::parse(params)?;
+    let script = TEMPLATE.replace("__NODE__", &required_node_expression(&node)?);
     dom_eval(tab, &script).await
 }
 
@@ -1330,7 +1313,8 @@ pub(crate) async fn dom_attributes(
       for (const a of n.attributes) { host.push(attributes, a.name, a.value); }
       return host.stringify({__proto__: null, attributes: attributes});
     })()";
-    let script = TEMPLATE.replace("__NODE__", &required_node_expression(params)?);
+    let node: crate::params::NodeTarget = crate::params::parse(params)?;
+    let script = TEMPLATE.replace("__NODE__", &required_node_expression(&node)?);
     dom_eval(tab, &script).await
 }
 
@@ -1350,7 +1334,8 @@ pub(crate) async fn dom_resolve_node(
         description: n.nodeName,
       }});
     })()"#;
-    let script = TEMPLATE.replace("__NODE__", &requested_node(params).to_string());
+    let node: crate::params::NodeTarget = crate::params::parse(params)?;
+    let script = TEMPLATE.replace("__NODE__", &requested_node(&node).to_string());
     dom_eval(tab, &script).await
 }
 
@@ -1366,24 +1351,11 @@ pub(crate) async fn dom_node_for_location(
       if (!found) return host.stringify({__proto__: null, nodeId: 0});
       return host.stringify({__proto__: null, nodeId: register(found)});
     })()";
+    let params: crate::params::NodeForLocation = crate::params::parse(params)?;
     let script = TEMPLATE
         .replace("__REGISTER__", REGISTER_PRELUDE)
-        .replace(
-            "__X__",
-            &params
-                .get("x")
-                .and_then(Value::as_f64)
-                .unwrap_or(0.0)
-                .to_string(),
-        )
-        .replace(
-            "__Y__",
-            &params
-                .get("y")
-                .and_then(Value::as_f64)
-                .unwrap_or(0.0)
-                .to_string(),
-        );
+        .replace("__X__", &params.x.to_string())
+        .replace("__Y__", &params.y.to_string());
     dom_eval(tab, &script).await
 }
 
@@ -1424,7 +1396,8 @@ pub(crate) async fn dom_box_model(tab: &TabHandle, params: &Value) -> Result<Val
         width: Math.round(r.width), height: Math.round(r.height),
       }});
     })()";
-    let script = TEMPLATE.replace("__NODE__", &requested_node_expression(params));
+    let node: crate::params::NodeTarget = crate::params::parse(params)?;
+    let script = TEMPLATE.replace("__NODE__", &requested_node_expression(&node));
     dom_eval(tab, &script).await
 }
 
@@ -1442,7 +1415,8 @@ pub(crate) async fn dom_content_quads(
       }
       return host.stringify({__proto__: null, quads: quads});
     })()";
-    let script = TEMPLATE.replace("__NODE__", &requested_node_expression(params));
+    let node: crate::params::NodeTarget = crate::params::parse(params)?;
+    let script = TEMPLATE.replace("__NODE__", &requested_node_expression(&node));
     dom_eval(tab, &script).await
 }
 
@@ -1462,7 +1436,8 @@ pub(crate) async fn css_computed_style(
       }
       return host.stringify({__proto__: null, computedStyle: computedStyle});
     })()";
-    let script = TEMPLATE.replace("__NODE__", &requested_node(params).to_string());
+    let params: crate::params::ComputedStyleForNode = crate::params::parse(params)?;
+    let script = TEMPLATE.replace("__NODE__", &params.node_id.to_string());
     dom_eval(tab, &script).await
 }
 
@@ -1480,19 +1455,14 @@ pub(crate) async fn capture_screenshot(
     tab: &TabHandle,
     params: &Value,
 ) -> Result<Value, DispatchError> {
-    let format = params
-        .get("format")
-        .and_then(Value::as_str)
-        .unwrap_or("png");
+    let params: crate::params::CaptureScreenshot = crate::params::parse(params)?;
+    let format = params.format.as_deref().unwrap_or("png");
     if !format.eq_ignore_ascii_case("png") {
         return Err(DispatchError::Failed(
             "only png screenshots are supported".into(),
         ));
     }
-    let clip = params
-        .get("clip")
-        .filter(|value| !value.is_null())
-        .and_then(parse_clip);
+    let clip = params.clip;
     let viewport_width = capture_side(clip.map_or(f64::from(DEFAULT_VIEWPORT.0), |clip| {
         f64::from(clip.x + clip.width)
     }));
@@ -1504,7 +1474,7 @@ pub(crate) async fn capture_screenshot(
         viewport_height,
         clip,
     };
-    let frame = requested_frame(tab, params)?;
+    let frame = requested_frame(tab, params.frame_id.as_deref())?;
     let png = tab
         .screenshot_frame(frame, request)
         .await
@@ -1515,8 +1485,11 @@ pub(crate) async fn capture_screenshot(
 /// Resolves the optional renderer-frame extension used by automation clients
 /// that need to address a child realm directly. Standard CDP calls omit it
 /// and therefore address the main frame.
-pub(crate) fn requested_frame(tab: &TabHandle, params: &Value) -> Result<FrameId, DispatchError> {
-    let Some(raw) = params.get("frameId").and_then(Value::as_str) else {
+pub(crate) fn requested_frame(
+    tab: &TabHandle,
+    raw: Option<&str>,
+) -> Result<FrameId, DispatchError> {
+    let Some(raw) = raw else {
         return Ok(FrameId::MAIN);
     };
     let target_id = tab.id().to_string();
@@ -1536,25 +1509,6 @@ pub(crate) fn requested_frame(tab: &TabHandle, params: &Value) -> Result<FrameId
         return Err(DispatchError::Failed("invalid frameId".into()));
     }
     Ok(FrameId::new(renderer_frame))
-}
-
-/// Narrows a clipped CDP coordinate to the renderer's `f32` viewport.
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "callers clamp values to 4096 before narrowing; f32 is exact there"
-)]
-fn narrow(value: f64) -> f32 {
-    value as f32
-}
-
-/// Parses Playwright's `clip` (`{x, y, width, height, scale}`).
-fn parse_clip(value: &Value) -> Option<ScreenshotClip> {
-    Some(ScreenshotClip {
-        x: narrow(value.get("x")?.as_f64()?),
-        y: narrow(value.get("y")?.as_f64()?),
-        width: narrow(value.get("width")?.as_f64()?),
-        height: narrow(value.get("height")?.as_f64()?),
-    })
 }
 
 /// Waits for the next navigation outcome on a temporary subscription.
@@ -1595,20 +1549,37 @@ pub(crate) async fn open_url(tab: &TabHandle, url: &str) -> Result<(), DispatchE
 }
 
 /// Builds the JS argument array for `Runtime.callFunctionOn`.
-pub(crate) fn arguments_expression(params: &Value) -> String {
-    let mut parts = Vec::new();
-    if let Some(arguments) = params.get("arguments").and_then(Value::as_array) {
-        for argument in arguments {
-            if let Some(id) = argument.get("objectId").and_then(Value::as_str) {
-                parts.push(format!("host.__tb_handles[{}]", json_string(id)));
-            } else if let Some(value) = argument.get("value") {
-                parts.push(serde_json::to_string(value).unwrap_or_else(|_| "undefined".to_owned()));
-            } else {
-                parts.push("undefined".to_owned());
-            }
-        }
-    }
+pub(crate) fn arguments_expression(arguments: &[CallArgument]) -> String {
+    let parts: Vec<String> = arguments.iter().map(argument_expression).collect();
     format!("[{}]", parts.join(", "))
+}
+
+fn argument_expression(argument: &CallArgument) -> String {
+    match argument {
+        CallArgument::Object { object_id } => {
+            format!("host.__tb_handles[{}]", json_string(object_id))
+        }
+        CallArgument::Unserializable { value } => unserializable_literal(value),
+        CallArgument::Value { value } => {
+            serde_json::to_string(value).unwrap_or_else(|_| "undefined".to_owned())
+        }
+        CallArgument::Empty {} => "undefined".to_owned(),
+    }
+}
+
+/// One `unserializableValue` as the JS literal it names. The protocol lists
+/// exactly these forms; anything else reaches the page as `undefined` rather
+/// than as a string, which is what a failed decode would produce.
+fn unserializable_literal(value: &str) -> String {
+    match value {
+        "NaN" | "Infinity" | "-Infinity" | "-0" => value.to_owned(),
+        _ => match value.strip_suffix('n') {
+            Some(digits) if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) => {
+                value.to_owned()
+            }
+            _ => "undefined".to_owned(),
+        },
+    }
 }
 
 /// JS string literal for embedding in generated source.
@@ -1800,21 +1771,19 @@ pub(crate) async fn target_info(browser: &BrowserHandle, id: TabId) -> Value {
     })
 }
 
-pub(crate) fn target_id(value: Option<&Value>) -> Result<TabId, DispatchError> {
-    let raw = value
-        .and_then(Value::as_str)
-        .ok_or_else(|| DispatchError::Failed("missing targetId".into()))?;
+pub(crate) fn target_id(raw: &str) -> Result<TabId, DispatchError> {
     let id = raw
         .parse::<u64>()
-        .map_err(|_| DispatchError::Failed("invalid targetId".into()))?;
+        .map_err(|_| DispatchError::InvalidParams("targetId".to_owned()))?;
     Ok(TabId::new(id))
 }
 
 #[derive(Debug)]
 pub(crate) enum DispatchError {
     MethodNotFound,
-    /// A required parameter is missing or malformed.
-    InvalidParams(&'static str),
+    /// A required parameter is missing or malformed. The message names the
+    /// field, or carries serde's field path when a struct failed to decode.
+    InvalidParams(String),
     /// A browser or page helper answered in a shape the dispatch cannot read.
     BadHelperReply(&'static str),
     Failed(String),

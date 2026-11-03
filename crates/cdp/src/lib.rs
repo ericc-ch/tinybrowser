@@ -38,6 +38,7 @@ use tungstenite::client::IntoClientRequest;
 use tungstenite::protocol::{Message, Role, WebSocket as ClientSocket};
 
 mod dispatch;
+mod params;
 use dispatch::{
     BrowserHandler, DispatchError, Handler, PageHandler, RUNTIME_CLEAR_HANDLES, RUNTIME_HANDLE,
     RUNTIME_HANDLE_READ, RUNTIME_HANDLE_SCHEDULE, RUNTIME_READ, RUNTIME_SCHEDULE, Target, accept,
@@ -491,30 +492,34 @@ enum RuntimeEntry {
 }
 
 impl RuntimeEntry {
-    fn source(self, params: &Value) -> Result<RuntimeSource, DispatchError> {
+    /// Decodes this entry's params once: the script and the settings both
+    /// `Runtime.evaluate` and `Runtime.callFunctionOn` carry.
+    fn decode(
+        self,
+        params: &Value,
+    ) -> Result<(RuntimeSource, params::RuntimeOptions), DispatchError> {
         match self {
             Self::Evaluate => {
-                let expression = params
-                    .get("expression")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| DispatchError::Failed("missing expression".into()))?;
-                Ok(RuntimeSource::Evaluate {
-                    expression: expression.to_owned(),
-                })
+                let request: params::RuntimeEvaluate = params::parse(params)?;
+                Ok((
+                    RuntimeSource::Evaluate {
+                        expression: request.expression,
+                    },
+                    request.options,
+                ))
             }
             Self::CallFunctionOn => {
-                let declaration = params
-                    .get("functionDeclaration")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| DispatchError::Failed("missing functionDeclaration".into()))?;
-                Ok(RuntimeSource::CallFunctionOn {
-                    declaration: declaration.to_owned(),
-                    object_id: params
-                        .get("objectId")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned),
-                    arguments: arguments_expression(params),
-                })
+                let request: params::RuntimeCallFunctionOn = params::parse(params)?;
+                Ok((
+                    RuntimeSource::CallFunctionOn {
+                        declaration: request.function_declaration,
+                        object_id: request.object_id,
+                        arguments: arguments_expression(
+                            request.arguments.as_deref().unwrap_or(&[]),
+                        ),
+                    },
+                    request.options,
+                ))
             }
         }
     }
@@ -702,11 +707,12 @@ impl Conn {
 
     /// Resolves the requested target (or the first live one) for `Target.getTargetInfo`.
     async fn target_info_for(&mut self, params: &Value) -> Result<Value, DispatchError> {
-        let id = match params.get("targetId").and_then(Value::as_str) {
+        let params: params::GetTargetInfo = params::parse(params)?;
+        let id = match params.target_id {
             Some(raw) => raw
                 .parse::<u64>()
                 .map(TabId::new)
-                .map_err(|_| DispatchError::Failed("invalid targetId".into()))?,
+                .map_err(|_| DispatchError::InvalidParams("targetId".to_owned()))?,
             None => self
                 .browser
                 .tabs()
@@ -720,11 +726,13 @@ impl Conn {
     }
 
     /// Enables or disables auto-attach and announces existing targets.
-    async fn set_auto_attach(&mut self, params: &Value, session: Option<&str>) -> Value {
-        let auto_attach = params
-            .get("autoAttach")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+    async fn set_auto_attach(
+        &mut self,
+        params: &Value,
+        session: Option<&str>,
+    ) -> Result<Value, DispatchError> {
+        let params: params::SetAutoAttach = params::parse(params)?;
+        let auto_attach = params.auto_attach;
         self.auto_attach = auto_attach;
         if auto_attach {
             for id in self.browser.tabs().await.unwrap_or_default() {
@@ -734,7 +742,7 @@ impl Conn {
                 }
             }
         }
-        json!({})
+        Ok(json!({}))
     }
 
     /// Registers a flattened session and returns its id.
@@ -787,7 +795,12 @@ impl Conn {
             };
         };
         let empty = json!({});
-        let params = parsed.get("params").unwrap_or(&empty);
+        // A client may send `"params": null` for a method that takes none;
+        // that is the same as omitting the object.
+        let params = parsed
+            .get("params")
+            .filter(|value| !value.is_null())
+            .unwrap_or(&empty);
         let session = parsed.get("sessionId").and_then(Value::as_str);
         match self.dispatch(method, params, session).await {
             Ok(result) => {
@@ -897,23 +910,19 @@ impl Conn {
                 self.navigate_to_history_entry(params, tab).await
             }
             PageHandler::CaptureScreenshot => capture_screenshot(tab, params).await,
-            PageHandler::CreateIsolatedWorld => {
-                Ok(self.create_isolated_world(params, tab, session))
-            }
+            PageHandler::CreateIsolatedWorld => self.create_isolated_world(params, tab, session),
             PageHandler::SetLifecycleEventsEnabled => {
-                self.lifecycle_events = params
-                    .get("enabled")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
+                let params: params::SetLifecycleEventsEnabled = params::parse(params)?;
+                self.lifecycle_events = params.enabled;
                 Ok(json!({}))
             }
             PageHandler::RuntimeEvaluate => {
-                self.dispatch_runtime(RuntimeEntry::Evaluate.source(params)?, params, tab)
-                    .await
+                let (source, options) = RuntimeEntry::Evaluate.decode(params)?;
+                self.dispatch_runtime(source, options, tab).await
             }
             PageHandler::RuntimeCallFunctionOn => {
-                self.dispatch_runtime(RuntimeEntry::CallFunctionOn.source(params)?, params, tab)
-                    .await
+                let (source, options) = RuntimeEntry::CallFunctionOn.decode(params)?;
+                self.dispatch_runtime(source, options, tab).await
             }
             PageHandler::RuntimeEnable => {
                 self.push_session_event(
@@ -978,21 +987,16 @@ impl Conn {
         params: &Value,
         tab: &TabHandle,
         session: Option<&str>,
-    ) -> Value {
+    ) -> Result<Value, DispatchError> {
+        let params: params::CreateIsolatedWorld = params::parse(params)?;
         let context_id = self.next_context;
         self.next_context = self.next_context.saturating_add(1);
-        let frame_id = params
-            .get("frameId")
-            .and_then(Value::as_str)
-            .map_or_else(|| tab.id().to_string(), str::to_owned);
-        let name = params
-            .get("worldName")
-            .and_then(Value::as_str)
-            .unwrap_or("");
+        let frame_id = params.frame_id;
+        let name = params.world_name.unwrap_or_default();
         if !name.is_empty() {
             let worlds = self.isolated_worlds.entry(tab.id()).or_default();
-            if !worlds.iter().any(|existing| existing == name) {
-                worlds.push(name.to_owned());
+            if !worlds.contains(&name) {
+                worlds.push(name.clone());
             }
         }
         self.push_session_event(
@@ -1010,7 +1014,7 @@ impl Conn {
                 },
             }}),
         );
-        json!({"executionContextId": context_id})
+        Ok(json!({"executionContextId": context_id}))
     }
 
     /// `Page.navigateToHistoryEntry`: activates the named entry. The entry id
@@ -1022,11 +1026,8 @@ impl Conn {
         params: &Value,
         tab: &TabHandle,
     ) -> Result<Value, DispatchError> {
-        let entry_id = params
-            .get("entryId")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| DispatchError::Failed("missing entryId".into()))?;
-        tab.traverse_to_entry(browser::EntryId::new(entry_id))
+        let params: params::NavigateToHistoryEntry = params::parse(params)?;
+        tab.traverse_to_entry(browser::EntryId::new(params.entry_id))
             .await
             .map_err(|error| DispatchError::Failed(error.to_string()))?;
         Ok(json!({}))
@@ -1055,17 +1056,18 @@ impl Conn {
                 result.map_err(|error| DispatchError::Failed(error.to_string()))?;
                 Ok(json!({}))
             }
-            BrowserHandler::SetAutoAttach => Ok(self.set_auto_attach(params, session).await),
+            BrowserHandler::SetAutoAttach => self.set_auto_attach(params, session).await,
             BrowserHandler::GetTargets => self.target_list().await,
             BrowserHandler::CreateTarget => self.create_target(params, session).await,
             BrowserHandler::CloseTarget => self.close_target(params, session).await,
             BrowserHandler::AttachToTarget => {
-                let id = target_id(params.get("targetId"))?;
-                let flatten = params
-                    .get("flatten")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-                if !flatten {
+                let params: params::AttachToTarget = params::parse(params)?;
+                let id = target_id(&params.target_id)?;
+                if params.flatten != Some(true) {
+                    // The protocol marks `flatten` optional, so a client that
+                    // omits it is asking for a valid mode this adapter does
+                    // not implement; that is a failed request, not a malformed
+                    // one.
                     return Err(DispatchError::Failed(
                         "attachToTarget requires flatten".into(),
                     ));
@@ -1081,9 +1083,10 @@ impl Conn {
                 Ok(json!({ "sessionId": self.mint(Target::Browser) }))
             }
             BrowserHandler::DetachFromTarget => {
-                if let Some(session) = params.get("sessionId").and_then(Value::as_str) {
-                    self.sessions.remove(session);
-                    self.unsubscribe_session(session);
+                let params: params::DetachFromTarget = params::parse(params)?;
+                if let Some(session) = params.session_id {
+                    self.sessions.remove(&session);
+                    self.unsubscribe_session(&session);
                 }
                 Ok(json!({}))
             }
@@ -1097,10 +1100,8 @@ impl Conn {
         params: &Value,
         session: Option<&str>,
     ) -> Result<Value, DispatchError> {
-        let url = params
-            .get("url")
-            .and_then(Value::as_str)
-            .unwrap_or("about:blank");
+        let params: params::CreateTarget = params::parse(params)?;
+        let url = params.url.as_str();
         let tab = self
             .browser
             .create_tab()
@@ -1124,7 +1125,8 @@ impl Conn {
         params: &Value,
         session: Option<&str>,
     ) -> Result<Value, DispatchError> {
-        let id = target_id(params.get("targetId"))?;
+        let params: params::CloseTarget = params::parse(params)?;
+        let id = target_id(&params.target_id)?;
         if self.auto_attach {
             let detached: Vec<String> = self
                 .sessions
@@ -1182,10 +1184,8 @@ impl Conn {
         params: &Value,
         tab: &TabHandle,
     ) -> Result<Value, DispatchError> {
-        let url = params
-            .get("url")
-            .and_then(Value::as_str)
-            .ok_or_else(|| DispatchError::Failed("missing url".into()))?;
+        let params: params::Navigate = params::parse(params)?;
+        let url = params.url.as_str();
         let frame_id = tab.id().to_string();
         let loader_id = self.next_loader_id();
         if url.is_empty() || url == "about:blank" {
@@ -1221,32 +1221,19 @@ impl Conn {
     async fn dispatch_runtime(
         &mut self,
         source: RuntimeSource,
-        params: &Value,
+        options: params::RuntimeOptions,
         tab: &TabHandle,
     ) -> Result<Value, DispatchError> {
-        let frame = requested_frame(tab, params)?;
-        let return_by_value = params
-            .get("returnByValue")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let await_promise = params
-            .get("awaitPromise")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let object_group = params
-            .get("objectGroup")
-            .and_then(Value::as_str)
-            .unwrap_or("");
+        let frame = requested_frame(tab, options.frame_id.as_deref())?;
+        let return_by_value = options.return_by_value.unwrap_or(false);
+        let await_promise = options.await_promise.unwrap_or(false);
+        let object_group = options.object_group.as_deref().unwrap_or("");
         // `Runtime.evaluate` carries an optional `timeout` in milliseconds;
         // `Runtime.callFunctionOn` has none, so the fallback applies. An
         // out-of-range value is a CDP error, not a panic in the server task.
-        let await_timeout = match params
-            .get("timeout")
-            .and_then(Value::as_f64)
-            .filter(|millis| *millis > 0.0)
-        {
+        let await_timeout = match options.timeout.filter(|millis| *millis > 0.0) {
             Some(millis) => Duration::try_from_secs_f64(millis / 1000.0)
-                .map_err(|_| DispatchError::Failed("timeout is out of range".into()))?,
+                .map_err(|_| DispatchError::InvalidParams("timeout".to_owned()))?,
             None => AWAIT_PROMISE_TIMEOUT,
         };
         let source = match source {
@@ -1775,10 +1762,13 @@ mod tests {
             "sessionId": session,
         });
         let outcome = conn.dispatch_text(&get_properties.to_string()).await;
-        assert_eq!(outcome.reply["error"]["code"], json!(-32000));
-        assert_eq!(
-            outcome.reply["error"]["message"],
-            json!("Runtime.getProperties requires objectId")
+        assert_eq!(outcome.reply["error"]["code"], json!(-32602));
+        assert!(
+            outcome.reply["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.starts_with("Invalid params")),
+            "{}",
+            outcome.reply
         );
 
         browser.close().await.expect("close");

@@ -138,6 +138,15 @@ run_guards() {
     echo "guard: parse a tuple origin with net::origin_url" >&2
     status=1
   fi
+  # A CDP request decodes into one `params::*` struct per method
+  # (`crates/cdp/src/params.rs`). A handler that reads raw `params.get(...)`
+  # reintroduces a silent default for a field the protocol requires (#161).
+  matches="$(grep -rn 'params\.get(' crates/cdp/src --include='*.rs' || true)"
+  if [[ -n "$matches" ]]; then
+    printf '%s\n' "$matches" >&2
+    echo "guard: decode CDP params into a params:: struct" >&2
+    status=1
+  fi
   if [[ "$status" -eq 0 ]]; then
     echo "guards: no second copy of a parsed type"
   fi
