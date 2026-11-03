@@ -3,7 +3,7 @@
 
 use super::super::{attribute_value, host, set_attribute_sync, world, world_for_node};
 
-use rquickjs::{Coerced, Ctx, Exception, FromJs, Result, Value};
+use rquickjs::{Ctx, Result, Value};
 
 use crate::dom::tree::{NodeId, attr, html_namespace, is_connected};
 
@@ -196,12 +196,47 @@ impl<'js> html_canvas_element_generated::HTMLCanvasElement<'js> for JsNode {
             // (<https://html.spec.whatwg.org/multipage/canvas.html#concept-canvas-context-mode>).
             return Ok(None);
         }
-        read_context_options(&ctx, &options)?;
-        let value = match member {
-            crate::js::world::SameObject::Canvas2d => {
-                crate::js::canvas::context_object(&ctx, self.handle.0)?
-            }
-            _ => bitmap_context_object(&ctx, self.handle.0)?,
+        // The mode outlives the context object: a collected 2D context still
+        // stops a later `bitmaprenderer` request
+        // (<https://html.spec.whatwg.org/multipage/canvas.html#concept-canvas-context-mode>).
+        let requested_mode = if member == crate::js::world::SameObject::Canvas2d {
+            crate::js::world::CanvasMode::TwoD
+        } else {
+            crate::js::world::CanvasMode::Bitmap
+        };
+        if let Some(mode) = world_rc
+            .borrow()
+            .registry()
+            .borrow()
+            .canvas_mode_for_node(self.handle.0)
+            && mode != crate::js::world::CanvasMode::None
+            && mode != requested_mode
+        {
+            return Ok(None);
+        }
+        crate::js::canvas::read_context_options(&ctx, Some(&options))?;
+        let width = crate::js::canvas::canvas_dimension(&ctx, self.handle.0, "width", 300);
+        let height = crate::js::canvas::canvas_dimension(&ctx, self.handle.0, "height", 150);
+        let canvas_id =
+            world_rc
+                .borrow()
+                .registry()
+                .borrow_mut()
+                .element_canvas(self.handle.0, width, height);
+        let value = if member == crate::js::world::SameObject::Canvas2d {
+            world_rc
+                .borrow()
+                .registry()
+                .borrow_mut()
+                .set_canvas_mode(canvas_id, crate::js::world::CanvasMode::TwoD);
+            crate::js::canvas::context_object(&ctx, canvas_id)?
+        } else {
+            world_rc
+                .borrow()
+                .registry()
+                .borrow_mut()
+                .set_canvas_mode(canvas_id, crate::js::world::CanvasMode::Bitmap);
+            bitmap_context_object(&ctx, self.handle.0)?
         };
         let weak = super::super::make_weak(&ctx, value.clone())?;
         world_rc.borrow_mut().intern_same_object(
@@ -612,60 +647,6 @@ fn context_variant(member: crate::js::world::SameObject, value: Value<'_>) -> Re
     }
 }
 
-/// Converts `getContext` options to `CanvasRenderingContext2DSettings` in
-/// `WebIDL` dictionary member order (lexicographic by member name). The settings
-/// are not stored yet, but conversion order is observable through getters and
-/// must match
-/// (<https://webidl.spec.whatwg.org/#es-dictionary>).
-fn read_context_options<'js>(ctx: &Ctx<'js>, options: &Value<'js>) -> Result<()> {
-    if options.is_undefined() || options.is_null() {
-        return Ok(());
-    }
-    // `getContext` takes `any` for options: primitives are ignored rather than
-    // converted as a dictionary
-    // (<https://html.spec.whatwg.org/multipage/canvas.html#dom-canvas-getcontext>).
-    let Some(object) = options.as_object() else {
-        return Ok(());
-    };
-    for name in [
-        "alpha",
-        "colorSpace",
-        "colorType",
-        "desynchronized",
-        "willReadFrequently",
-    ] {
-        let value: Value = object.get(name)?;
-        if value.is_undefined() {
-            continue;
-        }
-        match name {
-            "alpha" | "desynchronized" | "willReadFrequently" => {
-                let _ = Coerced::<bool>::from_js(ctx, value)?;
-            }
-            "colorSpace" => {
-                let text = Coerced::<rquickjs::String>::from_js(ctx, value)?.to_string()?;
-                if !matches!(
-                    text.as_str(),
-                    "srgb" | "srgb-linear" | "display-p3" | "display-p3-linear"
-                ) {
-                    return Err(Exception::throw_type(
-                        ctx,
-                        "unknown PredefinedColorSpace value",
-                    ));
-                }
-            }
-            "colorType" => {
-                let text = Coerced::<rquickjs::String>::from_js(ctx, value)?.to_string()?;
-                if !matches!(text.as_str(), "unorm8" | "float16") {
-                    return Err(Exception::throw_type(ctx, "unknown CanvasColorType value"));
-                }
-            }
-            _ => {}
-        }
-    }
-    Ok(())
-}
-
 /// `getContext("bitmaprenderer")`: the object exists but transfers nothing
 /// until `ImageBitmap` decoding lands.
 fn bitmap_context_object<'js>(ctx: &Ctx<'js>, id: NodeId) -> Result<Value<'js>> {
@@ -687,7 +668,5 @@ fn bitmap_context_object<'js>(ctx: &Ctx<'js>, id: NodeId) -> Result<Value<'js>> 
     let object = rquickjs::Object::new(ctx.clone())?;
     object.set_prototype(Some(&prototype))?;
     object.set("canvas", super::super::wrap_node(ctx, id)?)?;
-    object.set("__tbDoc", id.document)?;
-    object.set("__tbNode", id.node.as_u64())?;
     Ok(object.into_value())
 }

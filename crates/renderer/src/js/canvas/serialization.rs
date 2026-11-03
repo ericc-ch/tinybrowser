@@ -17,8 +17,9 @@ use rquickjs::{
 };
 
 use super::state::{Canvas2D, JpegQuality};
-use super::{DomString, canvas_dimension, canvas_host_node, world};
-use crate::dom::tree::NodeId;
+use super::{
+    CanvasHost, DomString, ElementCanvas, OffscreenCanvasHost, offscreen_canvas_id, world,
+};
 use crate::js::bindings::{dom_exception_value, throw_dom};
 
 /// The formats this engine serializes. An unsupported `type` falls back to PNG
@@ -49,25 +50,25 @@ pub(crate) fn install(ctx: &Ctx<'_>) -> Result<()> {
         .into_constructor()
         .ok_or_else(|| Exception::throw_internal(ctx, "Blob is not a constructor"))?;
     let set_timeout: Function = globals.get("setTimeout")?;
-    let detached: Function = globals.get("__tbOffscreenDetached")?;
-    let has_context: Function = globals.get("__tbOffscreenHasContext")?;
     {
         let world = world(ctx)?;
         let mut world = world.borrow_mut();
         world.pristine_blob = Some(Persistent::save(ctx, blob));
         world.pristine_set_timeout = Some(Persistent::save(ctx, set_timeout));
-        world.pristine_offscreen_detached = Some(Persistent::save(ctx, detached));
-        world.pristine_offscreen_has_context = Some(Persistent::save(ctx, has_context));
     }
 
-    let canvas: Object = globals.get("HTMLCanvasElement")?;
-    let canvas = canvas.get::<_, Object>("prototype")?;
-    define_method(&canvas, ctx, "toDataURL", 0, to_data_url)?;
-    define_method(&canvas, ctx, "toBlob", 1, to_blob)?;
+    // A worker realm has no `HTMLCanvasElement`; only the offscreen methods
+    // exist there.
+    if let Ok(canvas) = globals.get::<_, Object>("HTMLCanvasElement") {
+        let canvas = canvas.get::<_, Object>("prototype")?;
+        define_method(&canvas, ctx, "toDataURL", 0, to_data_url)?;
+        define_method(&canvas, ctx, "toBlob", 1, to_blob)?;
+    }
 
-    let offscreen: Object = globals.get("OffscreenCanvas")?;
-    let offscreen = offscreen.get::<_, Object>("prototype")?;
-    define_method(&offscreen, ctx, "convertToBlob", 0, convert_to_blob)?;
+    if let Ok(offscreen) = globals.get::<_, Object>("OffscreenCanvas") {
+        let offscreen = offscreen.get::<_, Object>("prototype")?;
+        define_method(&offscreen, ctx, "convertToBlob", 0, convert_to_blob)?;
+    }
     Ok(())
 }
 
@@ -178,22 +179,18 @@ fn encode_options<'js>(ctx: &Ctx<'js>, options: Option<&Value<'js>>) -> Result<I
 /// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-canvas-todataurl>).
 fn encode(
     ctx: &Ctx<'_>,
-    id: NodeId,
+    host: &impl CanvasHost,
     format: CanvasImageFormat,
     quality: f64,
 ) -> Result<Option<Vec<u8>>> {
-    let width = canvas_dimension(ctx, id, "width", 300);
-    let height = canvas_dimension(ctx, id, "height", 150);
+    let (width, height) = host.dimensions(ctx);
     if width == 0 || height == 0 {
         return Ok(None);
     }
-    let world = world(ctx)?;
-    let registry = world.borrow().registry();
-    let registry = registry.borrow();
-    if registry.canvas_has_open_layer(id) {
+    if host.has_open_layer(ctx) {
         return Err(throw_dom(ctx, "InvalidStateError", "a layer is open"));
     }
-    let origin_clean = registry.canvas_origin_clean(id);
+    let origin_clean = host.origin_clean(ctx);
     if origin_clean == Some(false) {
         return Err(throw_dom(
             ctx,
@@ -202,11 +199,19 @@ fn encode(
         ));
     }
     let quality = JpegQuality::new(quality);
-    let bytes = match (format, origin_clean) {
-        (CanvasImageFormat::Png, Some(_)) => registry.canvas_png(id),
-        (CanvasImageFormat::Jpeg, Some(_)) => registry.canvas_jpeg(id, quality),
-        (CanvasImageFormat::Png, None) => Canvas2D::blank_png(width, height),
-        (CanvasImageFormat::Jpeg, None) => Canvas2D::blank_jpeg(width, height, quality),
+    let bytes = match (format, origin_clean, host.canvas_id(ctx)) {
+        (CanvasImageFormat::Png, Some(_), Some(id)) => {
+            let world = world(ctx)?;
+            let registry = world.borrow().registry();
+            registry.borrow().canvas_png(id)
+        }
+        (CanvasImageFormat::Jpeg, Some(_), Some(id)) => {
+            let world = world(ctx)?;
+            let registry = world.borrow().registry();
+            registry.borrow().canvas_jpeg(id, quality)
+        }
+        (CanvasImageFormat::Png, _, _) => Canvas2D::blank_png(width, height),
+        (CanvasImageFormat::Jpeg, _, _) => Canvas2D::blank_jpeg(width, height, quality),
     };
     Ok(bytes)
 }
@@ -222,10 +227,10 @@ fn to_data_url<'js>(
     // WebIDL converts the arguments left to right, `type` before `quality`.
     let format = format(&ctx, mime.0.as_ref())?;
     let quality = any_quality(quality_value.0.as_ref());
-    let Some(id) = canvas_host_node(&ctx, &this.0.into_value())? else {
+    let Some(host) = ElementCanvas::resolve(&ctx, &this.0.into_value()) else {
         return Ok("data:,".to_owned());
     };
-    let Some(bytes) = encode(&ctx, id, format, quality)? else {
+    let Some(bytes) = encode(&ctx, &host, format, quality)? else {
         return Ok("data:,".to_owned());
     };
     Ok(data_url(format, &bytes))
@@ -252,9 +257,9 @@ fn to_blob<'js>(
     // WebIDL converts the arguments left to right, `type` before `quality`.
     let format = format(&ctx, mime.0.as_ref())?;
     let quality = any_quality(quality_value.0.as_ref());
-    let id = canvas_host_node(&ctx, &this.0.into_value())?
+    let host = ElementCanvas::resolve(&ctx, &this.0.into_value())
         .ok_or_else(|| throw_dom(&ctx, "InvalidStateError", "the canvas is not usable"))?;
-    let bytes = encode(&ctx, id, format, quality)?;
+    let bytes = encode(&ctx, &host, format, quality)?;
     // A canvas with no pixels, or a failed encoder, hands the callback `null`:
     // the spec leaves `result` null through the parallel steps.
     let blob = match bytes {
@@ -292,30 +297,34 @@ fn convert_to_blob<'js>(
     // it before the method body: a throwing getter must throw, not reject.
     let options = encode_options(&ctx, options.0.as_ref())?;
     let (promise, resolve, reject) = Promise::new(&ctx)?;
-    let Some(id) = canvas_host_node(&ctx, &this.0.clone().into_value())? else {
+    let Some(id) = offscreen_canvas_id(&ctx, &this.0.clone().into_value())? else {
         return Err(throw_dom(
             &ctx,
             "InvalidStateError",
             "the canvas is not usable",
         ));
     };
-    if offscreen_probe(&ctx, detached_probe(&ctx), &this.0)? {
+    let mode = {
+        let world = world(&ctx)?;
+        let registry = world.borrow().registry();
+        registry.borrow().canvas_mode(id)
+    };
+    if matches!(mode, Some(crate::js::world::CanvasMode::Detached)) {
         reject_dom(&ctx, &reject, "InvalidStateError", "the canvas is detached")?;
         return Ok(promise.into_value());
     }
-    if !offscreen_probe(&ctx, has_context_probe(&ctx), &this.0)? {
-        reject_dom(&ctx, &reject, "IndexSizeError", "the canvas has no pixels")?;
-        return Ok(promise.into_value());
-    }
+    // A canvas that never had a context, or one whose context is a
+    // `bitmaprenderer`, still has a bitmap: it serializes as transparent
+    // until something paints it. Only a detached canvas is an error here.
+    let host = OffscreenCanvasHost { id };
     // Step 3: a bitmap with no pixels rejects `IndexSizeError`. A later null
     // encoding is a separate `EncodingError`.
-    let width = canvas_dimension(&ctx, id, "width", 300);
-    let height = canvas_dimension(&ctx, id, "height", 150);
+    let (width, height) = host.dimensions(&ctx);
     if width == 0 || height == 0 {
         reject_dom(&ctx, &reject, "IndexSizeError", "the canvas has no pixels")?;
         return Ok(promise.into_value());
     }
-    match encode(&ctx, id, options.format, options.quality) {
+    match encode(&ctx, &host, options.format, options.quality) {
         Ok(Some(bytes)) => {
             let blob = blob_value(&ctx, options.format.mime(), bytes)?;
             resolve.call::<_, Value>((blob,))?;
@@ -335,29 +344,6 @@ fn convert_to_blob<'js>(
         Err(error) => return Err(error),
     }
     Ok(promise.into_value())
-}
-
-fn detached_probe(ctx: &Ctx<'_>) -> Option<Persistent<Function<'static>>> {
-    world(ctx)
-        .ok()
-        .and_then(|world| world.borrow().pristine_offscreen_detached.clone())
-}
-
-fn has_context_probe(ctx: &Ctx<'_>) -> Option<Persistent<Function<'static>>> {
-    world(ctx)
-        .ok()
-        .and_then(|world| world.borrow().pristine_offscreen_has_context.clone())
-}
-
-/// One captured `OffscreenCanvas` state probe.
-fn offscreen_probe<'js>(
-    ctx: &Ctx<'js>,
-    probe: Option<Persistent<Function<'static>>>,
-    canvas: &Object<'js>,
-) -> Result<bool> {
-    let probe =
-        probe.ok_or_else(|| Exception::throw_internal(ctx, "OffscreenCanvas probe missing"))?;
-    probe.restore(ctx)?.call::<_, bool>((canvas.clone(),))
 }
 
 fn reject_dom<'js>(

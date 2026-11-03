@@ -2,16 +2,18 @@
 //!
 //! The context is a plain platform object, not a node wrapper, so the
 //! generated IDL traits (which dispatch on `JsNode`) do not apply. Members
-//! are installed on the `CanvasRenderingContext2D` prototype and reach state
-//! through the hidden `__tbDoc`/`__tbNode` pair stamped on the instance.
+//! are installed on the `CanvasRenderingContext2D` prototype and reach the
+//! bitmap through the opaque `__tbCanvasId` stamped on the instance.
 //!
 //! Spec: <https://html.spec.whatwg.org/multipage/canvas.html#2dcontext>
 
+mod host;
 mod path2d;
 mod serialization;
 mod state;
 mod text;
 
+pub(crate) use host::{CanvasHost, CanvasId, ElementCanvas, OffscreenCanvasHost};
 pub(crate) use serialization::install as install_serialization;
 pub(crate) use state::{
     Canvas2D, ColorMatrix, Gradient, JpegQuality, Pattern, Rect, SourceImage, StyleValue,
@@ -87,61 +89,39 @@ impl<'js> FromJs<'js> for DomString {
     }
 }
 
-/// Resolves the canvas element backing a serialization request. A plain
-/// `HTMLCanvasElement` is used directly; an `OffscreenCanvas` wrapper points at
-/// its hidden element through `__tbCanvas`. The resolved node must belong to
-/// this realm and be a real `<canvas>`, the same guard `with_canvas` applies.
-fn canvas_host_node<'js>(ctx: &Ctx<'js>, source: &Value<'js>) -> Result<Option<NodeId>> {
-    let node = if crate::js::bindings::host_node_id(ctx, source).is_some() {
-        source.clone()
-    } else {
-        let Some(object) = source.as_object() else {
-            return Ok(None);
-        };
-        let hidden: Value = object.get("__tbCanvas")?;
-        if hidden.is_undefined() || hidden.is_null() {
-            return Ok(None);
-        }
-        hidden
-    };
-    let Some(id) = crate::js::bindings::host_node_id(ctx, &node) else {
-        return Ok(None);
-    };
-    let world = world(ctx)?;
-    let owner = world.borrow();
-    let is_canvas = owner
-        .with_document(id, |parsed| {
-            parsed
-                .document
-                .base
-                .get_node(id.node)
-                .is_some_and(|node| crate::dom::tree::is_html_tag(Some(&node.data), "canvas"))
-        })
-        .unwrap_or(false);
-    Ok((owner.owns_node(id) && is_canvas).then_some(id))
-}
-
 /// `OffscreenCanvas.transferToImageBitmap()`: snapshot the bitmap, clear the
 /// canvas to transparent black, and wrap the pixels in an `ImageBitmap`
 /// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-offscreencanvas-transfertoimagebitmap>).
-fn canvas_transfer_to_image_bitmap<'js>(ctx: Ctx<'js>, source: Value<'js>) -> Result<Value<'js>> {
-    let Some(id) = canvas_host_node(&ctx, &source)? else {
-        return Err(crate::js::bindings::throw_dom(
-            &ctx,
-            "InvalidStateError",
-            "the canvas is not usable",
-        ));
-    };
-    let width = canvas_dimension(&ctx, id, "width", 300);
-    let height = canvas_dimension(&ctx, id, "height", 150);
+fn offscreen_transfer_to_image_bitmap(ctx: Ctx<'_>, raw: f64) -> Result<Value<'_>> {
+    let id = canvas_id_argument(&ctx, raw)?;
+    let world = world(&ctx)?;
     let image = {
-        let world = world(&ctx)?;
         let registry = world.borrow().registry();
         let mut registry = registry.borrow_mut();
-        // A context exists once `getContext` returned it, even before the
-        // first draw; create the bitmap so the first transfer returns a
-        // transparent image instead of "no 2D context".
-        registry.canvas(id, width, height);
+        if !registry.owns_canvas(id, &world.borrow()) {
+            return Err(crate::js::bindings::throw_dom(
+                &ctx,
+                "InvalidStateError",
+                "the canvas is not usable",
+            ));
+        }
+        match registry.canvas_mode(id) {
+            Some(crate::js::world::CanvasMode::Detached) => {
+                return Err(crate::js::bindings::throw_dom(
+                    &ctx,
+                    "InvalidStateError",
+                    "the OffscreenCanvas is detached",
+                ));
+            }
+            Some(crate::js::world::CanvasMode::TwoD) => {}
+            _ => {
+                return Err(crate::js::bindings::throw_dom(
+                    &ctx,
+                    "InvalidStateError",
+                    "the OffscreenCanvas has no 2D context",
+                ));
+            }
+        }
         if registry.canvas_has_open_layer(id) {
             return Err(crate::js::bindings::throw_dom(
                 &ctx,
@@ -149,11 +129,21 @@ fn canvas_transfer_to_image_bitmap<'js>(ctx: Ctx<'js>, source: Value<'js>) -> Re
                 "a layer is open",
             ));
         }
+        // A context exists once `getContext` returned it, even before the
+        // first draw; allocate the bitmap so the first transfer returns a
+        // transparent image instead of "no 2D context".
+        if registry.canvas_mut(id).is_none() {
+            return Err(crate::js::bindings::throw_dom(
+                &ctx,
+                "InvalidStateError",
+                "the OffscreenCanvas has no 2D context",
+            ));
+        }
         let Some(image) = registry.canvas_snapshot(id) else {
             return Err(crate::js::bindings::throw_dom(
                 &ctx,
                 "InvalidStateError",
-                "the canvas has no 2D context",
+                "the OffscreenCanvas has no 2D context",
             ));
         };
         registry.clear_canvas_bitmap(id);
@@ -168,11 +158,66 @@ fn canvas_transfer_to_image_bitmap<'js>(ctx: Ctx<'js>, source: Value<'js>) -> Re
     )
 }
 
+/// Reads a bitmap id that an internal host function received from the shim.
+fn canvas_id_argument(ctx: &Ctx<'_>, raw: f64) -> Result<CanvasId> {
+    crate::js::bridge::enforce_range_u64(raw)
+        .map(CanvasId)
+        .ok_or_else(|| Exception::throw_type(ctx, "invalid canvas id"))
+}
+
+/// The bitmap id of an `OffscreenCanvas`, read through the pristine brand the
+/// shim keeps in a realm-private map. A plain object with the same shape is
+/// not an `OffscreenCanvas`.
+pub(crate) fn offscreen_canvas_id<'js>(
+    ctx: &Ctx<'js>,
+    value: &Value<'js>,
+) -> Result<Option<CanvasId>> {
+    if !value.is_object() {
+        return Ok(None);
+    }
+    let host = crate::js::bridge::object(ctx)?;
+    let brand: Option<Function> = host.get("__tbOffscreenCanvasId")?;
+    let Some(brand) = brand else {
+        return Ok(None);
+    };
+    let raw: f64 = brand.call((value.clone(),))?;
+    if !raw.is_finite() || raw < 0.0 {
+        return Ok(None);
+    }
+    Ok(crate::js::bridge::enforce_range_u64(raw).map(CanvasId))
+}
+
 /// Builds the `CanvasRenderingContext2D` constructor and its prototype.
 pub(crate) fn install(ctx: &Ctx<'_>) -> Result<()> {
-    ctx.globals().set(
-        "__tbCanvasTransferToImageBitmap",
-        Func::from(canvas_transfer_to_image_bitmap),
+    let host = crate::js::bridge::object(ctx)?;
+    host.set("__tbOffscreenCanvasNew", Func::from(offscreen_canvas_new))?;
+    host.set(
+        "__tbOffscreenCanvasWidth",
+        Func::from(offscreen_canvas_width),
+    )?;
+    host.set(
+        "__tbOffscreenCanvasHeight",
+        Func::from(offscreen_canvas_height),
+    )?;
+    host.set(
+        "__tbOffscreenCanvasSetWidth",
+        Func::from(offscreen_canvas_set_width),
+    )?;
+    host.set(
+        "__tbOffscreenCanvasSetHeight",
+        Func::from(offscreen_canvas_set_height),
+    )?;
+    host.set(
+        "__tbOffscreenCanvasContext",
+        Func::from(offscreen_canvas_context),
+    )?;
+    host.set(
+        "__tbOffscreenCanvasTransferToImageBitmap",
+        Func::from(offscreen_transfer_to_image_bitmap),
+    )?;
+    host.set(
+        "__tbOffscreenCanvasDetach",
+        Func::from(offscreen_canvas_detach),
     )?;
     let ctor = Function::new(ctx.clone(), || {})?;
     let prototype = Object::new(ctx.clone())?;
@@ -189,6 +234,130 @@ pub(crate) fn install(ctx: &Ctx<'_>) -> Result<()> {
 
 fn install_path2d(ctx: &Ctx<'_>) -> Result<()> {
     path2d::install(ctx)
+}
+
+/// `new OffscreenCanvas(width, height)`: allocate a bitmap in this realm with
+/// no DOM node
+/// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-offscreencanvas-offscreencanvas>).
+fn offscreen_canvas_new(ctx: Ctx<'_>, width: f64, height: f64) -> Result<f64> {
+    let world = world(&ctx)?;
+    let (realm, document) = {
+        let world = world.borrow();
+        (world.realm_id(), world.main_document_id())
+    };
+    let id = world.borrow().registry().borrow_mut().offscreen_canvas(
+        realm,
+        document,
+        canvas_u32(width),
+        canvas_u32(height),
+    );
+    Ok(crate::js::bridge::js_number(id.0))
+}
+
+/// The bitmap id's width or height
+/// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-offscreencanvas-width>).
+fn offscreen_canvas_width(ctx: Ctx<'_>, raw: f64) -> Result<u32> {
+    let id = canvas_id_argument(&ctx, raw)?;
+    with_offscreen_registry(&ctx, id, |registry| {
+        Ok(registry.canvas_dimensions(id).map_or(0, |(width, _)| width))
+    })
+}
+
+fn offscreen_canvas_height(ctx: Ctx<'_>, raw: f64) -> Result<u32> {
+    let id = canvas_id_argument(&ctx, raw)?;
+    with_offscreen_registry(&ctx, id, |registry| {
+        Ok(registry
+            .canvas_dimensions(id)
+            .map_or(0, |(_, height)| height))
+    })
+}
+
+/// Replaces the bitmap with a new transparent one of the requested width
+/// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-offscreencanvas-width>).
+fn offscreen_canvas_set_width(ctx: Ctx<'_>, raw: f64, value: f64) -> Result<()> {
+    let id = canvas_id_argument(&ctx, raw)?;
+    let width = canvas_u32(value);
+    with_offscreen_registry(&ctx, id, |registry| {
+        let height = registry
+            .canvas_dimensions(id)
+            .map_or(0, |(_, height)| height);
+        registry.resize_canvas(id, width, height);
+        Ok(())
+    })
+}
+
+fn offscreen_canvas_set_height(ctx: Ctx<'_>, raw: f64, value: f64) -> Result<()> {
+    let id = canvas_id_argument(&ctx, raw)?;
+    let height = canvas_u32(value);
+    with_offscreen_registry(&ctx, id, |registry| {
+        let width = registry.canvas_dimensions(id).map_or(0, |(width, _)| width);
+        registry.resize_canvas(id, width, height);
+        Ok(())
+    })
+}
+
+/// `OffscreenCanvas.getContext("2d")`: create the context object on the bitmap
+/// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-offscreencanvas-getcontext>).
+fn offscreen_canvas_context<'js>(
+    ctx: Ctx<'js>,
+    raw: f64,
+    options: Opt<Value<'js>>,
+) -> Result<Value<'js>> {
+    let id = canvas_id_argument(&ctx, raw)?;
+    // The dictionary converts before the context mode changes, so a throwing
+    // getter leaves the canvas untouched.
+    read_context_options(&ctx, options.0.as_ref())?;
+    let existing = with_offscreen_registry(&ctx, id, |registry| Ok(registry.canvas_mode(id)))?;
+    match existing {
+        Some(crate::js::world::CanvasMode::Detached) => {
+            return Err(crate::js::bindings::throw_dom(
+                &ctx,
+                "InvalidStateError",
+                "the OffscreenCanvas is detached",
+            ));
+        }
+        Some(crate::js::world::CanvasMode::None) | None => {}
+        Some(crate::js::world::CanvasMode::TwoD | crate::js::world::CanvasMode::Bitmap) => {
+            // The shim returns the same context object it stored, so a second
+            // request never reaches here.
+            return Ok(Value::new_null(ctx.clone()));
+        }
+    }
+    let context = context_object(&ctx, id)?;
+    with_offscreen_registry(&ctx, id, |registry| {
+        registry.set_canvas_mode(id, crate::js::world::CanvasMode::TwoD);
+        Ok(())
+    })?;
+    Ok(context)
+}
+
+/// The transfer steps unset the sender's bitmap
+/// (<https://html.spec.whatwg.org/multipage/structured-data.html#transferable-objects>).
+fn offscreen_canvas_detach(ctx: Ctx<'_>, raw: f64) -> Result<()> {
+    let id = canvas_id_argument(&ctx, raw)?;
+    with_offscreen_registry(&ctx, id, |registry| {
+        registry.detach_canvas(id);
+        Ok(())
+    })
+}
+
+/// Runs `run` against the registry after checking that this realm owns `id`.
+fn with_offscreen_registry<R>(
+    ctx: &Ctx<'_>,
+    id: CanvasId,
+    run: impl FnOnce(&mut crate::js::world::RealmRegistry) -> Result<R>,
+) -> Result<R> {
+    let world = world(ctx)?;
+    let registry = world.borrow().registry();
+    let mut registry = registry.borrow_mut();
+    if !registry.owns_canvas(id, &world.borrow()) {
+        return Err(crate::js::bindings::throw_dom(
+            ctx,
+            "InvalidStateError",
+            "the canvas does not belong to this realm",
+        ));
+    }
+    run(&mut registry)
 }
 
 /// `CanvasGradient` and `CanvasPattern` constructors: canvas returns branded
@@ -288,16 +457,75 @@ fn illegal_constructor(ctx: Ctx<'_>) -> Result<Value<'_>> {
 }
 
 /// One 2D context object for `id`.
-pub(crate) fn context_object<'js>(ctx: &Ctx<'js>, id: NodeId) -> Result<Value<'js>> {
+pub(crate) fn context_object<'js>(ctx: &Ctx<'js>, id: CanvasId) -> Result<Value<'js>> {
     let ctor: Function = ctx.globals().get("CanvasRenderingContext2D")?;
     let prototype: Object = ctor.get("prototype")?;
     let object = Object::new(ctx.clone())?;
     object.set_prototype(Some(&prototype))?;
-    object.set("__tbDoc", id.document)?;
-    object.set("__tbNode", id.node.as_u64())?;
+    object.set("__tbCanvasId", id.0)?;
     let resources = Object::new(ctx.clone())?;
     object.set("__tbRes", resources)?;
     Ok(object.into_value())
+}
+
+/// Converts `getContext` options to `CanvasRenderingContext2DSettings` in
+/// `WebIDL` dictionary member order (lexicographic by member name). The settings
+/// are not stored yet, but conversion order is observable through getters and
+/// must match
+/// (<https://webidl.spec.whatwg.org/#es-dictionary>).
+pub(crate) fn read_context_options<'js>(
+    ctx: &Ctx<'js>,
+    options: Option<&Value<'js>>,
+) -> Result<()> {
+    let Some(options) = options else {
+        return Ok(());
+    };
+    if options.is_undefined() || options.is_null() {
+        return Ok(());
+    }
+    // `getContext` takes `any` for options: primitives are ignored rather than
+    // converted as a dictionary
+    // (<https://html.spec.whatwg.org/multipage/canvas.html#dom-canvas-getcontext>).
+    let Some(object) = options.as_object() else {
+        return Ok(());
+    };
+    for name in [
+        "alpha",
+        "colorSpace",
+        "colorType",
+        "desynchronized",
+        "willReadFrequently",
+    ] {
+        let value: Value = object.get(name)?;
+        if value.is_undefined() {
+            continue;
+        }
+        match name {
+            "alpha" | "desynchronized" | "willReadFrequently" => {
+                let _ = Coerced::<bool>::from_js(ctx, value)?;
+            }
+            "colorSpace" => {
+                let text = Coerced::<rquickjs::String>::from_js(ctx, value)?.to_string()?;
+                if !matches!(
+                    text.as_str(),
+                    "srgb" | "srgb-linear" | "display-p3" | "display-p3-linear"
+                ) {
+                    return Err(Exception::throw_type(
+                        ctx,
+                        "unknown PredefinedColorSpace value",
+                    ));
+                }
+            }
+            "colorType" => {
+                let text = Coerced::<rquickjs::String>::from_js(ctx, value)?.to_string()?;
+                if !matches!(text.as_str(), "unorm8" | "float16") {
+                    return Err(Exception::throw_type(ctx, "unknown CanvasColorType value"));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn install_members<'js>(ctx: &Ctx<'js>, prototype: &Object<'js>) -> Result<()> {
@@ -544,13 +772,31 @@ fn noop(_: This<Object<'_>>) -> Result<()> {
 
 // ---- state access --------------------------------------------------------
 
-fn canvas_id(object: &Object<'_>) -> Result<NodeId> {
-    let document: u32 = object.get("__tbDoc")?;
-    let node: u64 = object.get("__tbNode")?;
-    Ok(NodeId {
-        document,
-        node: blitz_traits::node_id::NodeId::from_u64(node),
-    })
+fn context_canvas_id(ctx: &Ctx<'_>, object: &Object<'_>) -> Result<CanvasId> {
+    let id = CanvasId(object.get("__tbCanvasId")?);
+    // The id is a claim like any page-writable property, so the registry
+    // decides whether this realm owns it. An element slot must still be a
+    // `<canvas>` in a document this realm created; an offscreen slot must
+    // belong to this realm, which is what lets a worker with no document use
+    // one.
+    let world = world(ctx)?;
+    let registry = world.borrow().registry();
+    if !registry.borrow().owns_canvas(id, &world.borrow()) {
+        return Err(crate::js::bindings::throw_dom(
+            ctx,
+            "InvalidStateError",
+            "canvas does not belong to this frame",
+        ));
+    }
+    Ok(id)
+}
+
+/// The element behind a 2D context, or `None` for an `OffscreenCanvas`.
+fn context_canvas_node(ctx: &Ctx<'_>, object: &Object<'_>) -> Result<Option<NodeId>> {
+    let id = context_canvas_id(ctx, object)?;
+    let world = world(ctx)?;
+    let registry = world.borrow().registry();
+    Ok(registry.borrow().canvas_node(id))
 }
 
 /// Rejects members that cannot run while a layer is open
@@ -571,42 +817,28 @@ fn with_canvas<R>(
     object: &Object<'_>,
     run: impl FnOnce(&mut Canvas2D) -> R,
 ) -> Result<R> {
-    let mut id = canvas_id(object)?;
-    // The context stores a node id at creation. Adoption moves the canvas
-    // and its bitmap to a fresh id; follow the live id before any lookup.
-    {
-        let world = world(ctx)?;
-        let registry = world.borrow().registry();
-        id = registry.borrow_mut().live_node_id(id);
-    }
-    // `__tbDoc` and `__tbNode` are writable, so they carry a claim, not
-    // proof. Require a document this frame created and a real HTML canvas;
-    // otherwise a page could retarget another frame's canvas, or any element,
-    // in the shared registry.
+    let id = context_canvas_id(ctx, object)?;
+    // A content attribute change resets the bitmap even when it bypassed the
+    // IDL setter, so follow the element's current size before every use
+    // (<https://html.spec.whatwg.org/multipage/canvas.html#the-canvas-element>).
     let world = world(ctx)?;
-    {
-        let owner = world.borrow();
-        let is_canvas =
-            owner
-                .with_document(id, |parsed| {
-                    parsed.document.base.get_node(id.node).is_some_and(|node| {
-                        crate::dom::tree::is_html_tag(Some(&node.data), "canvas")
-                    })
-                })
-                .unwrap_or(false);
-        if !owner.owns_node(id) || !is_canvas {
-            return Err(crate::js::bindings::throw_dom(
-                ctx,
-                "InvalidStateError",
-                "canvas does not belong to this frame",
-            ));
-        }
-    }
-    let width = canvas_dimension(ctx, id, "width", 300);
-    let height = canvas_dimension(ctx, id, "height", 150);
     let registry = world.borrow().registry();
     let mut registry = registry.borrow_mut();
-    let canvas = registry.canvas(id, width, height);
+    // A content attribute change resets the bitmap even when it bypassed the
+    // IDL setter, so follow the element's current size before every use
+    // (<https://html.spec.whatwg.org/multipage/canvas.html#the-canvas-element>).
+    if let Some(node) = registry.canvas_node(id) {
+        let dimensions = (
+            canvas_dimension(ctx, node, "width", 300),
+            canvas_dimension(ctx, node, "height", 150),
+        );
+        if registry.canvas_dimensions(id) != Some(dimensions) {
+            registry.resize_canvas(id, dimensions.0, dimensions.1);
+        }
+    }
+    let canvas = registry.canvas_mut(id).ok_or_else(|| {
+        crate::js::bindings::throw_dom(ctx, "InvalidStateError", "the canvas is not usable")
+    })?;
     Ok(run(canvas))
 }
 
@@ -1617,8 +1849,7 @@ fn resource_object<'js>(this: &Object<'js>, kind: &str, id: u32) -> Result<Value
         ctor.get("prototype")?
     };
     object.set_prototype(Some(&prototype))?;
-    object.set("__tbDoc", this.get::<_, u32>("__tbDoc")?)?;
-    object.set("__tbNode", this.get::<_, u64>("__tbNode")?)?;
+    object.set("__tbCanvasId", this.get::<_, u64>("__tbCanvasId")?)?;
     object.set(format!("__tb{kind}"), id)?;
     let resources: Object = this.get("__tbRes")?;
     resources.set(id.to_string(), object.clone())?;
@@ -1658,8 +1889,7 @@ fn add_color_stop(this: This<Object<'_>>, offset: Coerced<f64>, color: DomString
     };
     let object = this.0.clone();
     let id_wrapper = Object::new(this.0.ctx().clone())?;
-    id_wrapper.set("__tbDoc", object.get::<_, u32>("__tbDoc")?)?;
-    id_wrapper.set("__tbNode", object.get::<_, u64>("__tbNode")?)?;
+    id_wrapper.set("__tbCanvasId", object.get::<_, u64>("__tbCanvasId")?)?;
     with_canvas(this.0.ctx(), &id_wrapper, |canvas| {
         canvas.add_color_stop(id, f32_of(*offset), color);
     })
@@ -2088,7 +2318,7 @@ fn create_image_data<'js>(
     second: Opt<Coerced<f64>>,
 ) -> Result<Value<'js>> {
     let ctx = this.0.ctx();
-    canvas_id(&this.0)?;
+    context_canvas_id(ctx, &this.0)?;
     if let Some(second) = second.0 {
         let width = *Coerced::<f64>::from_js(ctx, first)?;
         let height = *second;
@@ -2628,85 +2858,102 @@ enum ImageLookup {
 /// `ImageData`/`ImageBitmap`, or an `<img>` with decoded pixels
 /// (<https://html.spec.whatwg.org/multipage/canvas.html#check-the-usability-of-the-image-argument>).
 fn source_image<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> Result<ImageLookup> {
-    // OffscreenCanvas forwards to a hidden canvas element. Transferring that
-    // canvas zeroes its bitmap, so the ordinary zero-size check makes it an
-    // invalid source without a page-writable flag. `canvas_host_node` verifies
-    // that the backing node is this realm's canvas before trusting the wrapper.
-    let node_id =
-        canvas_host_node(ctx, &value)?.or_else(|| crate::js::bindings::host_node_id(ctx, &value));
-    if let Some(id) = node_id {
-        let world = world(ctx)?;
-        let (request, size) = {
-            let world = world.borrow();
-            (world.image_request(id), world.image_size(id))
-        };
-        let loading = request
-            .as_ref()
-            .is_some_and(|request| request.status == blitz_dom::ImageRequestStatus::Pending);
-        let broken = request
-            .as_ref()
-            .is_some_and(|request| request.status == blitz_dom::ImageRequestStatus::Failed);
-        let zero_size = size.is_some_and(|(width, height)| width == 0 || height == 0);
-        // A pending request is not fully decodable, so `drawImage` draws
-        // nothing: reassigning `src` starts a new request whose state is
-        // unavailable, and the previous request's pixels are not what the
-        // element's image data names any more
-        // (<https://html.spec.whatwg.org/multipage/canvas.html#check-the-usability-of-the-image-argument>,
-        // <https://html.spec.whatwg.org/multipage/images.html#img-not-fully-decodable>).
-        if loading {
-            return Ok(ImageLookup::NotReady);
-        }
-        if broken {
+    // A canvas this realm owns is its bitmap, not a DOM lookup. `<canvas>` and
+    // `OffscreenCanvas` share the snapshot and taint rules; only their
+    // dimensions differ.
+    if let Some(host) = ElementCanvas::resolve(ctx, &value) {
+        return Ok(canvas_host_image(ctx, host));
+    }
+    if let Some(id) = offscreen_canvas_id(ctx, &value)? {
+        return Ok(canvas_host_image(ctx, OffscreenCanvasHost { id }));
+    }
+    let Some(id) = crate::js::bindings::host_node_id(ctx, &value) else {
+        if let Some(object) = value.as_object()
+            && object.get::<_, bool>("__tbClosed").unwrap_or(false)
+        {
             return Ok(ImageLookup::Invalid);
         }
+        if let Some(object) = value.as_object()
+            && let Ok(id) = object.get::<_, u64>("__tbBitmap")
         {
-            let registry = world.borrow().registry();
-            let registry = registry.borrow();
-            if registry.canvas_has_open_layer(id) {
-                return Ok(ImageLookup::Invalid);
-            }
-            if let Some(snapshot) = registry.canvas_snapshot(id) {
-                return Ok(if snapshot.width == 0 || snapshot.height == 0 {
-                    ImageLookup::Invalid
-                } else {
-                    ImageLookup::Decoded(snapshot)
-                });
-            }
+            let image = world(ctx)?.borrow().registry().borrow().bitmap(id);
+            return Ok(image.map_or(ImageLookup::Invalid, ImageLookup::Decoded));
         }
-        let tracked_origin_clean = request.as_ref().map(|request| request.origin_clean);
-        let lookup = world
-            .borrow()
-            .with_document(id, |parsed| {
-                source_element(ctx, id, parsed, zero_size, broken, tracked_origin_clean)
-            })
-            .flatten()
-            .unwrap_or(ImageLookup::Unsupported);
-        return Ok(lookup);
+        let Some((width, height, pixels)) = read_image_data(&value)? else {
+            return Ok(ImageLookup::Unsupported);
+        };
+        let origin_clean = value
+            .as_object()
+            .and_then(|object| object.get::<_, bool>("__tbOriginClean").ok())
+            .unwrap_or(true);
+        return Ok(ImageLookup::Decoded(SourceImage {
+            width,
+            height,
+            pixels: pixels.into(),
+            origin_clean,
+        }));
+    };
+    let world = world(ctx)?;
+    let (request, size) = {
+        let world = world.borrow();
+        (world.image_request(id), world.image_size(id))
+    };
+    let loading = request
+        .as_ref()
+        .is_some_and(|request| request.status == blitz_dom::ImageRequestStatus::Pending);
+    let broken = request
+        .as_ref()
+        .is_some_and(|request| request.status == blitz_dom::ImageRequestStatus::Failed);
+    let zero_size = size.is_some_and(|(width, height)| width == 0 || height == 0);
+    // A pending request is not fully decodable, so `drawImage` draws
+    // nothing: reassigning `src` starts a new request whose state is
+    // unavailable, and the previous request's pixels are not what the
+    // element's image data names any more
+    // (<https://html.spec.whatwg.org/multipage/canvas.html#check-the-usability-of-the-image-argument>,
+    // <https://html.spec.whatwg.org/multipage/images.html#img-not-fully-decodable>).
+    if loading {
+        return Ok(ImageLookup::NotReady);
     }
-    if let Some(object) = value.as_object()
-        && object.get::<_, bool>("__tbClosed").unwrap_or(false)
-    {
+    if broken {
         return Ok(ImageLookup::Invalid);
     }
-    if let Some(object) = value.as_object()
-        && let Ok(id) = object.get::<_, u64>("__tbBitmap")
-    {
-        let image = world(ctx)?.borrow().registry().borrow().bitmap(id);
-        return Ok(image.map_or(ImageLookup::Invalid, ImageLookup::Decoded));
+    let tracked_origin_clean = request.as_ref().map(|request| request.origin_clean);
+    let lookup = world
+        .borrow()
+        .with_document(id, |parsed| {
+            source_element(ctx, id, parsed, zero_size, broken, tracked_origin_clean)
+        })
+        .flatten()
+        .unwrap_or(ImageLookup::Unsupported);
+    Ok(lookup)
+}
+
+/// The pixels of a canvas source, whether it has a context yet or not.
+fn canvas_host_image(ctx: &Ctx<'_>, host: impl CanvasHost) -> ImageLookup {
+    let (width, height) = host.dimensions(ctx);
+    if width == 0 || height == 0 {
+        return ImageLookup::Invalid;
     }
-    let Some((width, height, pixels)) = read_image_data(&value)? else {
-        return Ok(ImageLookup::Unsupported);
-    };
-    let origin_clean = value
-        .as_object()
-        .and_then(|object| object.get::<_, bool>("__tbOriginClean").ok())
-        .unwrap_or(true);
-    Ok(ImageLookup::Decoded(SourceImage {
+    if host.has_open_layer(ctx) {
+        return ImageLookup::Invalid;
+    }
+    if let Some(snapshot) = host.snapshot(ctx) {
+        return if snapshot.width == 0 || snapshot.height == 0 {
+            ImageLookup::Invalid
+        } else {
+            ImageLookup::Decoded(snapshot)
+        };
+    }
+    // A canvas without a context is still an empty bitmap. Its declared size
+    // is page-controlled, so an over-budget one has no pixels to draw.
+    let pixels =
+        crate::js::world::canvas_bytes(width, height).map_or_else(Vec::new, |bytes| vec![0; bytes]);
+    ImageLookup::Decoded(SourceImage {
         width,
         height,
         pixels: pixels.into(),
-        origin_clean,
-    }))
+        origin_clean: true,
+    })
 }
 
 /// Looks up a canvas, SVG image, or HTML image element by node id. An HTML
@@ -4013,12 +4260,19 @@ fn angle(text: &str) -> bool {
 /// The document's Parley font context. It includes `@font-face` fonts, which
 /// the shared process context does not.
 fn document_font_context(ctx: &Ctx<'_>, object: &Object<'_>) -> Result<parley::FontContext> {
-    let id = canvas_id(object)?;
     let world = world(ctx)?;
-    let font_ctx = world
-        .borrow()
-        .document(id)
-        .map(|parsed| parsed.document.base.font_context());
+    let font_ctx = match context_canvas_node(ctx, object)? {
+        Some(id) => world
+            .borrow()
+            .document(id)
+            .map(|parsed| parsed.document.base.font_context()),
+        // An `OffscreenCanvas` has no element, but a window realm still shapes
+        // with the document's `@font-face` fonts.
+        None => world
+            .borrow()
+            .main_document()
+            .map(|parsed| parsed.document.base.font_context()),
+    };
     font_ctx.map_or_else(
         || Ok(world.borrow().runtime.font_ctx.clone()),
         |font_ctx| {
@@ -4093,10 +4347,10 @@ fn import_resource(
 ) -> Result<StyleValue> {
     match style {
         StyleValue::Gradient(id) => {
-            let source = canvas_id(resource)?;
-            // Ids are per-canvas; a target that happens to own the same id is
+            let source = context_canvas_id(ctx, resource)?;
+            // Ids are per-bitmap; a target that happens to own the same id is
             // a different gradient. Only a same-canvas assignment is local.
-            if source == canvas_id(target)? {
+            if source == context_canvas_id(ctx, target)? {
                 return Ok(style);
             }
             let definition = {
@@ -4112,8 +4366,8 @@ fn import_resource(
             })?))
         }
         StyleValue::Pattern(id) => {
-            let source = canvas_id(resource)?;
-            if source == canvas_id(target)? {
+            let source = context_canvas_id(ctx, resource)?;
+            if source == context_canvas_id(ctx, target)? {
                 return Ok(style);
             }
             let definition = {
@@ -4211,8 +4465,9 @@ fn get_font(this: This<Object<'_>>) -> Result<Value<'_>> {
 
 fn set_font_binding(this: This<Object<'_>>, value: DomString) -> Result<()> {
     let ctx = this.0.ctx();
-    let id = canvas_id(&this.0)?;
-    let style = attribute_value(ctx, id, "style").unwrap_or_default();
+    let style = context_canvas_node(ctx, &this.0)?
+        .and_then(|id| attribute_value(ctx, id, "style").ok())
+        .unwrap_or_default();
     let (base_size, line_height) = canvas_style_metrics(&style);
     let Some(font) = text::canonical_font(&value, base_size, line_height) else {
         return Ok(());
@@ -4262,22 +4517,33 @@ fn resolved_language(ctx: &Ctx<'_>, object: &Object<'_>, lang: &str) -> Option<S
     if lang != "inherit" && !lang.is_empty() {
         return Some(lang.to_owned());
     }
-    let id = canvas_id(object).ok()?;
-    let owner = crate::js::bindings::world_for_node(ctx, id).ok()?;
-    let owner = owner.borrow();
-    let parsed = owner.document(id)?;
-    // `lang` inherits from the nearest ancestor that declares it, and an empty
-    // declaration stops the search
-    // (<https://html.spec.whatwg.org/multipage/dom.html#attr-lang>). An
-    // OffscreenCanvas has no element of its own, so it reads the document root,
-    // which is where `documentElement.lang` lives.
-    for ancestor in crate::dom::tree::ancestor_chain(&parsed.document.base, id.document, id.node) {
-        if let Some(value) = crate::dom::tree::attr(&parsed.document.base, ancestor.node, "lang") {
-            return (!value.trim().is_empty()).then(|| value.to_owned());
+    if let Some(id) = context_canvas_node(ctx, object).ok().flatten() {
+        let owner = crate::js::bindings::world_for_node(ctx, id).ok()?;
+        let owner = owner.borrow();
+        let parsed = owner.document(id)?;
+        // `lang` inherits from the nearest ancestor that declares it, and an
+        // empty declaration stops the search
+        // (<https://html.spec.whatwg.org/multipage/dom.html#attr-lang>).
+        for ancestor in
+            crate::dom::tree::ancestor_chain(&parsed.document.base, id.document, id.node)
+        {
+            if let Some(value) =
+                crate::dom::tree::attr(&parsed.document.base, ancestor.node, "lang")
+            {
+                return (!value.trim().is_empty()).then(|| value.to_owned());
+            }
         }
+        let root = parsed.document.base.root_element().id;
+        return crate::dom::tree::attr(&parsed.document.base, root, "lang")
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_owned);
     }
-    // A detached canvas (the OffscreenCanvas backing element) has no ancestor
-    // chain into the document, so read the document root explicitly.
+    // An `OffscreenCanvas` has no element of its own; the constructor step
+    // inherits the document element's language
+    // (<https://html.spec.whatwg.org/multipage/canvas.html#offscreencanvas-inherited-lang>).
+    let world = world(ctx).ok()?;
+    let owner = world.borrow();
+    let parsed = owner.main_document()?;
     let root = parsed.document.base.root_element().id;
     crate::dom::tree::attr(&parsed.document.base, root, "lang")
         .filter(|value| !value.trim().is_empty())
@@ -4291,8 +4557,9 @@ fn resolved_direction(ctx: &Ctx<'_>, object: &Object<'_>, direction: &str) -> bo
     match direction {
         "rtl" => true,
         "ltr" => false,
-        _ => canvas_id(object)
+        _ => context_canvas_node(ctx, object)
             .ok()
+            .flatten()
             .and_then(|id| attribute_value(ctx, id, "dir").ok())
             .is_some_and(|dir| dir.trim().eq_ignore_ascii_case("rtl")),
     }
@@ -4322,13 +4589,12 @@ fn resolved_alignment(
 
 fn canvas_object(this: This<Object<'_>>) -> Result<Value<'_>> {
     let ctx = this.0.ctx();
-    let id = canvas_id(&this.0)?;
-    let id = {
-        let world = world(ctx)?;
-        let registry = world.borrow().registry();
-        registry.borrow_mut().live_node_id(id)
-    };
-    wrap_node(ctx, id)
+    // The inspection attributes `ctx.canvas` returns the element; an
+    // `OffscreenCanvas` overrides this accessor with its owner object.
+    match context_canvas_node(ctx, &this.0)? {
+        Some(id) => wrap_node(ctx, id),
+        None => Ok(Value::new_undefined(ctx.clone())),
+    }
 }
 
 /// Parses a canvas color, preserving the `color(srgb …)` serialization that
@@ -4368,37 +4634,47 @@ fn parse_canvas_color(
     Ok(parsed)
 }
 
-/// The canvas element's document and node, when the context really belongs to
-/// it. `__tbDoc`/`__tbNode` are writable, so a forged context must not reach
-/// another frame's style state.
+/// The canvas document and, for an element context, its node. `__tbCanvasId`
+/// is a writable property, so the registry decides whether the id is this
+/// realm's element. An `OffscreenCanvas` has no element style; it still parses
+/// colors against its realm's document device so system colors resolve.
 fn with_canvas_document<T>(
     ctx: &Ctx<'_>,
     object: &Object<'_>,
-    f: impl FnOnce(NodeId, &mut crate::Parsed) -> T,
+    f: impl FnOnce(Option<NodeId>, &mut crate::Parsed) -> T,
 ) -> Result<Option<T>> {
-    let Ok(id) = canvas_id(object) else {
-        return Ok(None);
-    };
     let world = world(ctx)?;
     let world = world.borrow();
-    if !world.owns_node(id) {
-        return Ok(None);
-    }
-    let Some(mut parsed) = world.document_mut(id) else {
-        return Ok(None);
+    let (node, mut parsed) = if let Some(id) = context_canvas_node(ctx, object)? {
+        if !world.owns_node(id) {
+            return Ok(None);
+        }
+        let Some(parsed) = world.document_mut(id) else {
+            return Ok(None);
+        };
+        (Some(id), parsed)
+    } else {
+        let Some(document) = world.main_document_id() else {
+            return Ok(None);
+        };
+        let Some(parsed) = world.document_mut_by_id(document) else {
+            return Ok(None);
+        };
+        (None, parsed)
     };
-    Ok(Some(f(id, &mut parsed)))
+    Ok(Some(f(node, &mut parsed)))
 }
 
 /// The canvas element's computed `color`, or black when it has no computed
-/// style (detached elements have none)
+/// style (detached elements and offscreen canvases have none)
 /// (<https://drafts.csswg.org/css-color-4/#currentcolor-color>).
 fn current_color(ctx: &Ctx<'_>, object: &Object<'_>) -> Result<style::color::AbsoluteColor> {
-    let Some(current) = with_canvas_document(ctx, object, |id, parsed| {
+    let Some(current) = with_canvas_document(ctx, object, |node, parsed| {
+        let node = node?;
         let base = &mut parsed.document.base;
         base.resolve(0.0);
         let styles = base
-            .get_node(id.node)
+            .get_node(node.node)
             .and_then(|node| node.primary_styles())?;
         Some(
             styles

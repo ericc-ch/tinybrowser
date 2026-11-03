@@ -1,13 +1,14 @@
-// OffscreenCanvas is a detached canvas in this engine. A hidden <canvas>
-// element owns the bitmap and the 2D context; this wrapper keeps the element
-// and the per-object state in private maps so page code cannot retarget or
-// forge it. Moving the bitmap to a Rust host is the prerequisite for workers.
+// OffscreenCanvas owns a bitmap in the renderer registry. It has no DOM node:
+// the bitmap id lives in a realm-private map, and only the host functions
+// below can reach it. That makes the interface usable in a realm with no
+// document and leaves no page-visible handle to the bitmap.
 // https://html.spec.whatwg.org/multipage/canvas.html#the-offscreencanvas-interface
 (function () {
   if (typeof globalThis.OffscreenCanvas === 'function') {
     return;
   }
 
+  const ids = new __tbPrivateMap();
   const states = new __tbPrivateMap();
   const contexts = new __tbPrivateMap();
 
@@ -30,6 +31,14 @@
       throw new TypeError('Illegal invocation');
     }
     return state;
+  }
+
+  function idOf(canvas) {
+    const id = ids.get(canvas);
+    if (id === undefined) {
+      throw new TypeError('Illegal invocation');
+    }
+    return id;
   }
 
   const base = globalThis.CanvasRenderingContext2D;
@@ -78,30 +87,26 @@
       if (arguments.length < 2) {
         throw new TypeError('OffscreenCanvas needs width and height');
       }
-      const canvas = document.createElement('canvas');
-      canvas.width = toUnsignedLongLong(width);
-      canvas.height = toUnsignedLongLong(height);
-      // Non-writable and non-configurable so page code cannot retarget the
-      // wrapper at another element. The element stays an implementation
-      // detail of the current host until OffscreenCanvas moves to Rust.
-      Object.defineProperty(this, '__tbCanvas', {
-        value: canvas,
-        enumerable: false,
-        writable: false,
-        configurable: false,
-      });
+      const id = host.__tbOffscreenCanvasNew(
+        toUnsignedLongLong(width),
+        toUnsignedLongLong(height),
+      );
+      ids.set(this, id);
       states.set(this, {
-        canvas,
         context: null,
         detached: false,
       });
     }
 
-    get width() { return stateOf(this).canvas.width; }
-    set width(value) { stateOf(this).canvas.width = toUnsignedLongLong(value); }
+    get width() { return host.__tbOffscreenCanvasWidth(idOf(this)); }
+    set width(value) {
+      host.__tbOffscreenCanvasSetWidth(idOf(this), toUnsignedLongLong(value));
+    }
 
-    get height() { return stateOf(this).canvas.height; }
-    set height(value) { stateOf(this).canvas.height = toUnsignedLongLong(value); }
+    get height() { return host.__tbOffscreenCanvasHeight(idOf(this)); }
+    set height(value) {
+      host.__tbOffscreenCanvasSetHeight(idOf(this), toUnsignedLongLong(value));
+    }
 
     getContext(type, options) {
       const state = stateOf(this);
@@ -121,7 +126,7 @@
       if (state.context) {
         return state.context;
       }
-      const context = state.canvas.getContext('2d', options);
+      const context = host.__tbOffscreenCanvasContext(idOf(this), options);
       if (context) {
         if (offscreenPrototype) {
           Object.setPrototypeOf(context, offscreenPrototype);
@@ -140,7 +145,7 @@
       if (!state.context) {
         throw new DOMException('the OffscreenCanvas has no 2D context', 'InvalidStateError');
       }
-      return globalThis.__tbCanvasTransferToImageBitmap(state.canvas);
+      return host.__tbOffscreenCanvasTransferToImageBitmap(idOf(this));
     }
   }
 
@@ -150,23 +155,27 @@
   });
   globalThis.OffscreenCanvas = OffscreenCanvas;
 
-  // Messaging and drawImage use these branded helpers instead of a writable
-  // expando. Neither exposes the hidden element.
-  globalThis.__tbOffscreenDetached = function (canvas) {
+  // Messaging and serialization use these branded helpers instead of a
+  // writable expando. Neither exposes the bitmap or its id.
+  host.__tbOffscreenCanvasId = function (value) {
+    const id = value && typeof value === 'object' ? ids.get(value) : undefined;
+    return id === undefined ? -1 : id;
+  };
+  host.__tbOffscreenDetached = function (canvas) {
     const state = canvas && typeof canvas === 'object' ? states.get(canvas) : undefined;
     return Boolean(state && state.detached);
   };
-  globalThis.__tbOffscreenHasContext = function (canvas) {
+  host.__tbOffscreenHasContext = function (canvas) {
     const state = canvas && typeof canvas === 'object' ? states.get(canvas) : undefined;
     return Boolean(state && state.context);
   };
-  globalThis.__tbOffscreenDetach = function (canvas) {
+  host.__tbOffscreenDetach = function (canvas) {
     const state = stateOf(canvas);
+    const id = idOf(canvas);
     state.detached = true;
-    // Transferring moves the bitmap away, leaving a zero-sized bitmap. The
-    // hidden element follows the same rule so drawImage sees an invalid source
-    // without a page-writable detach flag.
-    state.canvas.width = 0;
-    state.canvas.height = 0;
+    state.context = null;
+    // The transfer steps unset the bitmap; the sender keeps its dimensions
+    // only as the zero-sized detached bitmap.
+    host.__tbOffscreenCanvasDetach(id);
   };
 })();

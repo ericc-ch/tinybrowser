@@ -2019,6 +2019,73 @@ mod realm_tests {
     }
 
     #[test]
+    fn offscreen_canvas_needs_no_dom_node_and_exposes_no_bitmap_handle() {
+        let services: Arc<dyn BrowserServices> = Arc::new(NullServices);
+        let shared = SharedJsRuntime::default();
+        let stop = Arc::new(Stop::new());
+        let documents = Rc::new(RefCell::new(crate::documents::DocumentStore::default()));
+        let registry = Rc::new(RefCell::new(crate::js::RealmRegistry::default()));
+        let world = world_with_document(
+            &shared,
+            &services,
+            &documents,
+            &registry,
+            "https://a.test/",
+            "<!doctype html><p>offscreen</p>",
+        );
+        let realm = JsRealm::new(&shared.handle(), world, stop).expect("realm");
+        realm
+            .eval(
+                r"
+                var before = document.getElementsByTagName('*').length;
+                var off = new OffscreenCanvas(4, 4);
+                var after = document.getElementsByTagName('*').length;
+                var context = off.getContext('2d');
+                context.fillStyle = '#f00';
+                context.fillRect(0, 0, 4, 4);
+                var bitmap = off.transferToImageBitmap();
+                var reader = document.createElement('canvas');
+                reader.width = 4;
+                reader.height = 4;
+                var read = reader.getContext('2d');
+                read.drawImage(bitmap, 0, 0);
+                var pixel = read.getImageData(0, 0, 1, 1).data;
+                var pending = new OffscreenCanvas(4, 4).convertToBlob();
+                pending.then(function (blob) { globalThis.__contextless = blob.size > 0; },
+                              function () { globalThis.__contextless = false; });
+                var forged = document.createElement('canvas');
+                forged.width = 4;
+                forged.height = 4;
+                var forgedContext = forged.getContext('2d');
+                forgedContext.__tbCanvasId = 999999;
+                var rejected = false;
+                try { forgedContext.canvas; } catch (error) {
+                  rejected = error.name === 'InvalidStateError';
+                }
+                globalThis.__probe = [
+                  after - before,
+                  '__tbCanvas' in off,
+                  String(off.__tbCanvasId),
+                  off.width,
+                  pixel[0],
+                  pixel[3],
+                  rejected,
+                ].join(',');
+                'ok'
+                ",
+            )
+            .expect("offscreen canvas");
+        let outcome = realm
+            .eval("[__probe, String(globalThis.__contextless)].join('|')")
+            .expect("offscreen probe");
+        // No node was added, there is no page-visible bitmap handle, the
+        // transferred bitmap still owns the red pixels the offscreen canvas
+        // painted before the transfer cleared it, a forged id is refused, and
+        // a contextless canvas still serializes a transparent bitmap.
+        assert_eq!(outcome, "0,false,undefined,4,255,255,true|true");
+    }
+
+    #[test]
     fn structured_clone_transfer_detaches_the_source_buffer() {
         let services: Arc<dyn BrowserServices> = Arc::new(NullServices);
         let shared = SharedJsRuntime::default();

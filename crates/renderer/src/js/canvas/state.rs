@@ -2753,6 +2753,10 @@ impl Canvas2D {
     /// zero row at a time so a fresh 4096x4096 canvas does not allocate a
     /// 64 MB pixmap just to serialize its blank bitmap.
     pub(crate) fn blank_png(width: u32, height: u32) -> Option<Vec<u8>> {
+        // The same retained-resource cap as an allocated bitmap: the encoder
+        // streams rows, so without it a page-sized `width * height` is an
+        // unbounded amount of work.
+        crate::js::world::canvas_bytes(width, height)?;
         let row_len = usize::try_from(width).ok()?.checked_mul(4)?;
         let mut out = Vec::new();
         {

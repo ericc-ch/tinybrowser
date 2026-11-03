@@ -15,11 +15,11 @@ use url::Url;
 
 use crate::documents::DocumentStore;
 use crate::documents::JournalEntry;
-use crate::dom::tree::{NodeId, attr, is_child_navigable_container, is_connected};
+use crate::dom::tree::{NodeId, attr, is_child_navigable_container, is_connected, is_html_tag};
 use crate::dom_string::DomString;
 
 use crate::js::FrameRuntime;
-use crate::js::canvas::{Canvas2D, Gradient, Pattern, SourceImage};
+use crate::js::canvas::{Canvas2D, CanvasId, Gradient, Pattern, SourceImage};
 use crate::messaging::{MAX_FRAMES, SharedHandle};
 use crate::protocol::{
     FrameId, SandboxFlag, SandboxFlags, StorageChange, StorageError, StorageKey, StorageKind,
@@ -73,8 +73,15 @@ pub(crate) struct RealmRegistry {
     /// `WebDriver` element ids, allocated across every world and frame so a
     /// reference cannot alias between browsing contexts.
     next_remote: u64,
-    /// Canvas 2D state and bitmaps, keyed by the canvas element.
-    canvases: HashMap<NodeId, Canvas2D>,
+    /// Canvas bitmaps keyed by an opaque id. The id names the bitmap, not a
+    /// DOM node, so an `OffscreenCanvas` needs no element.
+    canvases: HashMap<CanvasId, CanvasSlot>,
+    /// The bitmap a `<canvas>` element draws into, once it has a context.
+    canvas_nodes: HashMap<NodeId, CanvasId>,
+    next_canvas: u64,
+    /// Identifies this realm among the worlds sharing the registry, so a
+    /// documentless realm can own offscreen canvases.
+    next_realm: u64,
     /// Decoded `ImageBitmap` pixels, keyed by an opaque id. The id is exposed
     /// on the JS object; the pixels are not, so a page cannot read a
     /// cross-origin image through the bitmap's internal storage.
@@ -206,6 +213,41 @@ pub(crate) struct BitmapPixels {
     pub(crate) origin_clean: bool,
 }
 
+/// Which platform object owns one canvas bitmap.
+///
+/// An element slot follows its node through adoption and dies with the node's
+/// document; an offscreen slot belongs to the realm that constructed it, even
+/// when that realm has no document
+/// (<https://html.spec.whatwg.org/multipage/canvas.html#offscreencanvas>).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum CanvasOwner {
+    Element(NodeId),
+    Offscreen { realm: u64, document: Option<u32> },
+}
+
+/// The context mode of a canvas bitmap. `OffscreenCanvas` uses the full set;
+/// `<canvas>` only reaches `TwoD` or `Bitmap` through `getContext`
+/// (<https://html.spec.whatwg.org/multipage/canvas.html#concept-canvas-context-mode>,
+/// <https://html.spec.whatwg.org/multipage/canvas.html#offscreencanvas-context-mode>).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CanvasMode {
+    None,
+    TwoD,
+    Bitmap,
+    Detached,
+}
+
+/// One bitmap and the dimension of its backing store. `Canvas2D` is allocated
+/// on first drawing, so creating a context neither reserves pixels nor fails
+/// for a canvas that is never painted.
+pub(crate) struct CanvasSlot {
+    pub(crate) owner: CanvasOwner,
+    pub(crate) mode: CanvasMode,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    canvas: Option<Canvas2D>,
+}
+
 impl RealmRegistry {
     pub(crate) fn insert_bitmap(
         &mut self,
@@ -242,57 +284,211 @@ impl RealmRegistry {
         self.bitmaps.remove(&id);
     }
 
+    /// The next bitmap id. Ids are opaque and never reused, so a stale
+    /// `__tbCanvasId` cannot reach a later canvas.
+    fn allocate_canvas(&mut self) -> CanvasId {
+        self.next_canvas = self.next_canvas.saturating_add(1);
+        CanvasId(self.next_canvas)
+    }
+
+    /// A realm id for a documentless `OffscreenCanvas` owner.
+    pub(crate) fn allocate_realm(&mut self) -> u64 {
+        self.next_realm = self.next_realm.saturating_add(1);
+        self.next_realm
+    }
+
+    /// The bitmap a `<canvas>` element draws into, created on its first
+    /// `getContext` call
+    /// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-canvas-getcontext>).
+    pub(crate) fn element_canvas(&mut self, node: NodeId, width: u32, height: u32) -> CanvasId {
+        if let Some(id) = self.canvas_nodes.get(&node) {
+            return *id;
+        }
+        let id = self.allocate_canvas();
+        self.canvas_nodes.insert(node, id);
+        self.canvases.insert(
+            id,
+            CanvasSlot {
+                owner: CanvasOwner::Element(node),
+                mode: CanvasMode::None,
+                width,
+                height,
+                canvas: None,
+            },
+        );
+        id
+    }
+
+    /// A detached bitmap for `OffscreenCanvas`
+    /// (<https://html.spec.whatwg.org/multipage/canvas.html#offscreencanvas>).
+    pub(crate) fn offscreen_canvas(
+        &mut self,
+        realm: u64,
+        document: Option<u32>,
+        width: u32,
+        height: u32,
+    ) -> CanvasId {
+        let id = self.allocate_canvas();
+        self.canvases.insert(
+            id,
+            CanvasSlot {
+                owner: CanvasOwner::Offscreen { realm, document },
+                mode: CanvasMode::None,
+                width,
+                height,
+                canvas: None,
+            },
+        );
+        id
+    }
+
+    /// The bitmap a `<canvas>` element already draws into, if any.
+    pub(crate) fn canvas_id_for_node(&self, node: NodeId) -> Option<CanvasId> {
+        self.canvas_nodes.get(&node).copied()
+    }
+
+    /// Whether this realm may reach `id`. Element slots follow the node they
+    /// belong to; offscreen slots follow the realm that constructed them.
+    pub(crate) fn owns_canvas(&self, id: CanvasId, world: &World) -> bool {
+        let Some(slot) = self.canvases.get(&id) else {
+            return false;
+        };
+        match slot.owner {
+            CanvasOwner::Element(node) => {
+                world.owns_node(node)
+                    && world
+                        .with_document(node, |parsed| {
+                            parsed
+                                .document
+                                .base
+                                .get_node(node.node)
+                                .is_some_and(|node| is_html_tag(Some(&node.data), "canvas"))
+                        })
+                        .unwrap_or(false)
+            }
+            CanvasOwner::Offscreen { realm, .. } => realm == world.realm_id(),
+        }
+    }
+
+    pub(crate) fn canvas_mode(&self, id: CanvasId) -> Option<CanvasMode> {
+        self.canvases.get(&id).map(|slot| slot.mode)
+    }
+
+    /// The context mode already chosen for an element, even after its context
+    /// object was collected. `getContext` must keep refusing a second mode
+    /// (<https://html.spec.whatwg.org/multipage/canvas.html#concept-canvas-context-mode>).
+    pub(crate) fn canvas_mode_for_node(&self, node: NodeId) -> Option<CanvasMode> {
+        let id = self.canvas_nodes.get(&node)?;
+        self.canvases.get(id).map(|slot| slot.mode)
+    }
+
+    /// Drops every offscreen canvas a realm owns. A realm with no document
+    /// never reaches `forget_document`, so its bitmaps would otherwise stay
+    /// for the life of the tab.
+    pub(crate) fn forget_realm(&mut self, realm: u64) {
+        self.canvases.retain(|_, slot| {
+            !matches!(slot.owner, CanvasOwner::Offscreen { realm: owner, .. } if owner == realm)
+        });
+    }
+
+    pub(crate) fn set_canvas_mode(&mut self, id: CanvasId, mode: CanvasMode) {
+        if let Some(slot) = self.canvases.get_mut(&id) {
+            slot.mode = mode;
+        }
+    }
+
+    /// The element backing a canvas, or `None` for an `OffscreenCanvas`.
+    pub(crate) fn canvas_node(&self, id: CanvasId) -> Option<NodeId> {
+        match self.canvases.get(&id)?.owner {
+            CanvasOwner::Element(node) => Some(node),
+            CanvasOwner::Offscreen { .. } => None,
+        }
+    }
+
+    pub(crate) fn canvas_dimensions(&self, id: CanvasId) -> Option<(u32, u32)> {
+        self.canvases.get(&id).map(|slot| (slot.width, slot.height))
+    }
+
     /// Drops the bitmap and context state. Setting `canvas.width` or
     /// `canvas.height` resets the context even when the value is unchanged
     /// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-canvas-width>).
     pub(crate) fn reset_canvas(&mut self, id: NodeId, width: u32, height: u32) {
-        if let Some(canvas) = self.canvases.get_mut(&id) {
+        let Some(canvas_id) = self.canvas_nodes.get(&id).copied() else {
+            return;
+        };
+        self.resize_canvas(canvas_id, width, height);
+    }
+
+    /// Replaces the bitmap dimensions and resets a live 2D context.
+    pub(crate) fn resize_canvas(&mut self, id: CanvasId, width: u32, height: u32) {
+        let Some(slot) = self.canvases.get_mut(&id) else {
+            return;
+        };
+        slot.width = width;
+        slot.height = height;
+        if let Some(canvas) = &mut slot.canvas {
             canvas.reset_for_resize(width, height);
         }
     }
 
-    /// The 2D context state for `id`, reallocated when its content attributes
-    /// changed size
-    /// (<https://html.spec.whatwg.org/multipage/canvas.html#the-canvas-element>).
-    pub(crate) fn canvas(&mut self, id: NodeId, width: u32, height: u32) -> &mut Canvas2D {
-        let stale = self
-            .canvases
-            .get(&id)
-            .is_some_and(|canvas| canvas.width != width || canvas.height != height);
-        if stale && let Some(canvas) = self.canvases.get_mut(&id) {
-            canvas.reset_for_resize(width, height);
+    /// The transfer steps leave the sender without a bitmap.
+    pub(crate) fn detach_canvas(&mut self, id: CanvasId) {
+        if let Some(slot) = self.canvases.get_mut(&id) {
+            slot.mode = CanvasMode::Detached;
+            slot.width = 0;
+            slot.height = 0;
+            slot.canvas = None;
         }
+    }
+
+    /// The 2D context state for `id`, allocated on first drawing.
+    pub(crate) fn canvas_mut(&mut self, id: CanvasId) -> Option<&mut Canvas2D> {
+        let slot = self.canvases.get_mut(&id)?;
+        if slot.mode == CanvasMode::Detached {
+            return None;
+        }
+        let (width, height) = (slot.width, slot.height);
+        Some(
+            slot.canvas
+                .get_or_insert_with(|| Canvas2D::new(width, height)),
+        )
+    }
+
+    pub(crate) fn canvas_has_open_layer(&self, id: CanvasId) -> bool {
         self.canvases
-            .entry(id)
-            .or_insert_with(|| Canvas2D::new(width, height))
-    }
-
-    pub(crate) fn canvas_has_open_layer(&self, id: NodeId) -> bool {
-        self.canvases.get(&id).is_some_and(Canvas2D::has_open_layer)
+            .get(&id)
+            .and_then(|slot| slot.canvas.as_ref())
+            .is_some_and(Canvas2D::has_open_layer)
     }
 
     /// The origin-clean flag of a live canvas, or `None` when it has no
     /// context yet.
-    pub(crate) fn canvas_origin_clean(&self, id: NodeId) -> Option<bool> {
-        self.canvases.get(&id).map(Canvas2D::origin_clean)
+    pub(crate) fn canvas_origin_clean(&self, id: CanvasId) -> Option<bool> {
+        self.canvases
+            .get(&id)
+            .and_then(|slot| slot.canvas.as_ref())
+            .map(Canvas2D::origin_clean)
     }
 
-    pub(crate) fn canvas_png(&self, id: NodeId) -> Option<Vec<u8>> {
-        self.canvases.get(&id)?.to_png()
+    pub(crate) fn canvas_png(&self, id: CanvasId) -> Option<Vec<u8>> {
+        self.canvases.get(&id)?.canvas.as_ref()?.to_png()
     }
 
     pub(crate) fn canvas_jpeg(
         &self,
-        id: NodeId,
+        id: CanvasId,
         quality: crate::js::canvas::JpegQuality,
     ) -> Option<Vec<u8>> {
-        self.canvases.get(&id)?.to_jpeg(quality)
+        self.canvases.get(&id)?.canvas.as_ref()?.to_jpeg(quality)
     }
 
     /// Replaces the bitmap with a fresh transparent one without touching the
     /// drawing state.
-    pub(crate) fn clear_canvas_bitmap(&mut self, id: NodeId) -> bool {
-        let Some(canvas) = self.canvases.get_mut(&id) else {
+    pub(crate) fn clear_canvas_bitmap(&mut self, id: CanvasId) -> bool {
+        let Some(slot) = self.canvases.get_mut(&id) else {
+            return false;
+        };
+        let Some(canvas) = &mut slot.canvas else {
             return false;
         };
         canvas.clear_bitmap();
@@ -300,8 +496,8 @@ impl RealmRegistry {
     }
 
     /// A straight-RGBA copy of a canvas bitmap, for `drawImage` and patterns.
-    pub(crate) fn canvas_snapshot(&self, id: NodeId) -> Option<SourceImage> {
-        let canvas = self.canvases.get(&id)?;
+    pub(crate) fn canvas_snapshot(&self, id: CanvasId) -> Option<SourceImage> {
+        let canvas = self.canvases.get(&id)?.canvas.as_ref()?;
         Some(SourceImage {
             width: canvas.width,
             height: canvas.height,
@@ -314,14 +510,22 @@ impl RealmRegistry {
 
     /// A gradient defined on another canvas, for cross-canvas styles
     /// (<https://html.spec.whatwg.org/multipage/canvas.html#canvasgradient>).
-    pub(crate) fn canvas_gradient(&self, id: NodeId, resource: u32) -> Option<Gradient> {
-        self.canvases.get(&id)?.gradient_definition(resource)
+    pub(crate) fn canvas_gradient(&self, id: CanvasId, resource: u32) -> Option<Gradient> {
+        self.canvases
+            .get(&id)?
+            .canvas
+            .as_ref()?
+            .gradient_definition(resource)
     }
 
     /// A pattern defined on another canvas, for cross-canvas styles
     /// (<https://html.spec.whatwg.org/multipage/canvas.html#canvaspattern>).
-    pub(crate) fn canvas_pattern(&self, id: NodeId, resource: u32) -> Option<Pattern> {
-        self.canvases.get(&id)?.pattern_definition(resource)
+    pub(crate) fn canvas_pattern(&self, id: CanvasId, resource: u32) -> Option<Pattern> {
+        self.canvases
+            .get(&id)?
+            .canvas
+            .as_ref()?
+            .pattern_definition(resource)
     }
 
     /// The next process-unique `WebDriver` element id.
@@ -425,7 +629,11 @@ impl RealmRegistry {
         self.wrappers.retain(|node| node.document_id() != id);
         self.same_object
             .retain(|(node, _)| node.document_id() != id);
-        self.canvases.retain(|node, _| node.document_id() != id);
+        self.canvas_nodes.retain(|node, _| node.document_id() != id);
+        self.canvases.retain(|_, slot| match slot.owner {
+            CanvasOwner::Element(node) => node.document_id() != id,
+            CanvasOwner::Offscreen { document, .. } => document != Some(id),
+        });
         self.frame_documents
             .retain(|_, document| document.document_id() != id);
         self.creation_realms
@@ -481,8 +689,13 @@ impl RealmRegistry {
         if let Some(world) = self.creation_realms.remove(&from) {
             self.creation_realms.insert(to, world);
         }
-        if let Some(canvas) = self.canvases.remove(&from) {
-            self.canvases.insert(to, canvas);
+        if let Some(canvas_id) = self.canvas_nodes.remove(&from) {
+            self.canvas_nodes.insert(to, canvas_id);
+            if let Some(slot) = self.canvases.get_mut(&canvas_id)
+                && let CanvasOwner::Element(node) = &mut slot.owner
+            {
+                *node = to;
+            }
         }
     }
 
@@ -552,6 +765,7 @@ impl RealmRegistry {
         self.adopted_ids.clear();
         self.object_urls.clear();
         self.canvases.clear();
+        self.canvas_nodes.clear();
         self.bitmaps.clear();
     }
 
@@ -995,6 +1209,9 @@ pub(crate) struct World {
     pub(crate) runtime: FrameRuntime,
     /// The frame this realm belongs to.
     frame: FrameId,
+    /// This realm's id in the shared registry. It owns offscreen canvases even
+    /// when the realm has no document.
+    realm: u64,
     /// Page-scoped scripts registered through CDP to run in every new realm
     /// of this tab, shared by every frame's world, with their identifiers
     /// (<https://chromedevtools.github.io/devtools-protocol/tot/Page/#method-addScriptToEvaluateOnNewDocument>).
@@ -1121,10 +1338,6 @@ pub(crate) struct World {
     /// The pristine `setTimeout`, captured with the web bundle. `toBlob` queues
     /// its callback through this value instead of a page-replaceable global.
     pub(crate) pristine_set_timeout: Option<Persistent<Function<'static>>>,
-    /// The pristine `OffscreenCanvas` detached/has-context probes, so
-    /// `convertToBlob` keeps its early checks after the method moves to Rust.
-    pub(crate) pristine_offscreen_detached: Option<Persistent<Function<'static>>>,
-    pub(crate) pristine_offscreen_has_context: Option<Persistent<Function<'static>>>,
     /// The realm's own event-interface constructors, captured after the web
     /// bundle installs them and before page script runs. `createEvent` uses
     /// these, never `globals[interface]`: a page that replaces the global
@@ -1457,9 +1670,11 @@ impl World {
         init_scripts: Rc<RefCell<Vec<(u64, String)>>>,
     ) -> Self {
         let secure_context = secure_context::is_secure_environment(&document_url, None);
+        let realm = runtime.registry.borrow_mut().allocate_realm();
         Self {
             runtime: runtime.clone(),
             frame,
+            realm,
             init_scripts,
             viewport_size: Cell::new(crate::engine::DEFAULT_VIEWPORT),
             pending_frames: Vec::new(),
@@ -1502,8 +1717,6 @@ impl World {
             pristine_eval_error: None,
             pristine_blob: None,
             pristine_set_timeout: None,
-            pristine_offscreen_detached: None,
-            pristine_offscreen_has_context: None,
             event_ctors: HashMap::new(),
             weak_references: None,
             deliver_mutations_fn: None,
@@ -1574,6 +1787,10 @@ impl World {
             // the realm tears down (`clear_listeners`).
             self.events.forget_document(id);
         }
+        self.runtime
+            .registry
+            .borrow_mut()
+            .forget_realm(self.realm_id());
         self.document = None;
     }
 
@@ -1725,6 +1942,16 @@ impl World {
 
     pub(crate) fn frame_document(&self, container: NodeId) -> Option<NodeId> {
         self.runtime.registry.borrow().frame_document(container)
+    }
+
+    /// This realm's registry id, the owner of its offscreen canvases.
+    pub(crate) fn realm_id(&self) -> u64 {
+        self.realm
+    }
+
+    /// The active document id without borrowing the tree store.
+    pub(crate) fn main_document_id(&self) -> Option<u32> {
+        self.document
     }
 
     /// The frame this realm belongs to.
@@ -2855,8 +3082,6 @@ impl World {
         self.pristine_eval_error = None;
         self.pristine_blob = None;
         self.pristine_set_timeout = None;
-        self.pristine_offscreen_detached = None;
-        self.pristine_offscreen_has_context = None;
         self.event_ctors.clear();
         self.weak_references = None;
         self.deliver_mutations_fn = None;
