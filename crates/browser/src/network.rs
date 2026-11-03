@@ -545,7 +545,7 @@ impl NetworkContext {
             cache: Arc::clone(&self.cache),
             streams: Arc::clone(&self.streams),
             next_stream: Arc::clone(&self.next_stream),
-            sheets: Arc::new(Mutex::new(HashSet::new())),
+            sheets: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -610,15 +610,17 @@ pub(crate) struct TabNetworkHandle {
     cache: ResponseCache,
     streams: StreamMap,
     next_stream: Arc<AtomicU64>,
-    /// Style sheet URLs this tab's network served: final URL and request URL,
-    /// fragments stripped. A request a sheet initiates sends the sheet's URL
-    /// as its referrer, which is cross-origin to both the document and the
-    /// target, so the browser authorizes an explicit referrer against this set
-    /// instead of the document's origin. Only URLs that really were style
-    /// sheets for this tab can be forged into a referrer, so a renderer cannot
-    /// claim an arbitrary origin's URL
+    /// Style sheet URLs this tab's network served, keyed by the origin of the
+    /// document that asked for them: final URL and request URL, fragments
+    /// stripped. A request a sheet initiates sends the sheet's URL as its
+    /// referrer, which is cross-origin to both the document and the target, so
+    /// the browser authorizes an explicit referrer against the sheets *that
+    /// document* loaded instead of against the document's own origin. Keying
+    /// by origin is what stops document B from naming a sheet document A
+    /// loaded, which would leak another principal's cross-origin URLs and the
+    /// referrer policy they came with
     /// (<https://w3c.github.io/webappsec-referrer-policy/#integration-with-css>).
-    sheets: Arc<Mutex<HashSet<Url>>>,
+    sheets: Arc<Mutex<HashMap<url::Origin, HashSet<Url>>>>,
 }
 
 impl TabNetworkHandle {
@@ -796,7 +798,7 @@ impl TabNetworkHandle {
         }
         .await;
         if let Ok(outcome) = &result {
-            self.remember_sheet(request, outcome.status, &outcome.final_url);
+            self.remember_sheet(request, initiator, outcome.status, &outcome.final_url);
         }
         trace_dial_result(request, started, result.as_ref());
         result
@@ -1096,21 +1098,38 @@ impl TabNetworkHandle {
     /// referrer naming the sheet can be authorized. A sheet that failed or
     /// never arrived is not recorded: nothing it contained can issue a request
     /// (<https://w3c.github.io/webappsec-referrer-policy/#integration-with-css>).
-    fn remember_sheet(&self, request: &DialRequest, status: u16, final_url: &Url) {
+    fn remember_sheet(
+        &self,
+        request: &DialRequest,
+        initiator: &url::Origin,
+        status: u16,
+        final_url: &Url,
+    ) {
         if request.policy.kind() != DialKind::Stylesheet || !(200..300).contains(&status) {
+            return;
+        }
+        // Every opaque initiator is a fresh unique origin, so a sheet it loads
+        // could never authorize a later referrer; recording it would only grow
+        // the map. A later request from such a document falls back to sending
+        // no referrer, which is what the strip-for-use algorithm answers for a
+        // URL with no host anyway
+        // (<https://w3c.github.io/webappsec-referrer-policy/#strip-url>).
+        // `url`'s `Origin` names opaque origins by not being a tuple.
+        if !initiator.is_tuple() {
             return;
         }
         let mut sheets = self
             .sheets
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let loaded = sheets.entry(initiator.clone()).or_default();
         for url in [&request.url, final_url] {
             // A referrer never carries a fragment, and the sheet URL the
             // renderer names is the one it was loaded from
             // (<https://w3c.github.io/webappsec-referrer-policy/#strip-url>).
             let mut url = url.clone();
             url.set_fragment(None);
-            sheets.insert(url);
+            loaded.insert(url);
         }
     }
 
@@ -1197,7 +1216,7 @@ fn outbound_request(
     request: &DialRequest,
     initiator: &url::Origin,
     deadline: Instant,
-    sheets: &HashSet<Url>,
+    sheets: &HashMap<url::Origin, HashSet<Url>>,
 ) -> Result<Request, DialFailure> {
     let url = request.url.clone();
     let kind = request.policy.kind();
@@ -1313,13 +1332,23 @@ fn outbound_request(
 /// The sheet arm is what authorizes CSS-initiated requests, whose referrer is
 /// the sheet's URL on whatever host the sheet came from
 /// (<https://w3c.github.io/webappsec-referrer-policy/#integration-with-css>).
-fn referrer_authorized(referrer: &Url, initiator: &url::Origin, sheets: &HashSet<Url>) -> bool {
+fn referrer_authorized(
+    referrer: &Url,
+    initiator: &url::Origin,
+    sheets: &HashMap<url::Origin, HashSet<Url>>,
+) -> bool {
     if referrer.origin() == *initiator {
         return true;
     }
+    // Only the sheets this request's initiator loaded. A sheet another
+    // document fetched is a different principal's URL, and naming it here
+    // would leak that URL (and the policy it was served with).
+    let Some(loaded) = sheets.get(initiator) else {
+        return false;
+    };
     let mut stripped = referrer.clone();
     stripped.set_fragment(None);
-    sheets.contains(&stripped)
+    loaded.contains(&stripped)
 }
 
 /// The cache write a streamed body performs once its bytes are complete.
@@ -1603,6 +1632,34 @@ mod tests {
         DialRequest::new(policy, &url, &initiator.origin())
     }
 
+    /// A sheet's referrer authority belongs to the origin that loaded it.
+    /// Another document in the same tab must not be able to name that URL and
+    /// leak it (with the policy it was served under) to a target of its
+    /// choosing
+    /// (<https://w3c.github.io/webappsec-referrer-policy/#integration-with-css>).
+    #[test]
+    fn a_sheet_referrer_belongs_to_the_document_that_loaded_it() {
+        let loader = Url::parse("http://a.test/page").expect("page URL").origin();
+        let other = Url::parse("http://b.test/page").expect("page URL").origin();
+        let sheet = Url::parse("http://cdn.test/site.css").expect("sheet URL");
+        let mut sheets = HashMap::new();
+        sheets.insert(loader.clone(), HashSet::from([sheet.clone()]));
+
+        assert!(
+            referrer_authorized(&sheet, &loader, &sheets),
+            "the document that loaded the sheet may name it"
+        );
+        assert!(
+            !referrer_authorized(&sheet, &other, &sheets),
+            "another origin in the tab may not borrow it"
+        );
+        let fragment = Url::parse("http://cdn.test/site.css#x").expect("sheet URL");
+        assert!(
+            referrer_authorized(&fragment, &loader, &sheets),
+            "the comparison is on the fragment-stripped URL"
+        );
+    }
+
     fn js_fetch(mode: renderer::CorsMode, url: &str) -> DialRequest {
         dial(
             RequestPolicy::Fetch(renderer::CorsRequest {
@@ -1749,7 +1806,7 @@ mod tests {
     fn every_policy_reaches_the_wire_with_its_own_parameters() {
         let initiator = Url::parse("http://a.test/page").expect("page URL").origin();
         let deadline = Instant::now() + Duration::from_secs(5);
-        let sheets = HashSet::new();
+        let sheets = HashMap::new();
         for (policy, mode, credentials, redirect, fetch_mode, destination) in wire_table() {
             let request = dial(policy, "http://b.test/x");
             let outbound = outbound_request(&request, &initiator, deadline, &sheets)
@@ -1791,7 +1848,7 @@ mod tests {
 
         let initiator = Url::parse("http://a.test/page").expect("page URL").origin();
         let deadline = Instant::now() + Duration::from_secs(5);
-        let sheets = HashSet::new();
+        let sheets = HashMap::new();
         let mut request = dial(
             RequestPolicy::Fetch(renderer::CorsRequest {
                 mode: renderer::CorsMode::NoCors,
