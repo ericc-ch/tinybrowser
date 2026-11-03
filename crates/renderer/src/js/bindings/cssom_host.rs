@@ -12,9 +12,14 @@ use blitz_dom::{CssRuleInfo, CssomError};
 use rquickjs::{Array, Ctx, Exception, Object, Result, Value};
 
 use super::{host_node_id, throw_dom, world};
+use crate::dom::tree::NodeId;
 
 pub(super) fn install(ctx: &Ctx<'_>) -> Result<()> {
     let bridge = crate::js::bridge::object(ctx)?;
+    bridge.set(
+        "__tb_sheet_owner_nodes",
+        rquickjs::prelude::Func::from(sheet_owner_nodes),
+    )?;
     bridge.set(
         "__tb_node_sheet_id",
         rquickjs::prelude::Func::from(node_sheet_id),
@@ -92,6 +97,38 @@ fn rule_index(ctx: &Ctx<'_>, index: f64) -> Result<usize> {
 
 fn cssom_throw(ctx: &Ctx<'_>, err: CssomError) -> rquickjs::Error {
     throw_dom(ctx, err.dom_exception_name(), "CSSOM operation failed")
+}
+
+/// The owner nodes of `document`'s author sheets, in tree order. The JS
+/// `StyleSheetList` reads each owner's `.sheet`, so the list itself stays live
+/// (<https://drafts.csswg.org/cssom/#dom-document-stylesheets>).
+fn sheet_owner_nodes<'js>(ctx: Ctx<'js>, document: Value<'js>) -> Result<Array<'js>> {
+    let array = Array::new(ctx.clone())?;
+    let Ok(world) = world(&ctx) else {
+        return Ok(array);
+    };
+    let Some(id) = host_node_id(&ctx, &document) else {
+        return Ok(array);
+    };
+    let world = world.borrow();
+    let Some(parsed) = world.document(id) else {
+        return Ok(array);
+    };
+    let document_id = parsed.id;
+    let owners: Vec<NodeId> = parsed
+        .document
+        .base
+        .stylesheet_owner_nodes()
+        .map(|node| NodeId {
+            document: document_id,
+            node,
+        })
+        .collect();
+    drop(parsed);
+    for (index, id) in owners.into_iter().enumerate() {
+        array.set(index, super::wrap_node(&ctx, id)?)?;
+    }
+    Ok(array)
 }
 
 fn node_sheet_id<'js>(ctx: Ctx<'js>, element: Value<'js>) -> f64 {

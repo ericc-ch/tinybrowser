@@ -2762,6 +2762,7 @@ dependencies = [
  "webidl-bindgen",
  "webstorage",
  "writeable",
+ "wuff",
  "xml5ever",
 ]
 

@@ -50,6 +50,8 @@ webstorage = { path = "crates/webstorage" }
 # `[patch.crates-io]` supplies the fork path.
 xml5ever = "0.40"
 markup5ever = "0.40"
+# WOFF/WOFF2 decoding for `@font-face` and `FontFace` sources.
+wuff = "0.2"
 
 [patch.crates-io]
 # fontconfig-parser 0.5.8 pins roxmltree 0.20; usvg and fontique pin 0.21.

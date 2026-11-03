@@ -52,6 +52,17 @@
   CSSFontFaceRule.prototype = Object.create(CSSRule.prototype);
   CSSKeyframesRule.prototype = Object.create(CSSRule.prototype);
   CSSKeyframeRule.prototype = Object.create(CSSRule.prototype);
+  // Each interface owns its `constructor`, so `rule.constructor.name` names
+  // the rule's real interface instead of inheriting `CSSRule`
+  // (<https://webidl.spec.whatwg.org/#interface-object>).
+  for (const ctor of [
+    CSSStyleRule, CSSGroupingRule, CSSConditionRule, CSSMediaRule, CSSSupportsRule,
+    CSSImportRule, CSSFontFaceRule, CSSKeyframesRule, CSSKeyframeRule,
+  ]) {
+    __tbDefineProperty(ctor.prototype, 'constructor', {
+      value: ctor, writable: true, configurable: true,
+    });
+  }
   const __tbRulePrototype = {
     CSSStyleRule, CSSGroupingRule, CSSConditionRule, CSSMediaRule, CSSSupportsRule,
     CSSImportRule, CSSFontFaceRule, CSSKeyframesRule, CSSKeyframeRule, CSSRule,
@@ -227,7 +238,7 @@
         __tbRequireClean(sheet);
         index = index >>> 0;
         if (index >= this.length) return null;
-        const path = __tbApply(__tbArray.concat, listPath(), [index]);
+        const path = __tbArray.concat(listPath(), index);
         return __tbCachedRule(sheet, path, parentRule);
       },
     };
@@ -370,6 +381,72 @@
       if (__tbArray.indexOf(tokens, 'stylesheet') === -1) return null;
       return __tbAssociatedSheet(this);
     },
+    enumerable: true,
+    configurable: true,
+  });
+  // `document.styleSheets`: every author sheet whose owner node is in the
+  // document, in tree order
+  // (<https://drafts.csswg.org/cssom/#dom-document-stylesheets>). The list
+  // reads the owner set on every access, so a sheet inserted or removed after
+  // the list was first observed is reflected without rebuilding it.
+  function StyleSheetList() { __tbIllegal(); }
+  Object.defineProperty(globalThis, 'StyleSheetList', {
+    value: StyleSheetList, writable: true, configurable: true,
+  });
+  __tbDefineProperty(StyleSheetList.prototype, 'item', {
+    value: function item(index) {
+      if (arguments.length < 1) throw new TypeError('item requires 1 argument');
+      index = index >>> 0;
+      const all = host.__tb_sheet_owner_nodes(this.__tbDocument);
+      if (index >= all.length) return null;
+      return __tbAssociatedSheet(all[index]);
+    },
+    writable: true, configurable: true,
+  });
+  __tbDefineProperty(StyleSheetList.prototype, 'length', {
+    get() { return host.__tb_sheet_owner_nodes(this.__tbDocument).length; },
+    enumerable: true, configurable: true,
+  });
+  __tbDefineProperty(StyleSheetList.prototype, Symbol.iterator, {
+    value: function* () {
+      for (let index = 0; index < this.length; index++) yield this.item(index);
+    },
+    writable: true, configurable: true,
+  });
+  __tbDefineProperty(StyleSheetList.prototype, Symbol.toStringTag, {
+    value: 'StyleSheetList', writable: false, enumerable: false, configurable: true,
+  });
+  const __tbStyleSheetLists = new WeakMap();
+  function __tbCssomDocumentBrand(value) {
+    // A `Document` is the only node with nodeType 9; a forged object still
+    // fails the Rust `host_node_id` check authoritatively.
+    if (value === null || typeof value !== 'object' || value.nodeType !== 9) {
+      throw new TypeError('Illegal invocation');
+    }
+    return value;
+  }
+  function __tbStyleSheetList(document) {
+    __tbCssomDocumentBrand(document);
+    let list = __tbStyleSheetLists.get(document);
+    if (list !== undefined) return list;
+    const target = Object.create(StyleSheetList.prototype, {
+      __tbDocument: { value: document, writable: false, enumerable: false, configurable: false },
+    });
+    list = new Proxy(target, {
+      get(list, property, receiver) {
+        if (__tbCanonicalIndex(property)) {
+          const item = list.item(property >>> 0);
+          return item === null ? undefined : item;
+        }
+        const value = __tbApply(__tbReflectGet, Reflect, [list, property, receiver]);
+        return typeof value === 'function' ? __tbApply(__tbBind, value, [list]) : value;
+      },
+    });
+    __tbStyleSheetLists.set(document, list);
+    return list;
+  }
+  Object.defineProperty(globalThis.Document.prototype, 'styleSheets', {
+    get() { return __tbStyleSheetList(this); },
     enumerable: true,
     configurable: true,
   });

@@ -965,10 +965,13 @@ pub(crate) type FontFaceKey = (
 pub(crate) type FontFamilyEntry = (parley::fontique::FamilyId, Vec<FontFaceKey>);
 
 /// One call to `__tbRegisterFont`, with the exact faces added to each
-/// collection so `__tbUnregisterFont` can remove only those faces.
+/// collection so `__tbUnregisterFont` can remove only those faces. The
+/// document and runtime collections are separate clones, so their face lists
+/// are kept apart: removing a key from one must never touch the other.
 pub(crate) struct FontRegistration {
     pub(crate) document: Option<u32>,
-    pub(crate) fonts: Vec<FontFamilyEntry>,
+    pub(crate) document_fonts: Vec<FontFamilyEntry>,
+    pub(crate) runtime_fonts: Vec<FontFamilyEntry>,
 }
 
 /// The request inputs an element's own attributes supply: its `crossorigin`

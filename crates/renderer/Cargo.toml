@@ -26,6 +26,9 @@ encoding_rs = "0.8"
 data-url = "0.3"
 percent-encoding = "2"
 base64 = "0.23"
+# `@font-face` and `FontFace` sources may be WOFF/WOFF2; the font table wants
+# an sfnt, so both loaders decode through the same crate Blitz uses.
+wuff = { workspace = true }
 # CSP hash-source checks (`'sha256-'`, `'sha384-'`, `'sha512-'`).
 sha2 = "0.10"
 # Web Crypto entropy must come from the operating system, never the JS PRNG.
