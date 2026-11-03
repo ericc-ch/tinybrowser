@@ -317,8 +317,6 @@ impl BrowsingContextHost for FsServices {
         _target: &TargetName,
         _opener: OpenerPolicy,
         _source: &renderer::NavigationSource,
-        _allow_popups: bool,
-        _sandbox: renderer::SandboxFlags,
     ) -> Option<WindowId> {
         None
     }

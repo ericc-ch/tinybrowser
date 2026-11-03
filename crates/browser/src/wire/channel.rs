@@ -45,8 +45,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// navigation calls. Version 17 put the secure-context bit on the policy
 /// container. Version 18 gave a mount and a streamed response the browsing
 /// context state the browser owns (target name, opener relationship, popup
-/// sandboxing flag set) and added the tab rename call.
-pub const PROTOCOL_VERSION: u8 = 18;
+/// sandboxing flag set) and added the tab rename call. Version 19 made the
+/// calling document's sandbox set part of a navigation source and dropped the
+/// `window.open` flags the browser now derives from its own copy.
+pub const PROTOCOL_VERSION: u8 = 19;
 
 /// Fixed frame header size in bytes.
 pub const HEADER_BYTES: usize = 16;
@@ -845,9 +847,9 @@ mod tests {
         );
     }
 
-    /// Every field of a `window.open` call crosses the wire: the source, the
-    /// target, the URL (present or absent), the opener policy, the sandbox
-    /// bit, and the popup sandboxing flag set
+    /// Every field of a `window.open` call crosses the wire: the source
+    /// (including its sandbox set), the target, the URL (present or absent),
+    /// and the opener policy
     /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#window-open-steps>).
     #[test]
     fn a_window_open_caller_survives_the_wire() {
@@ -855,32 +857,34 @@ mod tests {
             origin: renderer::SerializedOrigin::Opaque,
             referrer: url::Url::parse("https://a.test/page").expect("referrer"),
             referrer_policy: net::ReferrerPolicy::UnsafeUrl,
+            sandbox: renderer::SandboxFlags::empty(),
+            frame: renderer::FrameId::MAIN,
+        };
+        let sandboxed = renderer::NavigationSource {
+            sandbox: renderer::SandboxFlags::parse(Some("allow-scripts allow-popups")),
+            ..source.clone()
         };
         let cases = [
             (
                 Some(url::Url::parse("https://b.test/").expect("url")),
                 renderer::TargetName::Named("peer".to_owned()),
                 renderer::OpenerPolicy::NoOpener,
-                false,
-                renderer::SandboxFlags::empty(),
+                source,
             ),
             (
                 None,
                 renderer::TargetName::Blank,
                 renderer::OpenerPolicy::Keep,
-                true,
-                renderer::SandboxFlags::parse(Some("allow-scripts allow-popups")),
+                sandboxed,
             ),
         ];
-        for (url, target, opener, allow_popups, popup_sandbox) in cases {
+        for (url, target, opener, source) in cases {
             let call = crate::wire::ServiceCall::BrowsingContext(
                 crate::wire::BrowsingContextCall::WindowOpen {
                     url: url.clone(),
                     target: target.clone(),
                     opener,
                     source: source.clone(),
-                    allow_popups,
-                    popup_sandbox,
                 },
             );
             let message: crate::wire::FromRenderer = crate::exchange::Frame::Call {
@@ -900,8 +904,6 @@ mod tests {
                     target: back_target,
                     opener: back_opener,
                     source: back_source,
-                    allow_popups: back_allow,
-                    popup_sandbox: back_sandbox,
                 },
             ) = body.call
             else {
@@ -910,8 +912,6 @@ mod tests {
             assert_eq!(back_url, url);
             assert_eq!(back_target, target);
             assert_eq!(back_opener, opener);
-            assert_eq!(back_allow, allow_popups);
-            assert_eq!(back_sandbox, popup_sandbox);
             assert_eq!(back_source, source);
         }
     }

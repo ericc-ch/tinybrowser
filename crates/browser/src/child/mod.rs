@@ -443,8 +443,6 @@ impl BrowsingContextHost for HostServices {
         target: &renderer::TargetName,
         opener: OpenerPolicy,
         source: &renderer::NavigationSource,
-        allow_popups: bool,
-        popup_sandbox: renderer::SandboxFlags,
     ) -> Option<WindowId> {
         match self.call(ServiceCall::BrowsingContext(
             BrowsingContextCall::WindowOpen {
@@ -452,8 +450,6 @@ impl BrowsingContextHost for HostServices {
                 target: target.clone(),
                 opener,
                 source: source.clone(),
-                allow_popups,
-                popup_sandbox,
             },
         )) {
             Some(ServiceReply::Window(tab)) => tab,

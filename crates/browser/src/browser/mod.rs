@@ -95,6 +95,11 @@ pub(crate) struct OpenWindowOptions {
     pub(crate) target: renderer::TargetName,
     /// Tab that called `window.open`, when it has one.
     pub(crate) source: Option<TabId>,
+    /// The frame inside `source` that called it. A sandboxed document may
+    /// navigate the auxiliary contexts it opened and no one else's, so the
+    /// browser records the opener at frame granularity
+    /// (<https://html.spec.whatwg.org/multipage/browsers.html#sandboxed-navigation-browsing-context-flag>).
+    pub(crate) source_frame: renderer::FrameId,
     /// What the call's `noopener` and `noreferrer` features asked for.
     pub(crate) opener: renderer::OpenerPolicy,
     /// The calling document, already authorized against its renderer's site

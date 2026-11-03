@@ -382,19 +382,13 @@ pub enum BrowsingContextCall {
         /// What the `noopener` and `noreferrer` features asked for, already
         /// parsed by the renderer that read the feature string.
         opener: OpenerPolicy,
-        /// The calling document's origin, referrer source, and policy
+        /// The calling document's origin, referrer source, policy, and
+        /// sandbox set. The browser unions the set into its own copy of the
+        /// tab's, so the caller can only make the new tab stricter
         /// (<https://w3c.github.io/webappsec-fetch-metadata/#abstract-opdef-set-site>,
-        /// <https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
+        /// <https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>,
+        /// <https://html.spec.whatwg.org/multipage/browsers.html#sandboxing>).
         source: NavigationSource,
-        /// The calling document's sandbox bit for creating a context. The
-        /// renderer already refused the call without it; the browser checks it
-        /// again because it is the trust boundary
-        /// (<https://html.spec.whatwg.org/multipage/browsers.html#sandboxed-auxiliary-navigation-browsing-context-flag>).
-        allow_popups: bool,
-        /// The calling document's popup sandboxing flag set, which every
-        /// document in the new tab inherits
-        /// (<https://html.spec.whatwg.org/multipage/browsers.html#popup-sandboxing-flag-set>).
-        popup_sandbox: renderer::SandboxFlags,
     },
     /// The browser tab this tab's browsing context group holds under a name.
     WindowByName {

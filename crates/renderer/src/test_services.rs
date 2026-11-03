@@ -82,8 +82,6 @@ impl BrowsingContextHost for NullServices {
         _target: &crate::protocol::TargetName,
         _opener: crate::protocol::OpenerPolicy,
         _source: &crate::protocol::NavigationSource,
-        _allow_popups: bool,
-        _popup_sandbox: crate::protocol::SandboxFlags,
     ) -> Option<crate::protocol::WindowId> {
         None
     }

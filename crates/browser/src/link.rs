@@ -798,6 +798,10 @@ fn window_initiator(
         origin: claim,
         referrer,
         referrer_policy,
+        // The caller already applied these to the browser's sandbox state;
+        // the initiator does not carry them.
+        sandbox: _,
+        frame: _,
     } = source;
     // The calling document's origin must belong to this renderer's site lock;
     // an opaque document may still open a window, but its origin stays opaque.
@@ -848,30 +852,37 @@ impl WindowRouter<'_> {
         target: renderer::TargetName,
         opener: renderer::OpenerPolicy,
         source: renderer::NavigationSource,
-        allow_popups: bool,
-        popup_sandbox: renderer::SandboxFlags,
     ) -> Result<(), RendererViolation> {
         let Self {
             context,
             assignment,
             request: id,
         } = self;
-        // The renderer refused a call without the bit already; a renderer that
-        // sends it anyway is confused rather than hostile, so the window is
-        // refused and the process keeps running.
-        if !allow_popups
-            || matches!(
-                target,
-                renderer::TargetName::Current
-                    | renderer::TargetName::Parent
-                    | renderer::TargetName::Top
-            )
-        {
+        // `_self`, `_parent`, and `_top` never create a browsing context; the
+        // renderer navigates those in its own frame tree. Sending one here is a
+        // renderer bug or a forgery, not a request the browser should soften.
+        if matches!(
+            target,
+            renderer::TargetName::Current
+                | renderer::TargetName::Parent
+                | renderer::TargetName::Top
+        ) {
+            return Err(RendererViolation);
+        }
+        // The browser's copy of the tab's set is the baseline, and the calling
+        // document's set can only add what the browser cannot see (an `iframe
+        // sandbox` attribute, CSP `sandbox`). A renderer that claims its
+        // sandboxed document is not sandboxed therefore cannot widen the set,
+        // and an honest renderer never reaches this branch because it refused
+        // the call already
+        // (<https://html.spec.whatwg.org/multipage/browsers.html#sandboxed-auxiliary-navigation-browsing-context-flag>).
+        let active = context.tabs.sandbox(assignment.tab).union(source.sandbox);
+        if active.blocks_auxiliary_navigation() {
             logging::debug!(
                 target: "browser::tabs",
-                "window.open refused: no allow-popups, or a target that cannot create"
+                "window.open refused: the browser's sandbox set blocks auxiliary navigation"
             );
-            return send_reply(&context.responder, id, ServiceReply::Window(None)).await;
+            return Err(RendererViolation);
         }
         let url = match url {
             Some(url) => {
@@ -882,13 +893,20 @@ impl WindowRouter<'_> {
             }
             None => None,
         };
+        let calling_frame = source.frame;
         let initiator = window_initiator(assignment, source, opener)?;
+        // Every document in the new tab inherits this set. `auxiliary_flags`
+        // is the spec's one release: `allow-popups-to-escape-sandbox` empties
+        // it, and only the actively governing set can carry that keyword
+        // (<https://html.spec.whatwg.org/multipage/browsers.html#sandbox-propagates-to-auxiliary-browsing-contexts-flag>).
+        let popup_sandbox = active.auxiliary_flags();
         let tab = context
             .browser
             .open_window(crate::browser::OpenWindowOptions {
                 url,
                 target,
                 source: Some(assignment.tab),
+                source_frame: calling_frame,
                 opener,
                 initiator,
                 popup_sandbox,
@@ -920,6 +938,27 @@ impl WindowRouter<'_> {
         if context.tabs.find_by_name(assignment.tab, &name) == Some(target)
             && let Some(url) = url.and_then(navigable_popup_url)
         {
+            // A sandboxed document may navigate itself, the contexts nested
+            // inside it, and the auxiliary contexts it opened — and only those.
+            // The frame tree's own navigations never reach this path, so the
+            // one case this leaves is a tab the caller opened. The set is the
+            // browser's copy unioned with the calling document's claim, so the
+            // claim can only add restrictions
+            // (<https://html.spec.whatwg.org/multipage/browsers.html#sandboxed-navigation-browsing-context-flag>).
+            let active = context.tabs.sandbox(assignment.tab).union(source.sandbox);
+            // "The auxiliary contexts it created" is a frame relationship: the
+            // tab that hosts the sandboxed document is not the document, so a
+            // frame cannot inherit its parent document's permission
+            // (<https://html.spec.whatwg.org/multipage/browsers.html#sandboxed-navigation-browsing-context-flag>).
+            let created_by_caller = context.tabs.opener(target) == Some(assignment.tab)
+                && context.tabs.opener_frame(target) == Some(source.frame);
+            if target != assignment.tab && active.blocks_navigation() && !created_by_caller {
+                logging::debug!(
+                    target: "browser::tabs",
+                    "window.open navigation refused: a sandboxed document cannot navigate another browsing context"
+                );
+                return send_reply(&context.responder, id, ServiceReply::Unit).await;
+            }
             let initiator = window_initiator(assignment, source, opener)?;
             if let Ok(handle) = context.browser.tab(target).await {
                 tokio::spawn(async move {
@@ -946,15 +985,13 @@ async fn route_window_call(
             target,
             opener,
             source,
-            allow_popups,
-            popup_sandbox,
         } => {
             WindowRouter {
                 context,
                 assignment,
                 request: id,
             }
-            .open(url, target, opener, source, allow_popups, popup_sandbox)
+            .open(url, target, opener, source)
             .await?;
         }
         BrowsingContextCall::WindowByName { name } => {
@@ -1571,5 +1608,59 @@ async fn child_task(mut child: Child, mut kill: watch::Receiver<bool>) {
                 logging::error!(target: "browser::link", "renderer wait failed: {error}");
             }
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use renderer::SandboxFlags;
+
+    /// The browser's tab-level set is the baseline and the calling document's
+    /// set only adds to it, so a renderer that under-reports its own sandbox
+    /// cannot free a popup whose tab the browser knows is sandboxed
+    /// (<https://html.spec.whatwg.org/multipage/browsers.html#sandboxing>).
+    #[test]
+    fn a_source_can_add_sandbox_flags_but_never_remove_the_tabs() {
+        let tab = SandboxFlags::parse(Some("allow-scripts allow-popups"));
+        assert!(tab.propagates_to_auxiliary());
+        assert_eq!(
+            tab.union(SandboxFlags::empty()).auxiliary_flags(),
+            tab,
+            "an empty claim cannot widen what the browser knows"
+        );
+        assert_eq!(
+            tab.union(tab).auxiliary_flags(),
+            tab,
+            "an honest renderer sends its active set, which already contains the tab's"
+        );
+
+        let stricter = tab.union(SandboxFlags::parse(Some("")));
+        assert_eq!(
+            tab.union(stricter).auxiliary_flags(),
+            stricter,
+            "a claim that adds a flag the browser cannot see is kept"
+        );
+
+        let escaping = SandboxFlags::parse(Some(
+            "allow-scripts allow-popups allow-popups-to-escape-sandbox",
+        ));
+        assert!(!escaping.propagates_to_auxiliary());
+        assert_eq!(
+            escaping.auxiliary_flags(),
+            SandboxFlags::empty(),
+            "the escaping set is the one legitimate release"
+        );
+        assert_eq!(
+            SandboxFlags::empty()
+                .union(SandboxFlags::empty())
+                .auxiliary_flags(),
+            SandboxFlags::empty(),
+            "an unsandboxed tab's popup starts unsandboxed"
+        );
+        assert_eq!(
+            SandboxFlags::empty().union(tab).auxiliary_flags(),
+            tab,
+            "an iframe's flags reach its popup through the claim"
+        );
     }
 }

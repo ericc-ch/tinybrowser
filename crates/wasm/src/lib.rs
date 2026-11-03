@@ -666,8 +666,6 @@ impl BrowsingContextHost for WasmServices {
         _target: &renderer::TargetName,
         _opener: renderer::OpenerPolicy,
         _source: &renderer::NavigationSource,
-        _allow_popups: bool,
-        _popup_sandbox: renderer::SandboxFlags,
     ) -> Option<renderer::WindowId> {
         None
     }

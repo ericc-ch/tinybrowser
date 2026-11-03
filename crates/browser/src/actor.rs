@@ -679,6 +679,12 @@ pub(crate) struct NewTab {
     /// navigation
     /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#resetBCName>).
     pub(crate) opener: Option<TabId>,
+    /// The frame inside `opener` that opened this one, when it is live. A
+    /// sandboxed document may navigate the auxiliary contexts it created, so
+    /// the opener relationship a sandbox check reads is the frame's, not the
+    /// tab's
+    /// (<https://html.spec.whatwg.org/multipage/browsers.html#sandboxed-navigation-browsing-context-flag>).
+    pub(crate) opener_frame: Option<renderer::FrameId>,
     /// The popup sandboxing flag set every document this tab installs
     /// inherits
     /// (<https://html.spec.whatwg.org/multipage/browsers.html#popup-sandboxing-flag-set>).
@@ -696,6 +702,7 @@ impl NewTab {
         Self {
             name: String::new(),
             opener: None,
+            opener_frame: None,
             popup_sandbox: renderer::SandboxFlags::empty(),
             document_origin: url::Origin::new_opaque(),
         }

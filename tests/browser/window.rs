@@ -781,3 +781,157 @@ fn a_refresh_delay_beyond_the_clock_never_fires() {
         "the page never asks for its refresh target"
     );
 }
+
+/// Runs #231's scenario once: a page opens a browser tab named `victim`, an
+/// `iframe` opens a second popup, and that popup navigates `victim` by name
+/// after it loads. Returns what the victim server recorded for `/two`, which
+/// is empty when the navigation was refused.
+///
+/// The popup's target is a real URL the server records, so "refused" and
+/// "navigated" are distinguishable from the outside; `about:blank` would
+/// never reach the server either way. `sandboxed` decides whether the opener
+/// is a `sandbox="allow-scripts allow-popups"` document, whose popup keeps
+/// the sandboxed navigation flag
+/// (<https://html.spec.whatwg.org/multipage/browsers.html#popup-sandboxing-flag-set>).
+fn sibling_navigation(sandboxed: bool) -> Vec<String> {
+    let victim = TestServer::start(
+        vec![
+            (
+                "/one",
+                ok("text/html", b"<!doctype html><title>one</title>"),
+            ),
+            (
+                "/two",
+                ok("text/html", b"<!doctype html><title>two</title>"),
+            ),
+        ],
+        None,
+    );
+    let popup_page = format!(
+        "<!doctype html><script>setTimeout(() => {{ window.open('http://{}/two', 'victim'); }}, 500);</script>",
+        victim.address()
+    );
+    let popup = TestServer::start(
+        vec![("/popup", ok("text/html", popup_page.as_bytes()))],
+        None,
+    );
+    let sandbox = if sandboxed {
+        r#" sandbox="allow-scripts allow-popups""#
+    } else {
+        ""
+    };
+    let page = format!(
+        r#"<!doctype html><script>window.open('http://{victim}/one', 'victim');</script>
+<iframe{sandbox} srcdoc="<script>window.open('http://{popup}/popup', 'sandboxed');</script>"></iframe>"#,
+        victim = victim.address(),
+        popup = popup.address(),
+    );
+    let (listener, origin) = server();
+    let _served = TestServer::serve_on(
+        listener,
+        vec![("/page/index.html", ok("text/html", page.as_bytes()))],
+    );
+    let (_fixture, _client, _session) = open_page(
+        "tinybrowser-sandbox-sibling-navigation",
+        &format!("http://{origin}/page/index.html"),
+    );
+
+    // Both tabs exist and loaded before the popup tries to navigate.
+    victim.wait("/one");
+    popup.wait("/popup");
+    std::thread::sleep(Duration::from_millis(1500));
+    victim.history("/two")
+}
+
+/// Runs the same scenario with no intermediate popup: the page itself opens
+/// a browser tab named `victim`, and an `iframe` it hosts navigates that tab
+/// by name. Returns what the victim server recorded for `/two`.
+///
+/// This is the case the browser cannot answer from the tab's own popup set (the
+/// tab is unsandboxed), so the calling document's set has to travel on the
+/// navigation source.
+fn sandboxed_frame_navigation(sandboxed: bool) -> Vec<String> {
+    let victim = TestServer::start(
+        vec![
+            (
+                "/one",
+                ok("text/html", b"<!doctype html><title>one</title>"),
+            ),
+            (
+                "/two",
+                ok("text/html", b"<!doctype html><title>two</title>"),
+            ),
+        ],
+        None,
+    );
+    let sandbox = if sandboxed {
+        r#" sandbox="allow-scripts allow-popups""#
+    } else {
+        ""
+    };
+    let page = format!(
+        r#"<!doctype html><script>window.open('http://{victim}/one', 'victim');</script>
+<iframe{sandbox} srcdoc="<script>setTimeout(() => {{ window.open('http://{victim}/two', 'victim'); }}, 500);</script>"></iframe>"#,
+        victim = victim.address(),
+    );
+    let (listener, origin) = server();
+    let _served = TestServer::serve_on(
+        listener,
+        vec![("/page/index.html", ok("text/html", page.as_bytes()))],
+    );
+    let (_fixture, _client, _session) = open_page(
+        "tinybrowser-sandbox-frame-navigation",
+        &format!("http://{origin}/page/index.html"),
+    );
+
+    victim.wait("/one");
+    std::thread::sleep(Duration::from_millis(1500));
+    victim.history("/two")
+}
+
+/// A sandboxed frame cannot navigate a browser tab it did not open, even
+/// though its own tab is unsandboxed: the check reads the calling document's
+/// set, not only the tab's
+/// (<https://html.spec.whatwg.org/multipage/browsers.html#sandboxed-navigation-browsing-context-flag>).
+#[test]
+fn a_sandboxed_frame_cannot_navigate_a_sibling_tab_by_name() {
+    assert!(
+        sandboxed_frame_navigation(true).is_empty(),
+        "a sandboxed frame must not navigate a tab it did not open"
+    );
+}
+
+/// The control: the same frame, unsandboxed, reaches the victim tab.
+#[test]
+fn an_unsandboxed_frame_may_navigate_a_sibling_tab_by_name() {
+    assert_eq!(
+        sandboxed_frame_navigation(false).len(),
+        1,
+        "an unsandboxed frame may navigate a tab in its group"
+    );
+}
+
+/// A sandboxed document cannot navigate a browsing context it did not open,
+/// even one the browser hosts: the popup set travels with the tab, and the
+/// name lookup alone is not permission
+/// (<https://html.spec.whatwg.org/multipage/browsers.html#sandboxed-navigation-browsing-context-flag>,
+/// #231).
+#[test]
+fn a_sandboxed_popup_cannot_navigate_a_sibling_tab_by_name() {
+    assert!(
+        sibling_navigation(true).is_empty(),
+        "a sandboxed document must not navigate a tab it did not open"
+    );
+}
+
+/// The control for the test above: the same name lookup and the same
+/// navigation, with the sandbox removed, reaches the victim tab. Without this
+/// the refusal could be a lookup that never matched anything.
+#[test]
+fn an_unsandboxed_popup_may_navigate_a_sibling_tab_by_name() {
+    assert_eq!(
+        sibling_navigation(false).len(),
+        1,
+        "an unsandboxed document may navigate a tab in its group"
+    );
+}

@@ -546,8 +546,42 @@ impl SandboxFlags {
     /// embedder's active set combine
     /// (<https://html.spec.whatwg.org/multipage/browsers.html#determining-the-creation-sandboxing-flags>).
     #[must_use]
-    pub(crate) fn union(self, other: Self) -> Self {
+    pub fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
+    }
+
+    /// Whether no flag is set: an unsandboxed document, or a tab whose popup
+    /// set carries nothing.
+    #[must_use]
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// Whether this set blocks creating auxiliary browsing contexts, i.e.
+    /// `allow-popups` is absent
+    /// (<https://html.spec.whatwg.org/multipage/browsers.html#sandboxed-auxiliary-navigation-browsing-context-flag>).
+    ///
+    /// The browser checks this against its own copy of a tab's popup set, so a
+    /// renderer cannot open a tab the browser's state refuses.
+    #[must_use]
+    pub fn blocks_auxiliary_navigation(self) -> bool {
+        self.contains(SandboxFlag::AuxiliaryNavigation)
+    }
+
+    /// Whether this set blocks navigating a browsing context other than the
+    /// sandboxed one. No `sandbox` keyword clears this flag
+    /// (<https://html.spec.whatwg.org/multipage/browsers.html#sandboxed-navigation-browsing-context-flag>).
+    #[must_use]
+    pub fn blocks_navigation(self) -> bool {
+        self.contains(SandboxFlag::Navigation)
+    }
+
+    /// Whether this set propagates into the auxiliary contexts the document
+    /// opens, i.e. `allow-popups-to-escape-sandbox` is absent
+    /// (<https://html.spec.whatwg.org/multipage/browsers.html#sandbox-propagates-to-auxiliary-browsing-contexts-flag>).
+    #[must_use]
+    pub fn propagates_to_auxiliary(self) -> bool {
+        self.contains(SandboxFlag::PropagatesToAuxiliary)
     }
 
     /// Whether scripts are blocked
@@ -567,8 +601,9 @@ impl SandboxFlags {
     /// set while the sandbox propagates, nothing after
     /// `allow-popups-to-escape-sandbox`
     /// (<https://html.spec.whatwg.org/multipage/browsers.html#sandbox-propagates-to-auxiliary-browsing-contexts-flag>).
-    pub(crate) fn auxiliary_flags(self) -> Self {
-        if self.contains(SandboxFlag::PropagatesToAuxiliary) {
+    #[must_use]
+    pub fn auxiliary_flags(self) -> Self {
+        if self.propagates_to_auxiliary() {
             self
         } else {
             Self::empty()
@@ -1694,6 +1729,17 @@ pub struct NavigationSource {
     pub referrer: Url,
     /// The concrete referrer policy the calling document determined.
     pub referrer_policy: net::ReferrerPolicy,
+    /// The calling document's active sandboxing flag set. A renderer sees flags
+    /// the browser does not (an `iframe sandbox` attribute, CSP `sandbox`), so
+    /// the browser unions this into its own copy of the tab's set and can only
+    /// become stricter, never looser
+    /// (<https://html.spec.whatwg.org/multipage/browsers.html#sandboxing>).
+    pub sandbox: SandboxFlags,
+    /// The calling frame. A sandboxed document may navigate the auxiliary
+    /// contexts it created, which is a relationship between frames: the tab
+    /// that hosts the frame is not the document
+    /// (<https://html.spec.whatwg.org/multipage/browsers.html#sandboxed-navigation-browsing-context-flag>).
+    pub frame: FrameId,
 }
 
 /// Browsing-context effects the page engine asks its host to perform.
@@ -1705,10 +1751,12 @@ pub trait BrowsingContextHost: Send + Sync + 'static {
     ///
     /// `source` is the calling document's origin, referrer source, and policy.
     /// `noreferrer` is not applied here: the browser folds it into the policy
-    /// it receives, because it owns the feature's meaning. `allow_popups` is
-    /// the calling document's sandbox bit; the browser enforces it too,
-    /// because it is the trust boundary
+    /// it receives, because it owns the feature's meaning. The browser derives
+    /// `allow-popups` and the new tab's popup sandboxing flag set from its own
+    /// copy of the tab's set plus `source.sandbox`, because a capability the
+    /// caller reports about itself is not a check
     /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#window-open-steps>,
+    /// <https://html.spec.whatwg.org/multipage/browsers.html#popup-sandboxing-flag-set>,
     /// <https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
     fn window_open(
         &self,
@@ -1716,8 +1764,6 @@ pub trait BrowsingContextHost: Send + Sync + 'static {
         target: &TargetName,
         opener: OpenerPolicy,
         source: &NavigationSource,
-        allow_popups: bool,
-        popup_sandbox: SandboxFlags,
     ) -> Option<WindowId>;
 
     /// The browser tab this tab's browsing context group holds under `name`,

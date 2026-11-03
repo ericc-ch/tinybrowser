@@ -1605,8 +1605,9 @@ fn open_window(
     // whether this renderer or the browser would host it; spelling the name
     // `_BLANK` or choosing an unknown `_x` must not change that
     // (<https://html.spec.whatwg.org/multipage/browsers.html#sandboxed-auxiliary-navigation-browsing-context-flag>).
-    let allow_popups = world.borrow().allows_auxiliary_navigation();
-    if !allow_popups {
+    // The browser checks the same flag against its own copy of the tab's set;
+    // this early return is the honest renderer behaving, not the check.
+    if !world.borrow().allows_auxiliary_navigation() {
         return None;
     }
     // A same-origin popup stays in this renderer; a cross-origin one is a
@@ -1617,15 +1618,7 @@ fn open_window(
             withholds: plan.withholds,
         });
     }
-    let popup_sandbox = world.borrow().sandbox.auxiliary_flags();
-    let tab = services.window_open(
-        plan.url.as_ref(),
-        &target,
-        plan.opener,
-        &plan.source,
-        allow_popups,
-        popup_sandbox,
-    )?;
+    let tab = services.window_open(plan.url.as_ref(), &target, plan.opener, &plan.source)?;
     Some(WindowOpenAnswer {
         context: OpenedContext::Tab(tab),
         withholds: plan.withholds,

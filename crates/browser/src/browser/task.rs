@@ -24,11 +24,19 @@ use super::{
 pub(crate) struct TabRegistry {
     tabs: Arc<Mutex<HashMap<TabId, TabTask>>>,
     openers: Arc<Mutex<HashMap<TabId, TabId>>>,
+    /// The frame inside the opener that created each tab; see
+    /// [`Self::opener_frame`].
+    opener_frames: Arc<Mutex<HashMap<TabId, renderer::FrameId>>>,
     /// Target names of tabs. The browsing context group is what
     /// `window.open`'s name lookup searches, so the names are keyed by tab and
     /// resolved through the opener chain; a tab with no name has no entry
     /// (<https://html.spec.whatwg.org/multipage/document-sequences.html#the-rules-for-choosing-a-navigable>).
     names: Arc<Mutex<HashMap<TabId, String>>>,
+    /// The popup sandboxing flag set each tab's documents inherit. The browser
+    /// owns the copy a `window.open` is checked against and the copy a new
+    /// tab inherits, so the renderer's claim can only ever add flags
+    /// (<https://html.spec.whatwg.org/multipage/browsers.html#popup-sandboxing-flag-set>).
+    sandboxes: Arc<Mutex<HashMap<TabId, renderer::SandboxFlags>>>,
 }
 
 impl TabRegistry {
@@ -36,7 +44,9 @@ impl TabRegistry {
         Self {
             tabs: Arc::new(Mutex::new(HashMap::new())),
             openers: Arc::new(Mutex::new(HashMap::new())),
+            opener_frames: Arc::new(Mutex::new(HashMap::new())),
             names: Arc::new(Mutex::new(HashMap::new())),
+            sandboxes: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -99,6 +109,37 @@ impl TabRegistry {
             .unwrap_or_else(PoisonError::into_inner)
             .get(&id)
             .copied()
+    }
+
+    /// Records the popup sandboxing flag set a tab's documents inherit.
+    ///
+    /// The browser keeps its own copy because the set is what it checks a
+    /// `window.open` against: a renderer that claims its document may open a
+    /// popup cannot widen what the browser already knows, and a tab the
+    /// browser created itself starts empty
+    /// (<https://html.spec.whatwg.org/multipage/browsers.html#popup-sandboxing-flag-set>).
+    pub(crate) fn set_sandbox(&self, id: TabId, sandbox: renderer::SandboxFlags) {
+        self.sandboxes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(id, sandbox);
+    }
+
+    /// The popup sandboxing flag set of one live tab; empty when it has none.
+    pub(crate) fn sandbox(&self, id: TabId) -> renderer::SandboxFlags {
+        self.sandboxes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&id)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn remove_sandbox(&self, id: TabId) {
+        self.sandboxes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&id);
     }
 
     /// Queues one `postMessage` delivery on the target tab's mailbox. Returns
@@ -167,15 +208,35 @@ impl TabRegistry {
             .collect()
     }
 
-    fn set_opener(&self, id: TabId, opener: TabId) {
+    /// Records that `id` was opened by `opener`'s frame `frame`.
+    fn set_opener(&self, id: TabId, opener: TabId, frame: renderer::FrameId) {
         self.openers
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(id, opener);
+        self.opener_frames
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(id, frame);
+    }
+
+    /// The frame inside `id`'s opener that opened it. Together with
+    /// [`Self::opener`] this is "the auxiliary contexts it created" for the
+    /// sandboxed navigation check.
+    pub(crate) fn opener_frame(&self, id: TabId) -> Option<renderer::FrameId> {
+        self.opener_frames
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&id)
+            .copied()
     }
 
     fn remove_opener(&self, id: TabId) {
         self.openers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&id);
+        self.opener_frames
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&id);
@@ -285,8 +346,9 @@ impl BrowserTask {
         let id = TabId::new(raw);
         self.context.create_tab(id);
         self.tabs.set_name(id, tab.name.clone());
-        if let Some(opener) = tab.opener {
-            self.tabs.set_opener(id, opener);
+        self.tabs.set_sandbox(id, tab.popup_sandbox);
+        if let (Some(opener), Some(frame)) = (tab.opener, tab.opener_frame) {
+            self.tabs.set_opener(id, opener, frame);
         }
         let task = TabTask::spawn(
             id,
@@ -306,6 +368,7 @@ impl BrowserTask {
         };
         self.tabs.remove_opener(id);
         self.tabs.remove_name(id);
+        self.tabs.remove_sandbox(id);
         // Never wait on the tab coordinator here: the browser owner task must
         // not join a wait-for cycle with a renderer that needs it. The task
         // keeps its own lifecycle and reaps itself.
@@ -319,6 +382,7 @@ impl BrowserTask {
             url,
             target,
             source,
+            source_frame,
             opener,
             initiator,
             popup_sandbox,
@@ -330,6 +394,7 @@ impl BrowserTask {
         let handle = self.create_tab(NewTab {
             name: target.new_context_name().unwrap_or_default().to_owned(),
             opener: opener_tab,
+            opener_frame: opener_tab.map(|_| source_frame),
             popup_sandbox,
             // The initial `about:blank` inherits the opener's origin, which is
             // what the first navigation's target-name reset compares against
@@ -527,7 +592,7 @@ mod tests {
         let tabs = TabRegistry::new();
         let opener = TabId::new(1);
         let popup = TabId::new(2);
-        tabs.set_opener(popup, opener);
+        tabs.set_opener(popup, opener, renderer::FrameId::MAIN);
         tabs.set_name(popup, "peer".to_owned());
         assert_eq!(tabs.name(popup), "peer");
         assert_eq!(tabs.find_by_name(opener, "peer"), Some(popup));
@@ -545,10 +610,31 @@ mod tests {
         let opener = TabId::new(1);
         let stranger = TabId::new(2);
         let popup = TabId::new(3);
-        tabs.set_opener(popup, opener);
+        tabs.set_opener(popup, opener, renderer::FrameId::MAIN);
         tabs.set_name(popup, "peer".to_owned());
         assert_eq!(tabs.find_by_name(opener, "peer"), Some(popup));
         assert_eq!(tabs.find_by_name(popup, "peer"), Some(popup));
         assert_eq!(tabs.find_by_name(stranger, "peer"), None);
+    }
+
+    /// The browser's own sandbox copy is what a `window.open` is checked
+    /// against and what a new tab inherits, so it must survive a renderer
+    /// replacement and disappear with its tab
+    /// (<https://html.spec.whatwg.org/multipage/browsers.html#popup-sandboxing-flag-set>).
+    #[test]
+    fn a_tab_keeps_its_popup_sandbox_until_it_closes() {
+        let tabs = TabRegistry::new();
+        let plain = TabId::new(1);
+        let sandboxed = TabId::new(2);
+        assert!(!tabs.sandbox(sandboxed).blocks_navigation());
+        tabs.set_sandbox(
+            sandboxed,
+            renderer::SandboxFlags::parse(Some("allow-scripts allow-popups")),
+        );
+        assert!(tabs.sandbox(sandboxed).blocks_navigation());
+        assert!(tabs.sandbox(sandboxed).origin_is_opaque());
+        assert!(!tabs.sandbox(plain).blocks_navigation());
+        tabs.remove_sandbox(sandboxed);
+        assert!(!tabs.sandbox(sandboxed).blocks_navigation());
     }
 }

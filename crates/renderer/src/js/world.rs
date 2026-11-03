@@ -1888,6 +1888,8 @@ impl World {
                 origin: crate::protocol::SerializedOrigin::from(&self.origin),
                 referrer: self.referrer_url.clone(),
                 referrer_policy: self.policy.referrer_policy.unwrap_or_default(),
+                sandbox: self.sandbox,
+                frame: self.frame,
             },
         })
     }
