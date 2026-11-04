@@ -1,49 +1,40 @@
-# Chunked WPT runs for sets too long for one machine. Local loops stay on
-# tools/wpt/cli.py; this workflow is the full-suite pass. It runs on every
-# push to main and nightly. Each run keeps its raw chunk reports as artifacts,
-# so a score can be reproduced without rerunning anything.
+# The full WPT suite on every push, in the engine process.
 #
-# Wall time on the standard runner is dominated by the wpt-profile build
-# (~2.5 min) and by the twenty chunk jobs (~15 min each, capped by the
-# repository's concurrent-job limit); the full suite does not fit a one-minute
-# budget. Use `fast`/`fast-harness` for the short feedback loop.
+# Two lanes partition the manifest exactly:
 #
-# Shape: a plan job walks the test tree once (cli.py manifest) and a build job
-# compiles the wpt profile; both fan out to `chunks` jobs. Each job runs one
-# upstream dir_hash chunk of the shared manifest (wptrunner hashes the test
-# directory, so a directory is never split across jobs); the score job folds
-# the reports into one table on the run page. A chunk that died before writing
-# its report is skipped there with a warning, turns the run red, and its raw
-# log still says how far it got.
+#   harness   — testharness, crashtest, and reftest files mounted in the real
+#               engine, with a wptserve sidecar for `.py` handler routes. No
+#               WebDriver, wptserve request path, or renderer child per test.
+#   webdriver — the files `fast-harness` cannot run: testdriver tests and the
+#               generated worker/module wrappers, driven through the browser.
 #
-# Defaults: the four test types tinybrowser can run today (testharness,
-# crashtest, reftest, test262) over the whole tree. print-reftest is out (no
-# printing); aamtest and wdspec need pytest plus the platform accessibility
-# stack, so they cannot run yet.
+# `test262` runs natively in QuickJS in one job. The score job folds every
+# report into one table. The nightly `wpt-nightly.yml` still runs the whole
+# suite through WebDriver, which is the fidelity backstop.
 #
-# Not here yet: results publishing (wpt-results branch + tracker page), PR
-# subsets, wpt.fyi upload.
+# Cost: the harness lane is ~4.6k CPU-seconds and the WebDriver lane ~2k, so
+# the chunk counts below split the repository's 20-job / 80-core limit to put
+# both lanes at roughly the same wall time (the WebDriver lane is ~5x slower
+# per test).
 name: WPT
 
 on:
   push:
     branches: [main]
-  schedule:
-    # Every day at 00:00 UTC (01:00 in Zurich winter, 02:00 in summer).
-    # Scheduled runs never see dispatch inputs, so all three defaults live
-    # in the env block below as well; GitHub pauses the timer after 60 days
-    # without repository activity, and manual runs stay available.
-    - cron: "0 0 * * *"
   workflow_dispatch:
     inputs:
-      chunks:
-        description: Matrix size; mirrors upstream --total-chunks (1..256).
+      harness-chunks:
+        description: In-process chunk jobs; ~4 vCPUs each.
         type: string
-        default: "20"
+        default: "15"
+      webdriver-chunks:
+        description: WebDriver chunk jobs; harness + WebDriver must total <= 20.
+        type: string
+        default: "5"
       test-types:
         description: Space-separated wptrunner test types; stays last (nargs).
         type: string
-        default: "testharness crashtest reftest test262"
+        default: "testharness crashtest reftest"
       exclude:
         description: Space-separated upstream --exclude values.
         type: string
@@ -53,8 +44,8 @@ permissions:
   contents: read
 
 concurrency:
-  # A new push supersedes the previous push's run; a scheduled or dispatched
-  # run is never cancelled by one (a cancelled run uploads no artifacts).
+  # A new push supersedes the previous push's run; a dispatched run is never
+  # cancelled by one (a cancelled run uploads no artifacts).
   group: wpt-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'push' }}
 
@@ -64,13 +55,12 @@ env:
   # fraction of full debuginfo; the 14 GB runner disk stays comfortable.
   CARGO_PROFILE_WPT_DEBUG: "line-tables-only"
   # Mirrors the flake devShell: link the runner's OpenSSL instead of building
-  # a vendored copy (the vendored one needs perl and minutes, and links the
-  # static copy where local builds link the system one).
+  # a vendored copy.
   OPENSSL_NO_VENDOR: "1"
-  # Dispatch inputs are empty on scheduled runs, so every use goes through
-  # these; the defaults match the workflow_dispatch inputs above.
-  WPT_CHUNKS: ${{ inputs.chunks || '20' }}
-  WPT_TEST_TYPES: ${{ inputs.test-types || 'testharness crashtest reftest test262' }}
+  # Dispatch inputs are empty on pushes, so every use goes through these.
+  WPT_HARNESS_CHUNKS: ${{ inputs.harness-chunks || '15' }}
+  WPT_WEBDRIVER_CHUNKS: ${{ inputs.webdriver-chunks || '5' }}
+  WPT_TEST_TYPES: ${{ inputs.test-types || 'testharness crashtest reftest' }}
   WPT_EXCLUDE: ${{ inputs.exclude || 'worker' }}
 
 jobs:
@@ -78,16 +68,20 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     outputs:
-      chunks: ${{ steps.plan.outputs.chunks }}
+      harness: ${{ steps.plan.outputs.harness }}
+      webdriver: ${{ steps.plan.outputs.webdriver }}
     steps:
       - id: plan
-        name: Build the chunk list
+        name: Build the chunk lists
         run: |
-          if [[ ! "$WPT_CHUNKS" =~ ^[1-9][0-9]*$ ]] || (( WPT_CHUNKS > 256 )); then
-            echo "::error::chunks must be an integer in 1..256 (got '$WPT_CHUNKS')"
+          set -euo pipefail
+          total=$(( WPT_HARNESS_CHUNKS + WPT_WEBDRIVER_CHUNKS ))
+          if (( total > 20 )); then
+            echo "::error::harness + webdriver chunks is $total; the repository limit is 20"
             exit 1
           fi
-          echo "chunks=[$(seq -s, 1 "$WPT_CHUNKS")]" >> "$GITHUB_OUTPUT"
+          echo "harness=[$(seq -s, 1 "$WPT_HARNESS_CHUNKS")]" >> "$GITHUB_OUTPUT"
+          echo "webdriver=[$(seq -s, 1 "$WPT_WEBDRIVER_CHUNKS")]" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v7
       - name: WPT checkout (pinned, shallow)
         run: git submodule update --init --depth 1 third_party/wpt
@@ -114,10 +108,6 @@ jobs:
           sudo apt-get install -y -qq --no-install-recommends
           libfontconfig1-dev libssl-dev pkg-config
       - name: Toolchain
-        # `rust-toolchain.toml` pins a nightly and `.cargo/config.toml` builds
-        # std in-tree, so the runner needs that toolchain plus `rust-src`.
-        # Install it here: an implicit rustup auto-install during `cargo build`
-        # would be the failure point with no name.
         run: |
           rustup toolchain install --profile minimal --component rust-src
           cargo --version
@@ -125,8 +115,6 @@ jobs:
         run: |
           git submodule update --init --depth 1 --jobs 4 \
             third_party/blitz third_party/rquickjs third_party/html5ever
-          # rquickjs needs its nested quickjs; html5ever's rcdom fixtures
-          # are test data, so recursing into everything only costs time.
           git -C third_party/rquickjs submodule update --init --depth 1 sys/quickjs
       - name: Cargo cache
         uses: actions/cache@v6
@@ -146,46 +134,48 @@ jobs:
           RUSTC_WRAPPER: "sccache"
         run: |
           cargo build --profile wpt --locked
-          cp "$(./tools/binary-path --profile wpt)" tinybrowser-wpt
-          ls -l tinybrowser-wpt
+          cp "$(./tools/binary-path --profile wpt tinybrowser)" tinybrowser-wpt
+          cp "$(./tools/binary-path --profile wpt wpt-harness)" wpt-harness
+          cp "$(./tools/binary-path --profile wpt wpt-fast)" wpt-fast
+          ls -l tinybrowser-wpt wpt-harness wpt-fast
       - name: Check runtime libraries
         run: |
-          missing="$(ldd tinybrowser-wpt | grep 'not found' || true)"
+          missing="$(ldd wpt-harness | grep 'not found' || true)"
           if [[ -n "$missing" ]]; then
             echo "::error::missing runtime libraries in the runner image:"$'\n'"$missing"
             exit 1
           fi
       - uses: actions/upload-artifact@v7
         with:
-          name: tinybrowser-wpt
-          path: tinybrowser-wpt
+          name: wpt-binaries
+          path: |
+            tinybrowser-wpt
+            wpt-harness
+            wpt-fast
           retention-days: 3
 
-  wpt:
-    name: chunk ${{ matrix.chunk }}/${{ strategy.job-total }}
+  harness:
+    name: harness chunk ${{ matrix.chunk }}
     needs: [plan, build]
     runs-on: ubuntu-24.04
-    timeout-minutes: 150
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        chunk: ${{ fromJSON(needs.plan.outputs.chunks) }}
+        chunk: ${{ fromJSON(needs.plan.outputs.harness) }}
     steps:
       - uses: actions/checkout@v7
       - name: WPT checkout (pinned, shallow)
         run: git submodule update --init --depth 1 third_party/wpt
-      # uv materializes CPython and the adapter venv on first use; the chunk
-      # itself never compiles.
       - uses: astral-sh/setup-uv@v10.3.0
       - uses: actions/download-artifact@v8
         with:
-          name: tinybrowser-wpt
+          name: wpt-binaries
       - uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: wpt-manifest
           path: wpt-manifest
-      - name: Shared manifest (skips the per-chunk tree walk)
+      - name: Shared manifest
         run: |
           if [[ -f wpt-manifest/MANIFEST.json ]]; then
             cp wpt-manifest/MANIFEST.json third_party/wpt/MANIFEST.json
@@ -194,14 +184,69 @@ jobs:
             exit 1
           fi
       - name: Run chunk ${{ matrix.chunk }}
-        # Deliberately below the job timeout: a step timeout fails the step
-        # (later steps still run) instead of cancelling the job, and the
-        # streaming raw log already holds everything the chunk finished.
-        timeout-minutes: 135
+        env:
+          REPORT: ${{ github.workspace }}/wpt-report-harness-${{ matrix.chunk }}.json
+          RAW: ${{ github.workspace }}/wpt-harness-${{ matrix.chunk }}.log
+        run: |
+          set -euo pipefail
+          chmod +x wpt-harness
+          python3 tools/wpt/cli.py fast-harness / \
+            --fast-binary "$PWD/wpt-harness" \
+            --jobs 4 \
+            --total-chunks "$WPT_HARNESS_CHUNKS" \
+            --this-chunk "${{ matrix.chunk }}" \
+            --exclude-testdriver \
+            --report "$REPORT" 2>&1 | tee "$RAW"
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() }}
+        with:
+          name: wpt-report-harness-${{ matrix.chunk }}
+          path: wpt-report-harness-${{ matrix.chunk }}.json
+          if-no-files-found: error
+          retention-days: 7
+      - name: Raw log
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: wpt-raw-harness-${{ matrix.chunk }}
+          path: wpt-harness-${{ matrix.chunk }}.log
+          if-no-files-found: ignore
+          retention-days: 3
+
+  webdriver:
+    name: webdriver chunk ${{ matrix.chunk }}
+    needs: [plan, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        chunk: ${{ fromJSON(needs.plan.outputs.webdriver) }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: WPT checkout (pinned, shallow)
+        run: git submodule update --init --depth 1 third_party/wpt
+      - uses: astral-sh/setup-uv@v10.3.0
+      - uses: actions/download-artifact@v8
+        with:
+          name: wpt-binaries
+      - uses: actions/download-artifact@v8
+        with:
+          name: wpt-manifest
+          path: wpt-manifest
+      - name: Shared manifest
+        run: |
+          if [[ -f wpt-manifest/MANIFEST.json ]]; then
+            cp wpt-manifest/MANIFEST.json third_party/wpt/MANIFEST.json
+          else
+            echo "::error::no shared manifest; the plan job did not upload one"
+            exit 1
+          fi
+      - name: Run chunk ${{ matrix.chunk }}
         env:
           BINARY: ${{ github.workspace }}/tinybrowser-wpt
-          REPORT: ${{ github.workspace }}/wpt-report-${{ matrix.chunk }}.json
-          RAW: ${{ github.workspace }}/wpt-report-${{ matrix.chunk }}.raw.log
+          REPORT: ${{ github.workspace }}/wpt-report-webdriver-${{ matrix.chunk }}.json
+          RAW: ${{ github.workspace }}/wpt-report-webdriver-${{ matrix.chunk }}.raw.log
         run: |
           set -euo pipefail
           chmod +x "$BINARY"
@@ -213,35 +258,67 @@ jobs:
             echo "::error::test-types is empty; nothing would run"
             exit 1
           fi
-          python3 tools/wpt/cli.py run --binary "$BINARY" -- \
+          python3 tools/wpt/cli.py run --binary "$BINARY" \
+            --exclude-in-process -- \
             --no-manifest-update \
             --log-wptreport "$REPORT" \
             --log-raw "$RAW" \
             --no-fail-on-unexpected \
-            --total-chunks "$WPT_CHUNKS" \
+            --processes 4 \
+            --total-chunks "$WPT_WEBDRIVER_CHUNKS" \
             --this-chunk "${{ matrix.chunk }}" \
             "${excludes[@]}" \
             --test-types "${types[@]}"
       - uses: actions/upload-artifact@v7
         if: ${{ !cancelled() }}
         with:
-          name: wpt-report-${{ matrix.chunk }}
-          path: wpt-report-${{ matrix.chunk }}.json
+          name: wpt-report-webdriver-${{ matrix.chunk }}
+          path: wpt-report-webdriver-${{ matrix.chunk }}.json
           if-no-files-found: error
           retention-days: 7
       - name: Raw log (partial chunks still explain themselves)
         if: ${{ always() }}
         uses: actions/upload-artifact@v7
         with:
-          name: wpt-raw-${{ matrix.chunk }}
-          path: wpt-report-${{ matrix.chunk }}.raw.log
+          name: wpt-raw-webdriver-${{ matrix.chunk }}
+          path: wpt-report-webdriver-${{ matrix.chunk }}.raw.log
           if-no-files-found: ignore
           retention-days: 3
 
+  test262:
+    name: test262
+    needs: [build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: WPT checkout (pinned, shallow)
+        run: git submodule update --init --depth 1 third_party/wpt
+      - uses: actions/download-artifact@v8
+        with:
+          name: wpt-binaries
+      - name: Run test262
+        env:
+          REPORT: ${{ github.workspace }}/wpt-report-test262.json
+        run: |
+          set -euo pipefail
+          chmod +x wpt-fast
+          python3 tools/wpt/cli.py fast \
+            --fast-binary "$PWD/wpt-fast" \
+            --jobs 4 \
+            --report "$REPORT"
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() }}
+        with:
+          name: wpt-report-test262
+          path: wpt-report-test262.json
+          if-no-files-found: error
+          retention-days: 7
+
   score:
     name: score
-    needs: [plan, wpt]
-    if: ${{ !cancelled() && needs.wpt.result != 'skipped' }}
+    needs: [plan, harness, webdriver, test262]
+    if: ${{ !cancelled() && needs.harness.result != 'skipped' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -256,25 +333,24 @@ jobs:
           set -euo pipefail
           shopt -s nullglob
           reports=(reports/*.json)
-          echo "downloaded ${#reports[@]}/$WPT_CHUNKS chunk reports"
+          expected=$(( WPT_HARNESS_CHUNKS + WPT_WEBDRIVER_CHUNKS + 1 ))
+          echo "downloaded ${#reports[@]}/$expected chunk reports"
           if (( ${#reports[@]} == 0 )); then
             echo "::error::no chunk reports to merge"
             exit 1
           fi
-          # --strict-skips: an empty or truncated chunk report still lets the
-          # table render, but turns the run red instead of hiding the chunk.
           python3 tools/wpt/cli.py merge --strict-skips "${reports[@]}" \
             --out merged.json | tee summary.txt
-          if (( ${#reports[@]} != WPT_CHUNKS )); then
-            echo "::error::incomplete run: ${#reports[@]} of $WPT_CHUNKS chunk reports"
+          if (( ${#reports[@]} != expected )); then
+            echo "::error::incomplete run: ${#reports[@]} of $expected chunk reports"
             exit 1
           fi
       - name: Run page summary
         if: ${{ !cancelled() && hashFiles('summary.txt') != '' }}
         run: |
           {
-            printf '## WPT — %s (%s chunks, exclude: %s)\n' \
-              "$WPT_TEST_TYPES" "$WPT_CHUNKS" "$WPT_EXCLUDE"
+            printf '## WPT — %s (harness %s + webdriver %s chunks, exclude: %s)\n' \
+              "$WPT_TEST_TYPES" "$WPT_HARNESS_CHUNKS" "$WPT_WEBDRIVER_CHUNKS" "$WPT_EXCLUDE"
             echo
             echo '```'
             cat summary.txt

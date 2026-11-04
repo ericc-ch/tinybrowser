@@ -193,6 +193,9 @@ class Options:
     """
 
     binary: str | None = None
+    # Prebuilt in-process runner (wpt-fast/wpt-harness); CI downloads it
+    # instead of building inside every chunk job.
+    fast_binary: str | None = None
     wpt_root: str | None = None
     venv: str | None = None
     log_level: str | None = None
@@ -206,6 +209,7 @@ class Options:
         out: list[str] = []
         for name, value in (
             ("--binary", self.binary),
+            ("--fast-binary", self.fast_binary),
             ("--wpt-root", self.wpt_root),
             ("--venv", self.venv),
             ("--log-level", self.log_level),
@@ -226,6 +230,7 @@ class Options:
 # empty one, `int` a non-negative whole number, `switch` is bare.
 HARNESS_FLAGS: dict[str, tuple[str, str]] = {
     "--binary": ("binary", "value"),
+    "--fast-binary": ("fast_binary", "value"),
     "--wpt-root": ("wpt_root", "value"),
     "--venv": ("venv", "value"),
     "--log-level": ("log_level", "value"),
@@ -1216,7 +1221,7 @@ def profile_main(options: Options, argv: list[str]) -> int:
 # --- in-venv runner ---
 
 
-def patch_wpt(wpt_root: Path) -> None:
+def patch_wpt(wpt_root: Path, lane: str | None = None) -> None:
     sys.path.insert(0, str(wpt_root))
     from tools import localpaths  # noqa: F401
     from tools.wpt import run as wpt_run
@@ -1265,6 +1270,29 @@ def patch_wpt(wpt_root: Path) -> None:
                     tests = {t for t in tests if not is_worker_variant_url(t.url)}
                     if not tests:
                         continue
+                if lane == "testdriver":
+                    # Only files that drive a real browser session.
+                    tests = {t for t in tests if getattr(t, "testdriver", None) is True}
+                    if not tests:
+                        continue
+                elif lane == "in-process-complement":
+                    # Everything `fast-harness` does not run: testdriver files,
+                    # plus generated wrappers it cannot render (service worker,
+                    # shared worker, module, shadow realm) instead of files.
+                    selected = set()
+                    for test in tests:
+                        if getattr(test, "testdriver", None) is True:
+                            selected.add(test)
+                            continue
+                        url = test.url.split("?", 1)[0]
+                        if url.endswith((".any.html", ".window.html")):
+                            continue
+                        if os.path.isfile(os.path.join(str(wpt_root), url.lstrip("/"))):
+                            continue
+                        selected.add(test)
+                    tests = selected
+                    if not tests:
+                        continue
                 yield test_type, test_path, tests
 
     testloader.TestFilter: type[testloader.TestFilter] = TinybrowserTestFilter
@@ -1302,10 +1330,17 @@ def patch_wpt(wpt_root: Path) -> None:
 
 def inner_main(options: Options, argv: list[str]) -> int:
     """Runs under the venv python: patch upstream, then `wpt run`."""
+    lane = run_lane(argv)
+    if lane is not None:
+        argv = [
+            arg
+            for arg in argv
+            if arg not in ("--testdriver-only", "--exclude-in-process")
+        ]
     if argv[:1] == ["--"]:
         argv = argv[1:]
     wpt_root = resolve_wpt_root(options)
-    patch_wpt(wpt_root)
+    patch_wpt(wpt_root, lane=lane)
     from tools.wpt import wpt
 
     code = wpt.main(prog=str(wpt_root / "wpt"), argv=["run", *argv])
@@ -1323,6 +1358,18 @@ def build_binary(options: Options) -> Path:
         )
         return Path(override)
     return build_profile_binary("tinybrowser")
+
+
+def fast_binary(options: Options, name: str) -> Path:
+    """The in-process runner, prebuilt when the caller passed `--fast-binary`."""
+    override = options.fast_binary
+    if override:
+        binary = Path(override)
+        if not (binary.is_file() and os.access(binary, os.X_OK)):
+            raise SystemExit(die("fast", f"{name} binary not found at {binary}"))
+        eprint(f"wpt: using the --fast-binary override: {binary}")
+        return Path(os.path.realpath(binary))
+    return build_profile_binary(name)
 
 
 def build_profile_binary(name: str) -> Path:
@@ -1428,6 +1475,7 @@ def run_wpt(
     manifest: Path,
     record: int,
     options: Options,
+    lane: str | None = None,
 ) -> int:
     # wpt's `--binary-arg` is the only channel that carries an argument into
     # the product's command line, and the browser owns both of these.
@@ -1440,14 +1488,18 @@ def run_wpt(
             wpt_args.append(f"--binary-arg=--{flag}={value}")
     # Everything for the harness goes before `--`; wpt's own `--binary` and the
     # user's upstream flags stay after it, untouched.
-    inner_argv = [
-        *inner_flags(wpt, options),
-        "--",
-        "--binary",
-        str(binary),
-        "tinybrowser",
-        *wpt_args,
-    ]
+    inner_argv = [*inner_flags(wpt, options)]
+    if lane is not None:
+        inner_argv.append(lane_flag(lane))
+    inner_argv.extend(
+        [
+            "--",
+            "--binary",
+            str(binary),
+            "tinybrowser",
+            *wpt_args,
+        ]
+    )
     manifest_lock = None
     if not has_option_exact("--no-manifest-update", final_args):
         lock_name = f"wpt-manifest-{sha16(str(manifest.resolve()))}.lock"
@@ -1521,12 +1573,24 @@ def run_wpt(
 
 
 def run_main(options: Options, argv: list[str]) -> int:
+    # Our flags, not upstream's: remove them before the split so a following
+    # literal `--` keeps its meaning, and let `inner_main` consume the copy
+    # that travels to the venv child.
+    lane = run_lane(argv)
+    if lane is not None:
+        argv = [
+            arg
+            for arg in argv
+            if arg not in ("--testdriver-only", "--exclude-in-process")
+        ]
     paths, score, dry_run, extras, error = split_run_argv(argv)
     if error:
         return die("run", error, 2)
     if score:
         if dry_run:
             extras = ["--dry-run", *extras]
+        if lane is not None:
+            extras = [lane_flag(lane), *extras]
         return score_main(options, [*paths, *extras])
     if dry_run:
         wpt = resolve_wpt_root(options)
@@ -1574,7 +1638,31 @@ def run_main(options: Options, argv: list[str]) -> int:
     paths, final, error = hoist_paths_after_test_types(paths, final)
     if error:
         return die("run", error, 2)
-    return run_wpt(wpt, venv, exe, binary, [*paths, *final], manifest, record, options)
+    return run_wpt(
+        wpt,
+        venv,
+        exe,
+        binary,
+        [*paths, *final],
+        manifest,
+        record,
+        options,
+        lane,
+    )
+
+
+def run_lane(argv: list[str]) -> str | None:
+    """The selection lane a `run` command asked for, or `None` for all tests."""
+    if "--testdriver-only" in argv:
+        return "testdriver"
+    if "--exclude-in-process" in argv:
+        return "in-process-complement"
+    return None
+
+
+def lane_flag(lane: str) -> str:
+    """The flag that selects `lane`, for a child `run` command."""
+    return "--testdriver-only" if lane == "testdriver" else "--exclude-in-process"
 
 
 # --- `fast` (native test262 lane) ---
@@ -1600,7 +1688,7 @@ def fast_main(options: Options, argv: list[str]) -> int:
     test262 = wpt / "third_party" / "test262"
     if not test262.is_dir():
         return die("fast", f"no test262 suite at {test262}", 1)
-    binary = build_profile_binary("wpt-fast")
+    binary = fast_binary(options, "wpt-fast")
     command = [str(binary), "--test262-root", str(test262), *argv]
     eprint("wpt: " + " ".join(command))
     try:
@@ -1633,7 +1721,7 @@ def fast_harness_main(options: Options, argv: list[str]) -> int:
     wpt = Path(os.path.realpath(wpt))
     if check_pin(wpt, options) != 0:
         return 1
-    binary = build_profile_binary("wpt-harness")
+    binary = fast_binary(options, "wpt-harness")
     if ensure_manifest(wpt, options) != 0:
         return 1
     venv = Path(options.venv) if options.venv else wpt / "_venv3"
@@ -1641,22 +1729,91 @@ def fast_harness_main(options: Options, argv: list[str]) -> int:
     content_types = wptserve_content_types(wpt, venv)
     if content_types is None:
         return 1
-    policy = [*harness_budget_flags(), "--content-types", content_types]
-    shard_size, argv = take_shard_size(argv)
-    if shard_size is None:
-        command = [
-            str(binary),
-            "--wpt-root",
-            str(wpt),
-            *policy,
-            *argv,
+    sidecar = start_sidecar(wpt, venv)
+    if sidecar is None:
+        return 1
+    try:
+        policy = [
+            *harness_budget_flags(),
+            "--content-types",
+            content_types,
+            "--sidecar",
+            sidecar.address,
         ]
-        eprint("wpt: " + " ".join(command))
+        shard_size, argv = take_shard_size(argv)
+        if shard_size is None:
+            command = [
+                str(binary),
+                "--wpt-root",
+                str(wpt),
+                *policy,
+                *argv,
+            ]
+            eprint("wpt: " + " ".join(command))
+            try:
+                return subprocess.run(command, cwd=str(ROOT), check=False).returncode
+            except OSError as error:
+                return die("fast-harness", f"cannot run {binary}: {error}")
+        return fast_harness_shards(binary, wpt, shard_size, argv, policy)
+    finally:
+        sidecar.stop()
+
+
+class SidecarProcess:
+    """A live wptserve process serving handler routes for the harness."""
+
+    def __init__(self, process: subprocess.Popen, address: str) -> None:
+        self.process = process
+        self.address = address
+
+    def stop(self) -> None:
+        """Closes the sidecar's stdin, which is its exit condition."""
+        if self.process.poll() is not None:
+            return
+        if self.process.stdin is not None:
+            try:
+                self.process.stdin.close()
+            except OSError:
+                pass
         try:
-            return subprocess.run(command, cwd=str(ROOT), check=False).returncode
-        except OSError as error:
-            return die("fast-harness", f"cannot run {binary}: {error}")
-    return fast_harness_shards(binary, wpt, shard_size, argv, policy)
+            self.process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+            self.process.wait(timeout=10)
+
+
+def start_sidecar(wpt: Path, venv: Path) -> SidecarProcess | None:
+    """Starts wptserve for the harness and returns its loopback address.
+
+    The harness runs the engine in-process but a `.py` path is a program, not a
+    file. This process runs the real wptserve handler for those requests, with
+    its stash and its templates, instead of porting that server here.
+    """
+    command = [
+        str(venv_python(venv)),
+        str(ROOT / "tools" / "wpt" / "sidecar.py"),
+        "--wpt-root",
+        str(wpt),
+    ]
+    eprint("wpt: " + " ".join(command))
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=str(ROOT),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+    except OSError as error:
+        die("fast-harness", f"cannot start wptserve: {error}")
+        return None
+    line = process.stdout.readline().strip() if process.stdout is not None else ""
+    if not line.startswith("PORT "):
+        process.kill()
+        process.wait(timeout=10)
+        die("fast-harness", "wptserve did not report its port")
+        return None
+    return SidecarProcess(process, f"127.0.0.1:{line.removeprefix('PORT ').strip()}")
 
 
 def harness_budget_flags() -> list[str]:
@@ -1755,6 +1912,8 @@ def take_shard_size(argv: list[str]) -> tuple[int | None, list[str]]:
 HARNESS_VALUE_FLAGS = {
     "--wpt-root",
     "--jobs",
+    "--total-chunks",
+    "--this-chunk",
 }
 
 
@@ -3056,9 +3215,12 @@ def _selftest_merge() -> None:
 
 TOP_HELP = """tinybrowser WPT harness: run | score | rerun | merge | profile | failures | baseline | manifest | fast | fast-harness | overnight | selftest
 
-  run PATH... [--score] [--dry-run] [-- upstream-flags...]
+  run PATH... [--score] [--dry-run] [--testdriver-only | --exclude-in-process] [-- upstream-flags...]
     Run WPT. Upstream flags follow `--` (or start implicitly at the first
     `-flag`). --score runs then prints the per-directory table.
+    --testdriver-only keeps only files that drive a WebDriver session.
+    --exclude-in-process keeps what the in-process lane cannot run (testdriver
+    plus worker/module wrappers), so the two lanes partition the suite.
     --dry-run prints the wpt invocation without building or running.
   score PATH... [--report FILE | --save-report FILE] [-- upstream-flags...]
     Summarize an existing report (--report) or run then summarize.
@@ -3097,9 +3259,12 @@ TOP_HELP = """tinybrowser WPT harness: run | score | rerun | merge | profile | f
     earlier --report and exits 1 on a regression.
   fast-harness PATH... [--jobs N] [--report FILE] [--baseline FILE]
     Run WPT testharness, crashtest, and reftest files in the engine
-    process, with a paused clock. No WebDriver, wptserve, or renderer
-    child. Reftests compare rendered pixels; testdriver still needs a
-    WebDriver session. --shard-size N isolates an engine abort to one file.
+    process, with a paused clock. No WebDriver or renderer child. `.py`
+    handler routes are forwarded to a wptserve sidecar this command starts.
+    Reftests compare rendered pixels; testdriver still needs a WebDriver
+    session (--exclude-testdriver leaves those files to it).
+    --total-chunks N --this-chunk K splits by source directory.
+    --shard-size N isolates an engine abort to one file.
   overnight [--save-report FILE] [--dry-run] [-- runner...]
     Full-suite run + score. Long; needs explicit approval per AGENTS.md.
   selftest
@@ -3107,6 +3272,7 @@ TOP_HELP = """tinybrowser WPT harness: run | score | rerun | merge | profile | f
 
 Harness flags (any subcommand, before `--`):
   --binary PATH          use a prebuilt browser binary as-is
+  --fast-binary PATH     use a prebuilt wpt-fast/wpt-harness runner
   --wpt-root PATH        WPT checkout to use
   --venv PATH            WPT virtualenv to use
   --log-level LEVEL      browser log level (e.g. trace)
