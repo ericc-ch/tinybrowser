@@ -1,7 +1,12 @@
 # Chunked WPT runs for sets too long for one machine. Local loops stay on
-# tools/wpt/cli.py; this workflow is the full-suite pass. Each run keeps its
-# raw chunk reports as artifacts, so a score can be reproduced without
-# rerunning anything.
+# tools/wpt/cli.py; this workflow is the full-suite pass. It runs on every
+# push to main and nightly. Each run keeps its raw chunk reports as artifacts,
+# so a score can be reproduced without rerunning anything.
+#
+# Wall time on the standard runner is dominated by the wpt-profile build
+# (~2.5 min) and by the twenty chunk jobs (~15 min each, capped by the
+# repository's concurrent-job limit); the full suite does not fit a one-minute
+# budget. Use `fast`/`fast-harness` for the short feedback loop.
 #
 # Shape: a plan job walks the test tree once (cli.py manifest) and a build job
 # compiles the wpt profile; both fan out to `chunks` jobs. Each job runs one
@@ -21,6 +26,8 @@
 name: WPT
 
 on:
+  push:
+    branches: [main]
   schedule:
     # Every day at 00:00 UTC (01:00 in Zurich winter, 02:00 in summer).
     # Scheduled runs never see dispatch inputs, so all three defaults live
@@ -46,10 +53,10 @@ permissions:
   contents: read
 
 concurrency:
-  # Queue, never cancel: a long run must not die because dispatch was hit
-  # twice, and a cancelled run uploads no artifacts at all.
+  # A new push supersedes the previous push's run; a scheduled or dispatched
+  # run is never cancelled by one (a cancelled run uploads no artifacts).
   group: wpt-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.event_name == 'push' }}
 
 env:
   CARGO_INCREMENTAL: "0"
