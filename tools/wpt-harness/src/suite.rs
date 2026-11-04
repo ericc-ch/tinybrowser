@@ -38,6 +38,39 @@ pub struct TestCase {
     pub content_type: String,
     /// Whether the manifest gives the test the long timeout.
     pub long_timeout: bool,
+    /// Reference documents a reftest compares against; empty for other kinds.
+    pub refs: Vec<Reference>,
+    /// The manifest's fuzzy tolerance, when the test declares one.
+    pub fuzzy: Option<Fuzzy>,
+}
+
+/// One reference document of a reftest.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Reference {
+    /// The reference's URL path, relative to the origin.
+    pub relative: String,
+    /// The on-disk source, relative to the WPT root.
+    pub source: String,
+    /// Whether the images must match or must differ.
+    pub relation: Relation,
+}
+
+/// How a reftest compares against one reference.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Relation {
+    /// `==`: the two renders must match.
+    Match,
+    /// `!=`: the two renders must differ.
+    Mismatch,
+}
+
+/// A reftest's pixel tolerance from `<meta name=fuzzy>`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fuzzy {
+    /// Largest allowed per-channel difference.
+    pub max_difference: u8,
+    /// Largest allowed number of differing pixels.
+    pub total_pixels: u64,
 }
 
 impl TestCase {
@@ -48,8 +81,8 @@ impl TestCase {
     }
 }
 
-/// Reads the manifest's testharness and crashtest items below the requested
-/// paths.
+/// Reads the manifest's testharness, crashtest, and reftest items below the
+/// requested paths.
 ///
 /// `paths` are relative to `root` and may name files or directories. An empty
 /// list is rejected by the caller so a run cannot accidentally start the full
@@ -68,12 +101,16 @@ pub fn select(
 ) -> io::Result<Vec<TestCase>> {
     let manifest = read_manifest(root)?;
     let mut selected: Vec<Item> = Vec::new();
-    for kind in ["testharness", "crashtest"] {
+    for kind in ["testharness", "crashtest", "reftest"] {
         let Some(tree) = manifest.get("items").and_then(|items| items.get(kind)) else {
             continue;
         };
         walk(tree, "", &mut |path, leaf| {
-            collect_leaf(root, path, leaf, kind, paths, &mut selected);
+            if kind == "reftest" {
+                collect_reftest(root, path, leaf, paths, &mut selected);
+            } else {
+                collect_leaf(root, path, leaf, kind, paths, &mut selected);
+            }
         });
     }
     selected.sort_by(|left, right| left.relative.cmp(&right.relative));
@@ -104,6 +141,10 @@ struct Item {
     long_timeout: bool,
     /// The wrapper to synthesize, when the URL names one.
     wrapper: Option<Wrapper>,
+    /// Reference documents, for a reftest.
+    refs: Vec<Reference>,
+    /// Pixel tolerance, for a reftest.
+    fuzzy: Option<Fuzzy>,
 }
 
 impl Item {
@@ -135,6 +176,8 @@ impl Item {
             bytes,
             content_type,
             long_timeout: self.long_timeout,
+            refs: self.refs,
+            fuzzy: self.fuzzy,
         })
     }
 }
@@ -233,7 +276,121 @@ fn collect_leaf(
             kind,
             long_timeout: props.get("timeout").and_then(Value::as_str) == Some("long"),
             wrapper,
+            refs: Vec::new(),
+            fuzzy: None,
         });
+    }
+}
+
+/// Turns one reftest leaf (`[hash, [timeout, refs, extras]]`) into an item.
+///
+/// A reftest item stores its reference documents and the fuzzy tolerance the
+/// `<meta name=fuzzy>` line produced; the runner mounts each reference in
+/// turn and compares the rendered pixels
+/// (<https://web-platform-tests.org/writing-tests/reftests.html>).
+fn collect_reftest(
+    root: &Path,
+    path: &str,
+    leaf: &Value,
+    paths: &[String],
+    selected: &mut Vec<Item>,
+) {
+    let Some(entries) = leaf.as_array() else {
+        return;
+    };
+    for entry in entries.iter().skip(1) {
+        let Some(entry) = entry.as_array() else {
+            continue;
+        };
+        if entry.len() < 2 {
+            continue;
+        }
+        let extras = entry.get(2).and_then(Value::as_object);
+        let long_timeout = entry.first().and_then(Value::as_str) == Some("long")
+            || extras
+                .and_then(|extras| extras.get("timeout"))
+                .and_then(Value::as_str)
+                == Some("long");
+        let mut refs = Vec::new();
+        for pair in entry[1].as_array().into_iter().flatten() {
+            let Some(pair) = pair.as_array() else {
+                continue;
+            };
+            if pair.len() < 2 {
+                continue;
+            }
+            let Some(url) = pair[0].as_str() else {
+                continue;
+            };
+            let Some(relation) = pair[1].as_str().and_then(|relation| match relation {
+                "==" => Some(Relation::Match),
+                "!=" => Some(Relation::Mismatch),
+                _ => None,
+            }) else {
+                continue;
+            };
+            let source = url.trim_start_matches('/').to_owned();
+            refs.push(Reference {
+                relative: source.clone(),
+                source,
+                relation,
+            });
+        }
+        // A reftest without a readable reference is not a comparison this
+        // executor can make. Upstream never emits one; if it does, the file
+        // still shows up as unmatched rather than silently passing.
+        if refs.is_empty() {
+            continue;
+        }
+        if !matches_requested(paths, path, path) || !root.join(path).is_file() {
+            continue;
+        }
+        selected.push(Item {
+            relative: path.to_owned(),
+            source: path.to_owned(),
+            kind: Kind::Reftest,
+            long_timeout,
+            wrapper: None,
+            refs,
+            fuzzy: extras.and_then(parse_fuzzy),
+        });
+    }
+}
+
+/// Reads the `<meta name=fuzzy>` tolerance out of a reftest's extras.
+///
+/// The manifest stores each bound as a `[min, max]` range. Only the
+/// default entry (a `null` selector) applies to every test; a selector-scoped
+/// entry is ignored here, which fails closed to an exact comparison.
+fn parse_fuzzy(extras: &Map<String, Value>) -> Option<Fuzzy> {
+    for entry in extras.get("fuzzy")?.as_array()? {
+        let Some(pair) = entry.as_array() else {
+            continue;
+        };
+        if pair.len() < 2 || !pair[0].is_null() {
+            continue;
+        }
+        let Some(ranges) = pair[1].as_array() else {
+            continue;
+        };
+        if ranges.len() < 2 {
+            continue;
+        }
+        let max_difference = u8::try_from(range_max(&ranges[0])?.min(255)).ok()?;
+        return Some(Fuzzy {
+            max_difference,
+            total_pixels: range_max(&ranges[1])?,
+        });
+    }
+    None
+}
+
+/// The upper bound of a manifest fuzzy range (`[min, max]`), or a bare number.
+fn range_max(value: &Value) -> Option<u64> {
+    match value {
+        Value::Number(number) => number.as_u64(),
+        Value::Array(items) => items.last().and_then(Value::as_u64),
+        _ => None,
     }
 }
 
@@ -270,7 +427,7 @@ fn js_url(document: &str) -> String {
 }
 
 /// The content type wptserve's `guess_content_type` returns for `path`.
-fn content_type_for(path: &Path, content_types: &HashMap<String, String>) -> String {
+pub(crate) fn content_type_for(path: &Path, content_types: &HashMap<String, String>) -> String {
     path.extension()
         .and_then(|extension| extension.to_str())
         .and_then(|extension| content_types.get(extension))
@@ -289,7 +446,7 @@ mod tests {
     use std::collections::HashMap;
     use std::fs;
 
-    use super::{Kind, select};
+    use super::{Kind, Relation, select};
 
     /// A checkout with a manifest listing one testharness file, one `.any.js`
     /// source, a worker variant, a jsshell variant, a crashtest, and a helper
@@ -300,6 +457,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("dom/nodes/resources")).expect("checkout");
         fs::create_dir_all(root.join("crashtests")).expect("crashtest directory");
+        fs::create_dir_all(root.join("css")).expect("reftest directory");
         fs::write(
             root.join("dom/nodes/plain.html"),
             "<script src=/resources/testharness.js></script>",
@@ -321,6 +479,9 @@ mod tests {
         )
         .expect("helper");
         fs::write(root.join("crashtests/boom.html"), "<p>boom</p>").expect("crashtest");
+        fs::write(root.join("css/example.html"), "<p>test</p>").expect("reftest");
+        fs::write(root.join("css/example-ref.html"), "<p>ref</p>").expect("reftest ref");
+        fs::write(root.join("css/other-ref.html"), "<p>other</p>").expect("reftest other ref");
         let manifest = serde_json::json!({
             "version": 9,
             "url_base": "/",
@@ -344,6 +505,14 @@ mod tests {
                 "crashtest": {
                     "crashtests": {
                         "boom.html": ["c", ["crashtests/boom.html", {"timeout": "long", "testdriver": true}]]
+                    }
+                },
+                "reftest": {
+                    "css": {
+                        "example.html": ["r", [null, [
+                            ["/css/example-ref.html", "=="],
+                            ["/css/other-ref.html", "!="]
+                        ], {"fuzzy": [[null, [[0, 3], [0, 250_000]]]]}]]
                     }
                 }
             }
@@ -406,6 +575,25 @@ mod tests {
         assert_eq!(crash.len(), 1);
         assert_eq!(crash[0].kind, Kind::Crashtest);
         assert!(crash[0].long_timeout);
+        fs::remove_dir_all(&root).expect("checkout removed");
+    }
+
+    #[test]
+    fn a_reftest_carries_its_references_and_fuzzy_tolerance() {
+        let root = checkout("reftest");
+        let cases = select(&root, &["css".into()], 0, usize::MAX, &types()).expect("selection");
+        assert_eq!(cases.len(), 1);
+        let case = &cases[0];
+        assert_eq!(case.kind, Kind::Reftest);
+        assert_eq!(case.relative, "css/example.html");
+        assert_eq!(case.source, "css/example.html");
+        assert_eq!(case.refs.len(), 2);
+        assert_eq!(case.refs[0].source, "css/example-ref.html");
+        assert_eq!(case.refs[0].relation, Relation::Match);
+        assert_eq!(case.refs[1].relation, Relation::Mismatch);
+        let fuzzy = case.fuzzy.expect("fuzzy tolerance");
+        assert_eq!(fuzzy.max_difference, 3);
+        assert_eq!(fuzzy.total_pixels, 250_000);
         fs::remove_dir_all(&root).expect("checkout removed");
     }
 

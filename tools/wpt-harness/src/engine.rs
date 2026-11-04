@@ -12,7 +12,7 @@ use crate::services::{BASE, FsServices};
 pub use wpt_report::Subtest;
 use wpt_report::SubtestStatus;
 
-use crate::suite::{Kind, TestCase};
+use crate::suite::{Fuzzy, Kind, Relation, TestCase};
 
 /// Wall-clock time a test may spend before it is called hung. The driver owns
 /// the numbers: `cli.py` computes them from `tools/wpt/timeouts.py`, the same
@@ -78,26 +78,32 @@ pub struct Session {
     services: Arc<FsServices>,
     renderer: EmbeddedRenderer,
     budgets: Budgets,
+    /// Extension table used to type each reference document.
+    content_types: HashMap<String, String>,
 }
 
 impl Session {
-    /// Creates an engine for one worker.
+    /// Creates an engine for one worker, sharing `fonts` with the worker's
+    /// other engines.
     #[must_use]
     pub fn new(
         root: &std::path::Path,
         content_types: HashMap<String, String>,
         budgets: Budgets,
+        fonts: &renderer::Fonts,
     ) -> Self {
-        let services = Arc::new(FsServices::new(root.to_path_buf(), content_types));
-        let renderer = EmbeddedRenderer::new(
+        let services = Arc::new(FsServices::new(root.to_path_buf(), content_types.clone()));
+        let renderer = EmbeddedRenderer::with_fonts(
             Arc::clone(&services) as Arc<dyn renderer::BrowserServices>,
             net::ValidIdentity::default(),
+            fonts,
         );
         Self {
             root: root.to_path_buf(),
             services,
             renderer,
             budgets,
+            content_types,
         }
     }
 
@@ -110,9 +116,7 @@ impl Session {
         let outcome = match case.kind {
             Kind::Testharness => run_testharness(self, case, virtual_time).await,
             Kind::Crashtest => run_crashtest(self, case, virtual_time).await,
-            Kind::Reftest => Err(Failure::Skip(
-                "reftest comparison is not implemented".into(),
-            )),
+            Kind::Reftest => run_reftest(self, case, virtual_time).await,
             Kind::Testdriver => Err(Failure::Skip(
                 "testdriver requires a WebDriver session".into(),
             )),
@@ -147,14 +151,32 @@ impl Session {
 
     /// Mounts one file and settles its first turn, bounded by `deadline`.
     fn mount(&mut self, case: &TestCase, deadline: Instant) -> Result<(), Failure> {
+        self.mount_source(
+            &case.relative,
+            &case.source,
+            case.bytes.clone(),
+            case.content_type.clone(),
+            deadline,
+        )
+    }
+
+    /// Mounts a URL from bytes, for the test file or one of its references.
+    fn mount_source(
+        &mut self,
+        relative: &str,
+        source: &str,
+        body: Vec<u8>,
+        fallback_content_type: String,
+        deadline: Instant,
+    ) -> Result<(), Failure> {
         // Events belong to the file that produced them. A crashtest is judged
         // by whether it survives, and a stale `ScriptFailed` from the previous
         // file must not be read as this one's.
         let _stale = self.renderer.take_events();
         self.services.clear();
-        let url = Url::parse(&format!("{BASE}{}", case.relative))
+        let url = Url::parse(&format!("{BASE}{relative}"))
             .map_err(|error| Failure::Error(format!("bad url: {error}")))?;
-        let path = self.root.join(&case.source);
+        let path = self.root.join(source);
         let headers = crate::services::FsServices::headers_for(
             &path,
             &crate::services::RequestContext {
@@ -162,9 +184,7 @@ impl Session {
                 headers: &[],
             },
         );
-        let content_type = headers
-            .content_type
-            .unwrap_or_else(|| case.content_type.clone());
+        let content_type = headers.content_type.unwrap_or(fallback_content_type);
         let head = ResponseHead::http(200, url, Some(content_type), &headers.list);
         self.renderer
             .mount_bounded(
@@ -174,7 +194,7 @@ impl Session {
                     // no popup sandbox. `window.open` returns null too, so a
                     // file cannot open a context whose flags it would need.
                     tab: renderer::TabState::default(),
-                    body: case.bytes.clone(),
+                    body,
                 },
                 deadline.saturating_duration_since(Instant::now()),
             )
@@ -316,6 +336,195 @@ async fn run_crashtest(
     }
 }
 
+/// Runs one reftest: render the test, then every reference, and compare.
+async fn run_reftest(
+    session: &mut Session,
+    case: &TestCase,
+    virtual_time: bool,
+) -> Result<Completed, Failure> {
+    let started = Instant::now();
+    let limit = session.budgets.for_case(case);
+    let deadline = started + limit;
+    session.mount(case, deadline)?;
+    settle_reftest(session, deadline, virtual_time, true).await?;
+    let request = screenshot_request();
+    let test = session
+        .renderer
+        .render(&request)
+        .map_err(|error| render_failure(&error))?;
+    let mut differing = Vec::new();
+    for reference in &case.refs {
+        let path = session.root.join(&reference.source);
+        let bytes = std::fs::read(&path).map_err(|error| {
+            Failure::Error(format!("cannot read {}: {error}", reference.source))
+        })?;
+        let content_type = crate::suite::content_type_for(
+            std::path::Path::new(&reference.source),
+            &session.content_types,
+        );
+        session.mount_source(
+            &reference.relative,
+            &reference.source,
+            bytes,
+            content_type,
+            deadline,
+        )?;
+        settle_reftest(session, deadline, virtual_time, false).await?;
+        let image = session
+            .renderer
+            .render(&request)
+            .map_err(|error| render_failure(&error))?;
+        let diff = compare_reftest(&test, &image, case.fuzzy.as_ref(), reference.relation);
+        if !diff.matches {
+            differing.push(format!(
+                "{} (max channel difference {}, {} pixels)",
+                reference.relative, diff.max_difference, diff.differing
+            ));
+        }
+    }
+    let subtest = |status: SubtestStatus, message: Option<String>| Subtest {
+        name: "Reftest".into(),
+        status,
+        message,
+    };
+    if differing.is_empty() {
+        Ok(Completed {
+            status: Status::Pass,
+            message: None,
+            subtests: vec![subtest(SubtestStatus::Pass, None)],
+        })
+    } else {
+        let message = format!("differs from {}", differing.join(", "));
+        Ok(Completed {
+            status: Status::Fail,
+            message: Some(message.clone()),
+            subtests: vec![subtest(SubtestStatus::Fail, Some(message))],
+        })
+    }
+}
+
+/// Waits until a reftest removes its `reftest-wait` class.
+///
+/// A document that leaves the class on and has no runnable task left cannot
+/// make progress; that is a timeout here just as it is in `wptrunner`
+/// (<https://web-platform-tests.org/writing-tests/reftests.html#reftest-wait>).
+async fn settle_reftest(
+    session: &mut Session,
+    deadline: Instant,
+    virtual_time: bool,
+    fire_test_rendered: bool,
+) -> Result<(), Failure> {
+    let mut rendered = false;
+    loop {
+        let _yielded = session.renderer.drain_until(deadline);
+        // An image, stylesheet, or font is still in flight. Its completion is
+        // a dial, and a render taken now would miss it.
+        if session.renderer.has_pending_dials() {
+            if Instant::now() >= deadline {
+                return Err(Failure::Timeout);
+            }
+            std::thread::sleep(Duration::from_micros(200));
+            continue;
+        }
+        // `wptrunner` fires `TestRendered` after load and before it waits for
+        // `reftest-wait`; tests such as `dir-auto-dynamic` do their final
+        // mutation in that listener.
+        if fire_test_rendered && !rendered {
+            let _ = session
+                .renderer
+                .eval("document.dispatchEvent(new Event('TestRendered'))");
+            rendered = true;
+            continue;
+        }
+        let waiting = session
+            .renderer
+            .eval("String(document.documentElement.classList.contains('reftest-wait'))")
+            .unwrap_or_default();
+        if waiting != "true" {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(Failure::Timeout);
+        }
+        let Some(delay) = session.renderer.time_until_deadline() else {
+            return Err(Failure::Timeout);
+        };
+        if !delay.is_zero() {
+            if virtual_time {
+                tokio::time::advance(delay).await;
+            } else {
+                tokio::time::sleep(delay.min(Duration::from_millis(50))).await;
+            }
+        }
+    }
+}
+
+/// The shared reftest viewport.
+fn screenshot_request() -> renderer::ScreenshotRequest {
+    let (width, height) = renderer::DEFAULT_VIEWPORT;
+    renderer::ScreenshotRequest {
+        viewport_width: width,
+        viewport_height: height,
+        clip: None,
+    }
+}
+
+fn render_failure(error: &TabError) -> Failure {
+    Failure::Error(format!("render: {error}"))
+}
+
+/// The pixel difference between two renders.
+struct Diff {
+    max_difference: u8,
+    differing: u64,
+    matches: bool,
+}
+
+/// Compares two renders under the test's relation and fuzzy tolerance.
+fn compare_reftest(
+    test: &renderer::RgbaImage,
+    reference: &renderer::RgbaImage,
+    fuzzy: Option<&Fuzzy>,
+    relation: Relation,
+) -> Diff {
+    let (max_difference, differing) =
+        if test.width != reference.width || test.height != reference.height {
+            (u8::MAX, u64::from(test.width) * u64::from(test.height))
+        } else {
+            let mut max_difference = 0u8;
+            let mut differing = 0u64;
+            for (left, right) in test
+                .data
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(reference.data.as_chunks::<4>().0.iter())
+            {
+                let mut pixel = 0u8;
+                for channel in 0..4 {
+                    pixel = pixel.max(left[channel].abs_diff(right[channel]));
+                }
+                if pixel > 0 {
+                    differing += 1;
+                    max_difference = max_difference.max(pixel);
+                }
+            }
+            (max_difference, differing)
+        };
+    let matches = match fuzzy {
+        Some(fuzzy) => max_difference <= fuzzy.max_difference && differing <= fuzzy.total_pixels,
+        None => differing == 0,
+    };
+    Diff {
+        max_difference,
+        differing,
+        matches: match relation {
+            Relation::Match => matches,
+            Relation::Mismatch => !matches,
+        },
+    }
+}
+
 /// Turns the reporter payload into a verdict.
 fn parse_result(raw: &str) -> Result<Completed, Failure> {
     let value: Value = serde_json::from_str(raw)
@@ -388,4 +597,88 @@ fn parse_subtest(value: &Value) -> Result<Subtest, Failure> {
             .filter(|message| !message.is_empty())
             .map(str::to_owned),
     })
+}
+
+#[cfg(test)]
+mod reftest_tests {
+    use super::{Fuzzy, Relation, compare_reftest};
+    use renderer::RgbaImage;
+
+    fn solid(pixel: [u8; 4]) -> RgbaImage {
+        RgbaImage {
+            width: 2,
+            height: 2,
+            data: pixel.iter().copied().cycle().take(16).collect(),
+        }
+    }
+
+    #[test]
+    fn exact_match_and_mismatch() {
+        let same = compare_reftest(
+            &solid([1, 2, 3, 4]),
+            &solid([1, 2, 3, 4]),
+            None,
+            Relation::Match,
+        );
+        assert!(same.matches);
+        assert_eq!((same.max_difference, same.differing), (0, 0));
+        let inverted = compare_reftest(
+            &solid([1, 2, 3, 4]),
+            &solid([1, 2, 3, 4]),
+            None,
+            Relation::Mismatch,
+        );
+        assert!(!inverted.matches);
+    }
+
+    #[test]
+    fn fuzzy_tolerance_is_two_bounds() {
+        let fuzzy = Some(Fuzzy {
+            max_difference: 1,
+            total_pixels: 4,
+        });
+        let pass = compare_reftest(
+            &solid([0, 0, 0, 0]),
+            &solid([1, 0, 0, 0]),
+            fuzzy.as_ref(),
+            Relation::Match,
+        );
+        assert!(pass.matches);
+        assert_eq!((pass.max_difference, pass.differing), (1, 4));
+        // The pixel count bound is separate from the channel bound.
+        let too_many = compare_reftest(
+            &solid([0, 0, 0, 0]),
+            &solid([1, 0, 0, 0]),
+            Some(&Fuzzy {
+                max_difference: 1,
+                total_pixels: 3,
+            }),
+            Relation::Match,
+        );
+        assert!(!too_many.matches);
+        // A larger channel difference exceeds the channel bound.
+        let too_different = compare_reftest(
+            &solid([0, 0, 0, 0]),
+            &solid([2, 0, 0, 0]),
+            fuzzy.as_ref(),
+            Relation::Match,
+        );
+        assert!(!too_different.matches);
+    }
+
+    #[test]
+    fn a_size_change_never_matches() {
+        let small = RgbaImage {
+            width: 1,
+            height: 1,
+            data: vec![0, 0, 0, 0],
+        };
+        let large = RgbaImage {
+            width: 2,
+            height: 1,
+            data: vec![0; 8],
+        };
+        assert!(!compare_reftest(&small, &large, None, Relation::Match).matches);
+        assert!(compare_reftest(&small, &large, None, Relation::Mismatch).matches);
+    }
 }

@@ -162,17 +162,17 @@ fn run_all(
                         eprintln!("wpt-harness: cannot create runtime: {error}");
                         std::process::exit(2);
                     });
+                // One font database per worker: building it scans the system
+                // fonts, and every engine this thread creates can share it.
+                let fonts = renderer::Fonts::default();
                 loop {
                     let index = next.fetch_add(1, Ordering::Relaxed);
                     let Some(case) = cases.get(index) else {
                         break;
                     };
                     let started = Instant::now();
-                    // One engine per file. Reusing one engine across a worker's
-                    // files is faster, but a page can leave a `QuickJS` class
-                    // cell borrowed, and the next mount then panics inside
-                    // rquickjs. A file's own engine cannot see that state.
-                    let mut session = engine::Session::new(root, content_types.clone(), budgets);
+                    let mut session =
+                        engine::Session::new(root, content_types.clone(), budgets, &fonts);
                     // Layout, paint, and the bindings can panic on a hostile
                     // page. A panic is this file's ERROR, not the end of the
                     // run; the engine that saw it is abandoned rather than

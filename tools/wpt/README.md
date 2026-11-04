@@ -37,8 +37,8 @@ loader; import attributes (JSON/text) and `$262.agent` are not implemented
 yet. On this machine the 53,640 test262 files take ~27 s wall across 12 jobs
 (~2m25s CPU) versus 20,587 s in the harness.
 
-`fast-harness` is the in-process testharness/crashtest lane: each file is
-mounted in the real engine in the harness process, with no WebDriver,
+`fast-harness` is the in-process testharness/crashtest/reftest lane: each
+file is mounted in the real engine in the harness process, with no WebDriver,
 wptserve, or renderer child. Requests are served from the checkout, the
 only replaced resource is `/resources/testharnessreport.js` (a small
 reporter the host polls), and a paused Tokio clock jumps over timer waits,
@@ -50,12 +50,21 @@ Budgets match the WebDriver lane's: 5 s, or 7 s for
 
 The selection comes from the checkout's `MANIFEST.json`, the same manifest
 the WebDriver lane uses, so "a test" means what upstream says it means:
-testharness and crashtest items, with the URL and `timeout` the manifest
-records. Multi-global tests run through wptserve's `.any.html` and
+testharness, crashtest, and reftest items, with the URL and `timeout` the
+manifest records. Multi-global tests run through wptserve's `.any.html` and
 `.window.html` wrappers, rendered from the source's `// META:` lines.
 Testdriver items are selected but skipped (`testdriver.js` needs a
-WebDriver session); reftests, worker/service-worker variants, and support
-pages are not selected, because this lane has no executor for them.
+WebDriver session); worker/service-worker variants and support pages are not
+selected, because this lane has no executor for them.
+
+A reftest mounts the test, fires the harness's `TestRendered` event after
+load, waits for `reftest-wait` to clear, and renders at 800x600. It then
+mounts each reference the manifest lists and compares raw RGBA buffers
+(`==`/`!=`, with the manifest's `fuzzy` bounds); PNG encoding and decoding
+would be pure overhead when both sides are rendered here. This matches the
+WebDriver lane's reftest executor on the same build: a 600-test random
+sample agreed on 599, and the one difference was an APNG animation test that
+the WebDriver lane times out and this lane fails.
 
     nix develop --command python3 tools/wpt/cli.py fast-harness dom/nodes --jobs 8
 
@@ -66,7 +75,8 @@ at 12 jobs. A truncated file is never mistaken for a verdict: testharness
 reports `interrupted` when the engine cuts a script short, and the runner
 gives each file one drain with its whole budget instead of a short slice.
 
-`--shard-size N` (in cli.py) runs the sorted selection in N-file processes.
+`--shard-size N` (in cli.py) runs the sorted selection in N-file processes,
+whatever mix of testharness, crashtest, and reftest the slice contains.
 Each shard is a separate `--offset`/`--limit` slice, so an engine abort costs
 one shard instead of the run; a shard that exits non-zero is bisected until
 the single crashing file is found, and that file is recorded as ERROR. The

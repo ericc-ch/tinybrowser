@@ -12,7 +12,7 @@ scheduling, driving, and reporting. This file owns the phases around it:
 * `baseline` — run a slice at two revisions, diff the failure lists.
 * `manifest` — one manifest walk for a chunked CI run (build job).
 * `fast`    — native test262 lane: no HTML, testharness, or wptserve.
-* `fast-harness` — in-process testharness/crashtest lane: no WebDriver.
+* `fast-harness` — in-process testharness/crashtest/reftest lane: no WebDriver.
 * `overnight` — full-suite run + score (needs explicit approval per AGENTS.md).
 
 `tinybrowser_wpt.py` stays separate: upstream imports it as the
@@ -1613,7 +1613,7 @@ def fast_main(options: Options, argv: list[str]) -> int:
 
 
 def fast_harness_main(options: Options, argv: list[str]) -> int:
-    """`fast-harness` — run testharness/crashtest files in the engine process.
+    """`fast-harness` — run testharness, crashtest, and reftest files in-process.
 
     No WebDriver, wptserve, or renderer child. The WPT checkout is read-only;
     requests are served from these files, and the paused clock jumps over
@@ -3096,10 +3096,10 @@ TOP_HELP = """tinybrowser WPT harness: run | score | rerun | merge | profile | f
     wptreport the other readers understand; --baseline compares with an
     earlier --report and exits 1 on a regression.
   fast-harness PATH... [--jobs N] [--report FILE] [--baseline FILE]
-    Run WPT testharness and crashtest files in the engine process, with a
-    paused clock. No WebDriver, wptserve, or renderer child. Reftests and
-    testdriver are not implemented yet. --shard-size N isolates an engine
-    abort to one file.
+    Run WPT testharness, crashtest, and reftest files in the engine
+    process, with a paused clock. No WebDriver, wptserve, or renderer
+    child. Reftests compare rendered pixels; testdriver still needs a
+    WebDriver session. --shard-size N isolates an engine abort to one file.
   overnight [--save-report FILE] [--dry-run] [-- runner...]
     Full-suite run + score. Long; needs explicit approval per AGENTS.md.
   selftest

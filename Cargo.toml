@@ -206,10 +206,16 @@ opt-level = 2
 opt-level = 2
 
 # ─── WPT profile ──────────────────────────────────────────────────────────────
-# Conformance runs measure the engine against testharness file timeouts. A
-# debug build spends that budget inside a `-O0` QuickJS interpreter, so slow
-# matrix files time out on the build mode instead of the engine. Keep dev's
-# assertions and overflow checks, optimize the code.
+# Conformance runs measure the engine against testharness file timeouts, and
+# the per-push wall clock is CPU-bound. Build time is excluded from that
+# budget, so pay for runtime speed: optimize, drop dev's assertions and
+# overflow checks, and let thin LTO fold calls across the harness, the engine,
+# and QuickJS's Rust glue. Line tables keep crash frames usable without the
+# full debuginfo that inflated the CI artifact to hundreds of MB.
 [profile.wpt]
 inherits = "dev"
-opt-level = 2
+opt-level = 3
+debug-assertions = false
+overflow-checks = false
+lto = "thin"
+debug = 1
