@@ -36,7 +36,6 @@ from __future__ import annotations
 import contextlib
 import fcntl
 import hashlib
-import heapq
 import io
 import json
 import os
@@ -45,16 +44,15 @@ import shlex
 import shutil
 import signal
 import socket
-import statistics
 import subprocess
 import sys
 import tempfile
 import time
-from collections import defaultdict, deque
+from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any
 
 from timeouts import DEFAULT_TIMEOUT, EXTRA_TIMEOUT, LONG_TIMEOUT
 
@@ -197,7 +195,6 @@ class Options:
     binary: str | None = None
     wpt_root: str | None = None
     venv: str | None = None
-    durations: str | None = None
     log_level: str | None = None
     log_file: str | None = None
     allow_pin_mismatch: bool = False
@@ -216,8 +213,6 @@ class Options:
         ):
             if value is not None:
                 out += [name, value]
-        if self.durations is not None:
-            out.append(f"--durations={self.durations}")
         if self.allow_pin_mismatch:
             out.append("--allow-pin-mismatch")
         if self.no_lock:
@@ -228,14 +223,11 @@ class Options:
 
 
 # flag -> (Options field, kind). `value` takes the next argv item and rejects an
-# empty one, `value_or_empty` also accepts the bare `--flag=` form (the empty
-# `--durations=` disables the longest-first split), `int` a non-negative whole
-# number, `switch` is bare.
+# empty one, `int` a non-negative whole number, `switch` is bare.
 HARNESS_FLAGS: dict[str, tuple[str, str]] = {
     "--binary": ("binary", "value"),
     "--wpt-root": ("wpt_root", "value"),
     "--venv": ("venv", "value"),
-    "--durations": ("durations", "value_or_empty"),
     "--log-level": ("log_level", "value"),
     "--log-file": ("log_file", "value"),
     "--lock-timeout": ("lock_timeout", "int"),
@@ -470,92 +462,7 @@ def ensure_venv(wpt: Path, venv: Path, options: Options) -> None:
         release_lock(lock)
 
 
-# --- manifest (whole-tree inventory; skip the walk when unchanged) ---
-
-
-def tree_state(wpt: Path) -> list[str]:
-    """The checkout's content: HEAD plus hashes of every changed or
-    untracked file. Taken before a run so an edit made while tests run is
-    not stamped as walked."""
-    parts: list[str] = []
-    rev = git(["rev-parse", "HEAD"], cwd=wpt) or "no-git"
-    parts.append(f"rev {rev}")
-    status = git(["status", "--porcelain=v1", "--untracked-files=all"], cwd=wpt)
-    parts.append(status if status is not None else "no-git-status")
-
-    def hashed(paths: list[str]) -> list[str]:
-        out: list[str] = []
-        for rel in paths:
-            try:
-                out.append(f"{sha_file(wpt / rel)}  {rel}")
-            except OSError:
-                pass
-        return out
-
-    try:
-        proc = subprocess.run(
-            ["git", "diff", "HEAD", "--name-only", "-z"],
-            cwd=str(wpt),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-        names = [p for p in proc.stdout.decode(errors="replace").split("\0") if p]
-        parts.extend(hashed(names))
-    except OSError:
-        pass
-    try:
-        proc = subprocess.run(
-            ["git", "ls-files", "--others", "--exclude-standard", "-z"],
-            cwd=str(wpt),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-        names = [p for p in proc.stdout.decode(errors="replace").split("\0") if p]
-        parts.extend(hashed(names))
-    except OSError:
-        pass
-    return parts
-
-
-def manifest_token(tree: list[str], manifest: Path) -> str:
-    parts = list(tree)
-    try:
-        parts.append(f"{sha_file(manifest)}  {manifest}")
-    except OSError:
-        parts.append("missing")
-    return hashlib.sha256("\n".join(parts).encode()).hexdigest()
-
-
-def manifest_stamp_file(manifest: Path) -> Path:
-    try:
-        key = sha16(str(manifest.resolve()))
-    except OSError:
-        key = sha16(str(manifest))
-    return cache_dir() / f"wpt-manifest-{key}.stamp"
-
-
-def manifest_is_current(wpt: Path, manifest: Path) -> bool:
-    if not manifest.is_file() or git(["rev-parse", "HEAD"], cwd=wpt) is None:
-        return False
-    stamp = manifest_stamp_file(manifest)
-    if not stamp.is_file():
-        return False
-    try:
-        return manifest_token(tree_state(wpt), manifest) == stamp.read_text().strip()
-    except OSError:
-        return False
-
-
-def write_manifest_stamp(wpt: Path, manifest: Path, tree: list[str]) -> None:
-    if git(["rev-parse", "HEAD"], cwd=wpt) is None:
-        return
-    stamp = manifest_stamp_file(manifest)
-    try:
-        stamp.write_text(manifest_token(tree, manifest) + "\n")
-    except OSError:
-        pass
+# --- manifest (whole-tree inventory) ---
 
 
 def manifest_parses(exe: Path, manifest: Path) -> bool:
@@ -1306,91 +1213,10 @@ def profile_main(options: Options, argv: list[str]) -> int:
     return profile_run(options, paths, extra, top)
 
 
-# --- longest-first split (durations from earlier runs) ---
-
-
-def durations_source(options: Options) -> Path | None:
-    """The wptreport-shaped file whose per-test durations drive the split.
-
-    `--durations` names one (any `--log-wptreport` output); `--durations=`
-    (empty) disables the split. Absent, it is the cache every run refreshes,
-    so the second run of a slice is already balanced.
-    """
-    override = options.durations
-    if override is not None:
-        return Path(override) if override else None
-    return cache_dir() / "wpt-durations.json"
-
-
-def read_durations(report: Path) -> dict[str, float]:
-    try:
-        data = json.loads(report.read_text())
-    except (OSError, json.JSONDecodeError):
-        return {}
-    return {
-        r["test"]: float(r["duration"])
-        for r in data.get("results", [])
-        if r.get("test")
-        and isinstance(r.get("duration"), (int, float))
-        and r["duration"] > 0
-    }
-
-
-def write_durations(cache: Path, durations: dict[str, float]) -> None:
-    merged = read_durations(cache)
-    merged.update(durations)
-    results = [
-        {"test": test, "duration": round(ms)} for test, ms in sorted(merged.items())
-    ]
-    try:
-        with tempfile.NamedTemporaryFile(
-            "w", dir=cache.parent, prefix=cache.name, delete=False
-        ) as out:
-            json.dump({"results": results}, out)
-        os.replace(out.name, cache)
-    except OSError as error:
-        eprint(f"wpt: cannot record test durations in {cache}: {error}")
-
-
-_K = TypeVar("_K")
-
-
-def longest_first(costs: dict[_K, float], buckets: int) -> list[list[_K]]:
-    """LPT: hand each test, longest first, to the least-loaded bucket.
-
-    Bucket order is longest first too, so stragglers start early. Ties
-    break on the test id, so the split is deterministic for a given input.
-    """
-    loads = [(0.0, i) for i in range(buckets)]
-    out: list[list[_K]] = [[] for _ in range(buckets)]
-    for test in sorted(costs, key=lambda t: (-costs[t], t)):
-        load, i = heapq.heappop(loads)
-        out[i].append(test)
-        heapq.heappush(loads, (load + costs[test], i))
-    return out
-
-
-class DurationRecorder:
-    """mozlog handler: wall time from `test_start` to `test_end`, in ms."""
-
-    def __init__(self) -> None:
-        self.started: dict[str, int] = {}
-        self.durations: dict[str, float] = {}
-
-    def __call__(self, data: dict) -> None:
-        action = data.get("action")
-        if action == "test_start":
-            self.started[data["test"]] = data["time"]
-        elif action == "test_end" and data["test"] in self.started:
-            self.durations[data["test"]] = data["time"] - self.started.pop(data["test"])
-
-
 # --- in-venv runner ---
 
 
-def patch_wpt(
-    wpt_root: Path, durations: dict[str, float], recorder: DurationRecorder
-) -> None:
+def patch_wpt(wpt_root: Path) -> None:
     sys.path.insert(0, str(wpt_root))
     from tools import localpaths  # noqa: F401
     from tools.wpt import run as wpt_run
@@ -1473,83 +1299,16 @@ def patch_wpt(
 
     browser_base.wait_for_service = wait_for_webdriver  # ty: ignore[invalid-assignment] -- intentional runtime patch; polling interval is the whole point, verified by every run
 
-    from wptrunner import wptlogging
-
-    enter_logger = wptlogging.LoggerManager.__enter__
-
-    def enter_recording_logger(self):
-        logger = enter_logger(self)
-        if recorder not in logger.handlers:
-            logger.add_handler(recorder)
-        return logger
-
-    wptlogging.LoggerManager.__enter__ = enter_recording_logger  # ty: ignore[invalid-assignment] -- intentional runtime patch; return type lives in venv-only mozlog, verified by every run
-
-    class LongestFirstSource(testloader.SingleTestSource):
-        """Default (no `--run-by-dir`/`-f`) split, balanced by past durations.
-
-        Upstream hashes test ids into one fixed group per process and test
-        type, so one unlucky process gets the 60 s tests. Here every test,
-        whatever its type, goes longest first to the least-loaded process;
-        each process's tests become one group per type, and the queue hands
-        out the costliest groups first so the short tail groups land on
-        whichever process frees up. Tests never timed cost the median.
-        """
-
-        def make_queue(self, tests_by_type):
-            tests = {
-                (key, t.id): t for key, group in tests_by_type.items() for t in group
-            }
-            known = [durations[test_id] for _, test_id in tests if test_id in durations]
-            if not known:
-                return super().make_queue(tests_by_type)
-            eprint(f"wpt: longest-first split, {len(known)} tests with known durations")
-            unknown_ms = statistics.median(known)
-            costs = {item: durations.get(item[1], unknown_ms) for item in tests}
-            groups = []
-            for bucket in longest_first(costs, self.kwargs["processes"]):
-                by_type = defaultdict(list)
-                for key, test_id in bucket:
-                    by_type[key].append((key, test_id))
-                for (subsuite, test_type), items in by_type.items():
-                    metadata = self.group_metadata({})
-                    queue = deque()
-                    for item in items:
-                        tests[item].update_metadata(metadata.extra)
-                        queue.append(tests[item])
-                    cost = sum(costs[item] for item in items)
-                    groups.append(
-                        (
-                            cost,
-                            testloader.TestGroup(queue, subsuite, test_type, metadata),
-                        )
-                    )
-            groups.sort(key=lambda entry: entry[0], reverse=True)
-            test_queue = testloader.WriteQueue()
-            for _, group in groups:
-                test_queue.put(group)
-            return test_queue.to_read(), self.process_count(
-                self.kwargs["processes"], len(groups)
-            )
-
-    testloader.SingleTestSource: type[testloader.SingleTestSource] = LongestFirstSource
-
 
 def inner_main(options: Options, argv: list[str]) -> int:
     """Runs under the venv python: patch upstream, then `wpt run`."""
     if argv[:1] == ["--"]:
         argv = argv[1:]
     wpt_root = resolve_wpt_root(options)
-    source = durations_source(options)
-    recorder = DurationRecorder()
-    patch_wpt(wpt_root, read_durations(source) if source else {}, recorder)
+    patch_wpt(wpt_root)
     from tools.wpt import wpt
 
-    try:
-        code = wpt.main(prog=str(wpt_root / "wpt"), argv=["run", *argv])
-    finally:
-        if recorder.durations:
-            write_durations(cache_dir() / "wpt-durations.json", recorder.durations)
+    code = wpt.main(prog=str(wpt_root / "wpt"), argv=["run", *argv])
     return code if isinstance(code, int) else 0
 
 
@@ -1602,7 +1361,7 @@ def finalize_run_args(wpt: Path, extras: list[str]) -> list[str]:
     if not has_option("--manifest", args):
         # Upstream defaults the manifest into ${metadata_root}, which would
         # land the 40MB walk output in our baselines dir; pin it at the WPT
-        # checkout so the stamp, lock, and mtime gate track the file wpt uses.
+        # checkout so the lock tracks the file wpt uses.
         args = ["--manifest", str(wpt / "MANIFEST.json"), *args]
     if not has_option("--pause-after-test", args) and not has_option(
         "--no-pause-after-test", args
@@ -1654,14 +1413,10 @@ def check_type_drift(exe: Path) -> None:
 def inner_flags(wpt: Path, options: Options) -> list[str]:
     """Flags for the `_inner` child: only what it cannot derive itself.
 
-    The child re-resolves the default durations cache identically, so only a
-    caller-supplied value has to travel. The checkout is always passed: the
-    parent did the worktree lookup, and the child must see the same tree.
+    The checkout is always passed: the parent did the worktree lookup, and the
+    child must see the same tree.
     """
-    out = ["--wpt-root", str(wpt)]
-    if options.durations is not None:
-        out.append(f"--durations={options.durations}")
-    return out
+    return ["--wpt-root", str(wpt)]
 
 
 def run_wpt(
@@ -1734,12 +1489,6 @@ def run_wpt(
     # lock fds (the lock belongs to the open file description; one orphaned
     # browser would block every later run).
     try:
-        manifest_mtime_before = manifest.stat().st_mtime_ns
-    except OSError:
-        manifest_mtime_before = 0
-    # The walk sees the tree as it is when the runner starts; snapshot it now.
-    tree_before = tree_state(wpt) if record == 1 and manifest_locked else []
-    try:
         child = subprocess.Popen(
             [str(exe), str(CLI), "_inner", *inner_argv],
             cwd=str(wpt),
@@ -1749,11 +1498,8 @@ def run_wpt(
         release_lock(venv_lock)
         release_lock(manifest_lock)
         return die("run", f"could not start the runner: {error}")
-    interrupted = False
 
     def forward(signum, _frame):
-        nonlocal interrupted
-        interrupted = True
         try:
             child.send_signal(signum)
         except (OSError, ValueError):
@@ -1769,18 +1515,6 @@ def run_wpt(
         for s, handler in old.items():
             signal.signal(s, handler)
         signal.signal(signal.SIGINT, old_int)
-    try:
-        manifest_mtime_after = manifest.stat().st_mtime_ns
-    except OSError:
-        manifest_mtime_after = 0
-    if (
-        not interrupted
-        and record == 1
-        and manifest_mtime_after != manifest_mtime_before
-        and manifest_locked
-        and manifest_parses(exe, manifest)
-    ):
-        write_manifest_stamp(wpt, manifest, tree_before)
     release_lock(venv_lock)
     release_lock(manifest_lock)
     return status
@@ -1833,16 +1567,10 @@ def run_main(options: Options, argv: list[str]) -> int:
     check_type_drift(exe)
 
     manifest = Path(opt_value(final, "--manifest") or wpt / "MANIFEST.json")
-    if has_option_exact("--no-manifest-update", final):
-        record = 0
-    elif has_option_exact("--manifest-update", final):
-        record = 1
-    elif manifest_is_current(wpt, manifest):
-        eprint("wpt: manifest is current, skipping update")
-        final = ["--no-manifest-update", *final]
-        record = 1
-    else:
-        record = 1
+    # The manifest is a generated file, not a cache: an explicit
+    # `--no-manifest-update` (CI uses the plan job's artifact) trusts the one
+    # on disk, and every other run updates it.
+    record = 0 if has_option_exact("--no-manifest-update", final) else 1
     paths, final, error = hoist_paths_after_test_types(paths, final)
     if error:
         return die("run", error, 2)
@@ -1944,15 +1672,16 @@ def harness_budget_flags() -> list[str]:
 
 
 def ensure_manifest(wpt: Path, options: Options) -> int:
-    """Builds `MANIFEST.json` when the stamp says the tree moved on.
+    """Builds `MANIFEST.json` when the checkout has none.
 
-    The fast lanes select tests from the manifest, so they need the same
-    freshness check the `run` lane does. Building it here keeps the walk in the
-    venv python, where upstream's manifest package and its requirements live.
+    The fast lanes select tests from the manifest. It is a generated file, not
+    a cache: once it exists it is used as-is, so the lanes never spend a tree
+    walk per run. `cli.py manifest` is the explicit rebuild after editing the
+    WPT checkout. Building it here keeps the walk in the venv python, where
+    upstream's manifest package and its requirements live.
     """
     manifest = wpt / "MANIFEST.json"
-    if manifest_is_current(wpt, manifest):
-        eprint("wpt: manifest is current, skipping update")
+    if manifest.is_file():
         return 0
     venv = Path(options.venv) if options.venv else wpt / "_venv3"
     ensure_venv(wpt, venv, options)
@@ -2272,15 +2001,13 @@ def run_shard_range(
 
 
 def manifest_main(options: Options, argv: list[str]) -> int:
-    """`manifest` — build MANIFEST.json and its stamp once per CI run.
+    """`manifest` — build MANIFEST.json once per CI run.
 
-    A chunked CI run has one build job and N chunk jobs; without this,
-    every chunk walks the whole test tree to rebuild the manifest. The
-    build job runs this and uploads both files; each chunk drops them into
-    place, cli.py's staleness check (same HEAD, same clean tree, same
-    manifest) passes --no-manifest-update, and the walk happens once. The
-    stamp is only an optimization: a stamp that does not match makes
-    chunks walk exactly as they did before.
+    A chunked CI run has one plan job and N chunk jobs; without this, every
+    chunk walks the whole test tree to rebuild the manifest. The plan job
+    runs this and uploads the file; each chunk drops it into place and passes
+    --no-manifest-update, so the walk happens once. Locally, run this after
+    editing the WPT checkout; the fast lanes use an existing manifest as-is.
     """
     if argv:
         return die("manifest", "manifest takes no arguments", 2)
@@ -2309,15 +2036,13 @@ def manifest_main(options: Options, argv: list[str]) -> int:
 
 def manifest_inner_main(options: Options, argv: list[str]) -> int:
     """The `manifest` body, under the venv python (manifest has its own
-    requirements). The tree snapshot is taken before the walk: the stamp
-    must describe the tree the walk saw, not what the run left behind."""
+    requirements)."""
     if argv[:1] == ["--"]:
         argv = argv[1:]
     if argv:
         return die("manifest", "manifest takes no arguments", 2)
     wpt = resolve_wpt_root(options)
     manifest = wpt / "MANIFEST.json"
-    tree_before = tree_state(wpt)
     try:
         sys.path.insert(0, str(wpt))
         # Upstream's bootstrap puts tools/third_party (atomicwrites, attrs,
@@ -2330,7 +2055,6 @@ def manifest_inner_main(options: Options, argv: list[str]) -> int:
     manifest_pkg.load_and_update(str(wpt), str(manifest), "/")
     if not manifest_parses(Path(sys.executable), manifest):
         return die("manifest", f"{manifest} does not parse", 1)
-    write_manifest_stamp(wpt, manifest, tree_before)
     eprint(f"wpt: manifest {manifest} ({manifest.stat().st_size} bytes)")
     return 0
 
@@ -2872,7 +2596,6 @@ def _selftest() -> None:
             "dom/",
             "--binary",
             "/x",
-            "--durations=",
             "--no-lock",
             "--",
             "--binary",
@@ -2881,7 +2604,7 @@ def _selftest() -> None:
     )
     assert err is None, err
     assert rest == ["run", "dom/", "--", "--binary", "wpt-value"]
-    assert opts.binary == "/x" and opts.durations == "" and opts.no_lock
+    assert opts.binary == "/x" and opts.no_lock
     assert extract_options(["--binary"])[2] is not None
     assert extract_options(["--binary="])[2] is not None
     # A value never starts with `-`, so a missing one cannot swallow a flag.
@@ -2896,7 +2619,6 @@ def _selftest() -> None:
         binary="/x",
         wpt_root="/w",
         venv="/v",
-        durations="/d",
         log_level="trace",
         log_file="/log",
         allow_pin_mismatch=True,
@@ -3042,17 +2764,6 @@ def _selftest() -> None:
     assert rerun_status(0, 0) == (0, False)
     assert rerun_status(0, 64) == (64, True)
     assert rerun_status(2, 0) == (1, True)
-
-    assert longest_first({"a": 60, "b": 10, "c": 10, "d": 10, "e": 30, "f": 30}, 2) == [
-        ["a", "b", "d"],
-        ["e", "f", "c"],
-    ]
-    assert longest_first({"a": 1}, 3) == [["a"], [], []]
-    recorder = DurationRecorder()
-    recorder({"action": "test_start", "test": "/a.html", "time": 1000})
-    recorder({"action": "test_end", "test": "/a.html", "time": 1250})
-    recorder({"action": "test_end", "test": "/b.html", "time": 1300})
-    assert recorder.durations == {"/a.html": 250}
 
     report, save, paths, extra, dry, err = split_score_argv(
         ["FileAPI/", "--save-report", "/tmp/x.json", "--", "--exclude=worker"]
@@ -3377,8 +3088,8 @@ TOP_HELP = """tinybrowser WPT harness: run | score | rerun | merge | profile | f
     exit 1 on a failure the working tree adds. The baseline browser is built
     in a detached worktree that is removed on exit.
   manifest
-    Build MANIFEST.json plus its stamp once per chunked CI run, so chunk
-    jobs can skip the tree walk. The stamp only ever makes runs faster.
+    Build MANIFEST.json once per chunked CI run, so chunk jobs can skip the
+    tree walk. Locally, rerun it after editing the WPT checkout.
   fast [FILTER...] [--jobs N] [--report FILE] [--baseline FILE]
     Run test262 in-process with QuickJS, without HTML, testharness.js,
     wptserve, or WebDriver. The suite is read-only. --report writes a
@@ -3398,8 +3109,6 @@ Harness flags (any subcommand, before `--`):
   --binary PATH          use a prebuilt browser binary as-is
   --wpt-root PATH        WPT checkout to use
   --venv PATH            WPT virtualenv to use
-  --durations FILE       per-test durations for the longest-first split;
-                         `--durations=` disables the split
   --log-level LEVEL      browser log level (e.g. trace)
   --log-file PATH        write the browser log here, not under the data home
   --allow-pin-mismatch   run even when the checkout drifts from the pin

@@ -90,11 +90,6 @@ jobs:
           python3 tools/wpt/cli.py manifest
           mkdir -p wpt-manifest
           cp third_party/wpt/MANIFEST.json wpt-manifest/
-          if compgen -G "$HOME/.cache/tinybrowser/wpt-manifest-*.stamp" > /dev/null; then
-            cp "$HOME"/.cache/tinybrowser/wpt-manifest-*.stamp wpt-manifest/
-          else
-            echo "::warning::no manifest stamp; every chunk will walk the tree itself"
-          fi
       - uses: actions/upload-artifact@v7
         with:
           name: wpt-manifest
@@ -188,11 +183,9 @@ jobs:
           if [[ -f wpt-manifest/MANIFEST.json ]]; then
             cp wpt-manifest/MANIFEST.json third_party/wpt/MANIFEST.json
           else
-            echo "::warning::no shared manifest; this chunk walks the tree itself"
+            echo "::error::no shared manifest; the plan job did not upload one"
+            exit 1
           fi
-          mkdir -p "$HOME/.cache/tinybrowser"
-          cp wpt-manifest/*.stamp "$HOME/.cache/tinybrowser/" 2>/dev/null \
-            || echo "::warning::no manifest stamp; this chunk walks the tree itself"
       - name: Run chunk ${{ matrix.chunk }}
         # Deliberately below the job timeout: a step timeout fails the step
         # (later steps still run) instead of cancelling the job, and the
@@ -214,6 +207,7 @@ jobs:
             exit 1
           fi
           python3 tools/wpt/cli.py run --binary "$BINARY" -- \
+            --no-manifest-update \
             --log-wptreport "$REPORT" \
             --log-raw "$RAW" \
             --no-fail-on-unexpected \
