@@ -241,9 +241,9 @@ fn handle_request(
             | Command::WaitForJs { .. }
             | Command::CancelWait { .. }
             | Command::WindowMessage(..)
-            | Command::HistoryTraverse { .. } => {
-                Reply::Unit(Err(stream_error("unknown assignment")))
-            }
+            | Command::HistoryTraverse { .. }
+            | Command::HistoryTraverseFrame { .. }
+            | Command::SetHistory { .. } => Reply::Unit(Err(stream_error("unknown assignment"))),
         };
         return send_to_browser(
             outbox,
@@ -657,6 +657,25 @@ fn handle_command(engine: &mut Engine, command: Command) -> Handled {
         }
         Command::HistoryTraverse { url, history } => {
             Handled::Reply(Reply::Unit(engine.traverse_history(&url, &history)))
+        }
+        Command::HistoryTraverseFrame {
+            frame,
+            index,
+            url,
+            history,
+            same_document,
+            reload,
+        } => Handled::Reply(Reply::Unit(engine.traverse_frame_history(
+            frame,
+            index,
+            &url,
+            &history,
+            same_document,
+            reload,
+        ))),
+        Command::SetHistory { frame, history } => {
+            engine.set_history(frame, &history);
+            Handled::Reply(Reply::Unit(Ok(())))
         }
     }
 }

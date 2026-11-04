@@ -1038,8 +1038,10 @@ impl Tab {
         self.events_rx = None;
         // Frame ids are minted by the renderer, so a replacement restarts
         // them. Keeping the old records would let a reused id inherit another
-        // document's sandbox flags.
+        // document's sandbox flags, and stale child entries would corrupt the
+        // joint list the replacement's frames see.
         self.tabs.clear_frames(self.id);
+        self.history.clear_children();
         // Dropping the assignment is the release: it removes the registry
         // record, notifies the renderer, and lets the process manager
         // evaluate shutdown.
@@ -1453,33 +1455,42 @@ impl Tab {
     }
 
     async fn handle_renderer_event(&mut self, frame: FrameId, event: &BrowserEvent) {
-        if frame != FrameId::MAIN {
-            return;
-        }
         match event {
             BrowserEvent::Navigated { url, outgoing_name } => {
-                if let Ok(url) = Url::parse(url) {
-                    // This commit was driven by the renderer, which resolved
-                    // the reset itself. The event carries the name the document
-                    // being replaced had, because the new document's scripts
-                    // may already have renamed the tab; the new entry takes the
-                    // live name
-                    // (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#resetBCName>).
-                    self.history.sync_current_name(outgoing_name.as_ref());
-                    let name = self.tabs.name(self.id);
-                    self.history.commit(Commit::Push {
-                        url: url.clone(),
-                        name: name.clone(),
-                    });
-                    self.tabs
-                        .settle_document_name(self.id, outgoing_name.as_ref(), name);
-                    self.advance_document_url(url);
+                let Ok(url) = Url::parse(url) else {
+                    return;
+                };
+                if frame != FrameId::MAIN {
+                    // A started child navigation is staged; its commit carries
+                    // the final URL after redirects and takes the step
+                    // (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#finalize-a-cross-document-navigation>).
+                    self.history.commit_url(frame, url);
+                    self.sync_histories().await;
+                    return;
                 }
+                // This commit was driven by the renderer, which resolved the
+                // reset itself. The event carries the name the document being
+                // replaced had, because the new document's scripts may already
+                // have renamed the tab; the new entry takes the live name
+                // (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#resetBCName>).
+                self.history.sync_current_name(outgoing_name.as_ref());
+                let name = self.tabs.name(self.id);
+                self.history.commit(Commit::Push {
+                    url: url.clone(),
+                    name: name.clone(),
+                });
+                self.tabs
+                    .settle_document_name(self.id, outgoing_name.as_ref(), name);
+                self.advance_document_url(url);
                 self.document_loaded = false;
                 self.navigation_failed = false;
+                self.sync_histories().await;
                 self.record_event(TabEvent::Navigated).await;
             }
             BrowserEvent::Load => {
+                if frame != FrameId::MAIN {
+                    return;
+                }
                 // A `load` for the document a navigation replaced can arrive
                 // after the carrier committed the new response. Only the
                 // document the tab is navigating to may settle the wait.
@@ -1497,24 +1508,104 @@ impl Tab {
                 self.record_event(TabEvent::Load).await;
             }
             BrowserEvent::DomContentLoaded => {
+                if frame != FrameId::MAIN {
+                    return;
+                }
                 self.record_event(TabEvent::DomContentLoaded).await;
+            }
+            BrowserEvent::NavigationStarted {
+                url,
+                replace,
+                local_index,
+                pending,
+            } => {
+                let Ok(url) = Url::parse(url) else {
+                    return;
+                };
+                self.history
+                    .begin(frame, url, *replace, *local_index, None, *pending);
+                if !*pending {
+                    self.sync_histories().await;
+                }
+            }
+            BrowserEvent::FrameAdded { url } => {
+                let url = Url::parse(url).unwrap_or_else(|_| net::about_blank());
+                self.history.add_frame(frame, url, None);
+                self.sync_histories().await;
+            }
+            BrowserEvent::FrameRemoved => {
+                self.history.remove_frame(frame);
+                self.sync_histories().await;
             }
             BrowserEvent::HistoryUpdated {
                 url,
                 state,
                 handling,
             } => {
-                if let Ok(url) = Url::parse(url)
-                    && url.origin() == self.document_url.origin()
-                {
-                    self.history.update(url.clone(), state.clone(), *handling);
-                    self.document_url = url;
-                    self.record_event(TabEvent::SameDocumentNavigation).await;
-                }
+                self.apply_history_update(frame, url, state, *handling)
+                    .await;
             }
             BrowserEvent::HistoryTraversal { delta } => {
-                let _result = self.traverse(HistoryStep::Delta(*delta)).await;
+                let _result = self.traverse(HistoryStep::Delta(*delta), frame).await;
             }
+        }
+    }
+
+    /// Applies one same-document `pushState`/`replaceState` from `frame`.
+    ///
+    /// A URL outside the frame's own origin is not a history update the
+    /// renderer may make, so it is ignored rather than allowed to move the
+    /// tab onto another origin.
+    async fn apply_history_update(
+        &mut self,
+        frame: FrameId,
+        url: &str,
+        state: &str,
+        handling: renderer::HistoryHandling,
+    ) {
+        let Ok(url) = Url::parse(url) else {
+            return;
+        };
+        let expected = if frame == FrameId::MAIN {
+            Some(self.document_url.origin())
+        } else {
+            self.history
+                .active_entry(frame)
+                .and_then(|entry| self.history.entry_url(entry))
+                .map(Url::origin)
+        };
+        if expected.is_none_or(|origin| url.origin() != origin) {
+            return;
+        }
+        self.history
+            .update(frame, url.clone(), state.to_owned(), handling);
+        if frame == FrameId::MAIN {
+            self.document_url = url;
+            self.record_event(TabEvent::SameDocumentNavigation).await;
+        }
+        self.sync_histories().await;
+    }
+
+    /// Republish the joint entry count and each frame's active position after
+    /// the browser's list moved.
+    async fn sync_histories(&mut self) {
+        if self.renderer.is_none() {
+            return;
+        }
+        let snapshots: Vec<(FrameId, renderer::HistorySnapshot)> = self
+            .history
+            .frames()
+            .into_iter()
+            .filter_map(|frame| {
+                self.history
+                    .renderer_snapshot_for(frame)
+                    .map(|snapshot| (frame, snapshot))
+            })
+            .collect();
+        for (frame, history) in snapshots {
+            let _result = self
+                .renderer_request(RendererCommand::SetHistory { frame, history })
+                .await;
         }
     }
 
@@ -1546,20 +1637,23 @@ impl Tab {
         self.history.sync_current_name(name.as_ref());
     }
 
-    async fn traverse(&mut self, step: HistoryStep) -> Result<(), TabError> {
+    /// Applies one step of the joint session history
+    /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#traverse-the-history-by-a-delta>).
+    ///
+    /// `caller` is the frame whose script spoke the step; it does not limit the
+    /// step, because one joint step can move several frames at once.
+    async fn traverse(&mut self, step: HistoryStep, caller: FrameId) -> Result<(), TabError> {
         // A script may rename the tab and traverse in the same turn, so the
         // entry being left takes the value before the traversal reads any.
-        self.sync_outgoing_name();
-        // `go(0)` reloads the current entry without touching history
+        if caller == FrameId::MAIN {
+            self.sync_outgoing_name();
+        }
+        // `go(0)` reloads the active entry without touching history
         // (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-history-go>).
         if step == HistoryStep::Delta(0) {
-            let url = self.document_url.to_string();
-            if self.goto(&url, None).is_ok() {
-                self.traversal = Some(self.history.current_entry());
-            }
-            return Ok(());
+            return self.reload_frame(caller).await;
         }
-        let Some(target) = self.history.target(step) else {
+        let Some(target_step) = self.history.target_step(step, caller) else {
             // A distance past either end of the list is a step that goes
             // nowhere. An identity that names no entry is the caller's
             // mistake, and answering "done" would hide it.
@@ -1570,32 +1664,129 @@ impl Tab {
                 HistoryStep::Delta(_) => Ok(()),
             };
         };
-        let entry = target.id;
-        let url = target.url.to_string();
-        let same_document = target.same_document;
-        if same_document {
-            let Some(history) = self.history.renderer_snapshot_at(entry) else {
-                return Ok(());
+        let previous_step = self.history.current_step();
+        let mut main_move = None;
+        let mut child_moves = Vec::new();
+        for frame in self.history.frames() {
+            let Some(target) = self.history.active_entry_at(frame, target_step) else {
+                continue;
             };
-            let result = self
-                .renderer_request(RendererCommand::HistoryTraverse {
-                    url: url.clone(),
+            let current = self.history.active_entry_at(frame, previous_step);
+            if current == Some(target) {
+                continue;
+            }
+            let same_document =
+                current.is_some_and(|current| self.history.same_document(current, target));
+            if frame == FrameId::MAIN {
+                main_move = Some((target, same_document));
+            } else {
+                child_moves.push((frame, target, same_document));
+            }
+        }
+        let mut main_reloads = false;
+        if let Some((entry, same_document)) = main_move {
+            let url = self
+                .history
+                .entry_url(entry)
+                .cloned()
+                .ok_or(TabError::UnknownHistoryEntry { entry: entry.get() })?;
+            if same_document {
+                let Some(history) = self.history.renderer_snapshot_for_entry(entry) else {
+                    return Ok(());
+                };
+                let result = self
+                    .renderer_request(RendererCommand::HistoryTraverse {
+                        url: url.to_string(),
+                        history,
+                    })
+                    .await;
+                if matches!(result, Ok(Reply::Unit(Ok(()))))
+                    && self.history.traverse_same_document(entry)
+                {
+                    self.document_url = url;
+                    self.record_event(TabEvent::SameDocumentNavigation).await;
+                }
+            } else {
+                main_reloads = true;
+                if self.goto(url.as_str(), None).is_ok() {
+                    self.traversal = Some(entry);
+                }
+            }
+        }
+        for (frame, entry, same_document) in child_moves {
+            let Some(url) = self.history.entry_url(entry).cloned() else {
+                continue;
+            };
+            let Some(index) = self.history.local_index(entry) else {
+                continue;
+            };
+            let Some(history) = self.history.renderer_snapshot_for_entry(entry) else {
+                continue;
+            };
+            // The traversal cancels any uncommitted load in this frame, and
+            // the renderer drops its staged replay entry to match.
+            self.history.discard_pending(frame);
+            let _result = self
+                .renderer_request(RendererCommand::HistoryTraverseFrame {
+                    frame,
+                    index,
+                    url: url.to_string(),
                     history,
+                    same_document,
+                    reload: false,
                 })
                 .await;
-            if matches!(result, Ok(Reply::Unit(Ok(()))))
-                && self.history.traverse_same_document(entry)
-            {
-                if let Ok(url) = Url::parse(&url) {
-                    self.document_url = url;
-                }
-                self.record_event(TabEvent::SameDocumentNavigation).await;
+        }
+        // A main-frame cross-document step becomes current when its response
+        // commits; every other frame has already moved.
+        if main_reloads {
+            // The main commit's `sync_histories` publishes the new step to
+            // every frame. Sending the pre-traversal step now would undo the
+            // mirrors the child commands just installed.
+            return Ok(());
+        }
+        self.history.set_current_step(target_step);
+        // Every `History` object mirrors the tab's step position, so a frame
+        // that did not move still learns the new index before its next
+        // synchronous `pushState`
+        // (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#getting-the-history-object-length-and-index>).
+        self.sync_histories().await;
+        Ok(())
+    }
+
+    /// Reloads the caller frame's active entry (`history.go(0)`).
+    async fn reload_frame(&mut self, frame: FrameId) -> Result<(), TabError> {
+        if frame == FrameId::MAIN {
+            let url = self.document_url.to_string();
+            if self.goto(&url, None).is_ok() {
+                self.traversal = Some(self.history.current_entry());
             }
             return Ok(());
         }
-        if self.goto(&url, None).is_ok() {
-            self.traversal = Some(entry);
-        }
+        let Some(entry) = self.history.active_entry(frame) else {
+            return Ok(());
+        };
+        let Some(url) = self.history.entry_url(entry).cloned() else {
+            return Ok(());
+        };
+        let Some(index) = self.history.local_index(entry) else {
+            return Ok(());
+        };
+        let Some(history) = self.history.renderer_snapshot_for_entry(entry) else {
+            return Ok(());
+        };
+        // A reload owns the frame, so an uncommitted load is superseded.
+        self.history.discard_pending(frame);
+        let _result = self
+            .renderer_request(RendererCommand::HistoryTraverseFrame {
+                frame,
+                index,
+                url: url.to_string(),
+                history,
+                same_document: false,
+                reload: true,
+            })
+            .await;
         Ok(())
     }
 
@@ -1905,7 +2096,7 @@ impl Command {
                 let _result = reply.send(Ok(tab.history.snapshot()));
             }
             Command::TraverseHistory { step, reply } => {
-                let result = tab.traverse(step).await;
+                let result = tab.traverse(step, FrameId::MAIN).await;
                 let _result = reply.send(result);
             }
             Command::LastNavigationFailed { reply } => {

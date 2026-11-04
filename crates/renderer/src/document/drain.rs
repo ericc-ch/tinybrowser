@@ -58,7 +58,7 @@ impl Document {
         if !self.tasks.is_empty() || self.dials.has_queued() {
             return true;
         }
-        // A queued navigation or history traversal is engine work the next
+        // A queued navigation or child traversal is engine work the next
         // reconcile applies, even though no task carries it.
         if !self.frame_traversals.is_empty() || self.world.borrow().has_frame_navigations() {
             return true;
@@ -324,13 +324,14 @@ impl Document {
             }
             RealmRequest::HistoryTraverse { delta } => {
                 if self.frame == crate::protocol::FrameId::MAIN {
+                    // The browser tab owns the main frame's steps.
                     self.record_event(RendererEvent::Browser(BrowserEvent::HistoryTraversal {
                         delta,
                     }));
                 } else {
-                    // A child navigable keeps its own entries in the engine,
-                    // which owns its documents; the browser tab holds only the
-                    // main frame's.
+                    // A child's step names a joint position its renderer
+                    // cannot resolve alone
+                    // (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#traverse-the-history-by-a-delta>).
                     self.frame_traversals.push(delta);
                 }
             }

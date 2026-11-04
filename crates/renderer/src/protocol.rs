@@ -354,13 +354,44 @@ pub enum BrowserEvent {
         /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#resetBCName>).
         outgoing_name: Option<ContextName>,
     },
+    /// A child navigable started a navigation. The browser owns the joint
+    /// session history, so it records the entry here and updates every frame's
+    /// `history.length`
+    /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#finalize-a-cross-document-navigation>).
+    NavigationStarted {
+        /// The URL the navigation targets.
+        url: String,
+        /// Whether the navigation replaces the frame's active entry instead of
+        /// appending one.
+        replace: bool,
+        /// For a replacement, the position of the entry being replaced. An
+        /// append takes its position when it commits, so this value is only a
+        /// hint there.
+        local_index: usize,
+        /// Whether the document has not committed yet. A pending navigation
+        /// changes neither the joint step count nor the frame's replay store
+        /// until its commit, so a failed or superseded load leaves no phantom
+        /// entry
+        /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#finalize-a-cross-document-navigation>).
+        pending: bool,
+    },
+    /// A child navigable was created with its initial `about:blank` document.
+    /// Its entry belongs to the joint history from the moment the frame exists
+    /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#session-history-entry>).
+    FrameAdded {
+        /// The initial document's URL.
+        url: String,
+    },
+    /// A frame was torn down, so its entries leave the joint history
+    /// (<https://html.spec.whatwg.org/multipage/history.html#joint-session-history>).
+    FrameRemoved,
     /// A history API update in the active document (no new JS realm).
     HistoryUpdated {
         url: String,
         state: String,
         handling: HistoryHandling,
     },
-    /// Request to traverse the tab's session history by `delta` entries.
+    /// Request to traverse the joint session history by `delta` entries.
     HistoryTraversal { delta: i32 },
 }
 
@@ -963,10 +994,16 @@ impl ResponseHead {
 /// The browser's session history, as the renderer mirrors it.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct HistorySnapshot {
-    /// Total session-history entry count.
+    /// Number of used history steps in the tab's joint session history.
     pub length: usize,
-    /// Zero-based position of the active entry, including any forward branch.
+    /// Zero-based position of the current step among the used steps.
     pub index: usize,
+    /// Number of entries this frame's own list holds. It can shrink when a
+    /// push in any frame clears the forward branch, and the renderer's replay
+    /// store follows it.
+    pub local_length: usize,
+    /// Position of this frame's active entry in its own list.
+    pub local_index: usize,
     /// Serialized classic history API state of the active entry.
     pub state: Option<String>,
 }
@@ -974,11 +1011,15 @@ pub struct HistorySnapshot {
 impl HistorySnapshot {
     /// Mirrors one same-document history update.
     ///
-    /// The browser owns the entries; the renderer keeps this mirror because
+    /// The browser owns the steps; the renderer keeps this mirror because
     /// `history.length` and `history.state` are synchronous DOM reads, while
     /// the browser's authoritative update arrives later as a renderer event.
     /// The browser replaces this snapshot on mount and traversal, so the two
     /// only differ between a script's update and that event.
+    ///
+    /// A push clears the forward branch and appends one step, so the new
+    /// length is the new index plus one
+    /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#url-and-history-update-steps>).
     pub(crate) fn apply(&mut self, state: String, handling: HistoryHandling) {
         self.state = Some(state);
         match handling {
@@ -2852,5 +2893,52 @@ mod sandbox_flag_tests {
             SandboxFlags::empty(),
             "an escaping popup starts unsandboxed"
         );
+    }
+}
+
+#[cfg(test)]
+mod history_snapshot_tests {
+    use super::{HistoryHandling, HistorySnapshot};
+
+    /// A push clears the forward branch and appends one step, so the
+    /// synchronous mirror reports the step's position and that position plus
+    /// one, not the longer pre-traversal length
+    /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#url-and-history-update-steps>).
+    #[test]
+    fn a_push_mirrors_the_step_it_creates() {
+        let mut snapshot = HistorySnapshot {
+            length: 3,
+            index: 1,
+            local_length: 1,
+            local_index: 1,
+            state: None,
+        };
+        snapshot.apply("{}".to_owned(), HistoryHandling::Push);
+        assert_eq!((snapshot.length, snapshot.index), (3, 2));
+
+        // From the last step a push appends one and leaves the count alone
+        // apart from the new entry.
+        let mut snapshot = HistorySnapshot {
+            length: 3,
+            index: 2,
+            local_length: 2,
+            local_index: 2,
+            state: None,
+        };
+        snapshot.apply("{}".to_owned(), HistoryHandling::Push);
+        assert_eq!((snapshot.length, snapshot.index), (4, 3));
+    }
+
+    #[test]
+    fn a_replace_keeps_the_position_and_count() {
+        let mut snapshot = HistorySnapshot {
+            length: 4,
+            index: 2,
+            local_length: 2,
+            local_index: 2,
+            state: None,
+        };
+        snapshot.apply("{}".to_owned(), HistoryHandling::Replace);
+        assert_eq!((snapshot.length, snapshot.index), (4, 2));
     }
 }

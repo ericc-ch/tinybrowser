@@ -605,10 +605,9 @@ pub(crate) struct Document {
     /// (<https://html.spec.whatwg.org/multipage/parsing.html#delay-the-load-event>).
     /// Each value is that container's delay token.
     pending_frame_loads: HashMap<crate::dom::tree::NodeId, LoadDelayGuard>,
-    /// Traversals of this frame's own session history, queued by
-    /// `history.back()`/`go()`. The engine owns a child navigable's entries,
-    /// so it applies them after the script stops; the main frame's traversal
-    /// belongs to the browser tab.
+    /// `history.back()`/`go()` calls from a child frame. A browser-hosted
+    /// engine forwards them to the tab actor, which owns the joint steps; an
+    /// embedded carrier applies them against the frame's replay store.
     frame_traversals: Vec<i32>,
     /// Child frame documents this document's realm created for the engine to
     /// adopt
@@ -1242,7 +1241,7 @@ impl Document {
         self.world.borrow_mut().take_frame_navigations()
     }
 
-    /// Takes the traversals of this frame's own session history.
+    /// Takes the traversals this frame's script requested.
     pub(crate) fn take_frame_traversals(&mut self) -> Vec<i32> {
         std::mem::take(&mut self.frame_traversals)
     }
@@ -1356,6 +1355,16 @@ impl Document {
             ancestors,
             integrity: None,
         });
+    }
+
+    /// Cancels an in-flight frame load because a history traversal now owns
+    /// the frame.
+    ///
+    /// The cancelled dial's completion is dropped by the ledger, so it cannot
+    /// commit a document the browser no longer names
+    /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#aborting-navigation>).
+    pub(crate) fn cancel_frame_navigation(&mut self) {
+        self.dials.cancel_frame_loads();
     }
 
     /// Records the creator's secure-context bit for the navigation this
@@ -1610,6 +1619,19 @@ impl Document {
     /// realm runs so the `history` bindings read the fresh entry.
     pub(crate) fn set_history(&mut self, history: &crate::protocol::HistorySnapshot) {
         self.world.borrow_mut().history = history.clone();
+    }
+
+    /// Replaces the mirror and, when the document already has a realm, the
+    /// live `history` bindings it was initialized from.
+    ///
+    /// The browser owns the joint entry count, so a change made by another
+    /// frame has to reach this realm without replacing its document
+    /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-history-length>).
+    pub(crate) fn update_history_mirror(&mut self, history: &crate::protocol::HistorySnapshot) {
+        self.set_history(history);
+        if let Some(js) = self.js.as_ref() {
+            let _ = js.restore_history(history.state.as_deref(), history.length);
+        }
     }
 
     /// Restores a same-document session history entry while preserving the realm.

@@ -82,6 +82,32 @@ pub enum Command {
         url: String,
         history: renderer::HistorySnapshot,
     },
+    /// Activates one child frame's entry. The renderer restores the local
+    /// document or replays the navigation its replay store holds at `index`;
+    /// the browser supplies the joint length and the frame's active position.
+    HistoryTraverseFrame {
+        /// Frame whose entry is activated.
+        frame: FrameId,
+        /// The entry's position in the frame's own list.
+        index: usize,
+        /// The entry's URL.
+        url: String,
+        /// The joint length and this frame's active position.
+        history: renderer::HistorySnapshot,
+        /// Whether the entry presents the document already active in the
+        /// frame, which makes this a same-document traversal.
+        same_document: bool,
+        /// Whether the step reloads the active entry, as `history.go(0)` does.
+        reload: bool,
+    },
+    /// Replaces one frame's mirrored joint history without moving its
+    /// document, so a frame's `history.length` follows another frame's push.
+    SetHistory {
+        /// Frame whose mirror changes.
+        frame: FrameId,
+        /// The joint length, this frame's active position, and its state.
+        history: renderer::HistorySnapshot,
+    },
     /// Registers a page-scoped init script, identified by `id` so a replaced
     /// renderer can replay it.
     AddInitScript {

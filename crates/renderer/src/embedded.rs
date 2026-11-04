@@ -26,8 +26,10 @@ impl EmbeddedRenderer {
     #[must_use]
     pub fn new(host: Arc<dyn BrowserServices>, identity: net::ValidIdentity) -> Self {
         let stop = Arc::new(Stop::new());
+        let mut engine = Engine::new(host, Arc::clone(&stop), Arc::new(Notify::new()), identity);
+        engine.use_standalone_history();
         Self {
-            engine: Engine::new(host, Arc::clone(&stop), Arc::new(Notify::new()), identity),
+            engine,
             stop,
             ready_queued: false,
         }

@@ -55,7 +55,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// traversal names but the tab no longer holds. Version 23 reports frame
 /// creation and teardown so the browser owns every frame's sandbox flags, and
 /// drops the renderer-supplied sandbox set from a navigation source.
-pub const PROTOCOL_VERSION: u8 = 23;
+// Bumped for the browser-owned joint session history: child frames now send
+// navigation-start events and receive per-frame history snapshots.
+pub const PROTOCOL_VERSION: u8 = 24;
 
 /// Fixed frame header size in bytes.
 pub const HEADER_BYTES: usize = 16;

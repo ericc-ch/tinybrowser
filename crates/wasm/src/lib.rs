@@ -168,9 +168,11 @@ impl GuestTab for Tab {
             .map(|events| {
                 events
                     .into_iter()
-                    .map(|(frame, event)| FrameEvent {
-                        frame: frame.get(),
-                        event: to_event(event),
+                    .filter_map(|(frame, event)| {
+                        to_event(event).map(|event| FrameEvent {
+                            frame: frame.get(),
+                            event,
+                        })
                     })
                     .collect()
             })
@@ -198,30 +200,37 @@ impl Tab {
 }
 
 /// The renderer's event vocabulary, restricted to what this component emits.
-fn to_event(event: RendererEvent) -> Event {
+///
+/// The embedded engine has no auxiliary browsing contexts and its host owns
+/// the single tab, so the browser's joint-history bookkeeping events stay
+/// inside the engine instead of crossing the component boundary.
+fn to_event(event: RendererEvent) -> Option<Event> {
     match event {
         RendererEvent::Browser(event) => match event {
-            BrowserEvent::Navigated { url, .. } => Event::Navigated(url),
+            BrowserEvent::Navigated { url, .. } => Some(Event::Navigated(url)),
             BrowserEvent::HistoryUpdated {
                 url,
                 state,
                 handling,
-            } => Event::HistoryUpdated((
+            } => Some(Event::HistoryUpdated((
                 url,
                 state,
                 match handling {
                     HistoryHandling::Push => HostHistoryHandling::Push,
                     HistoryHandling::Replace => HostHistoryHandling::Replace,
                 },
-            )),
-            BrowserEvent::HistoryTraversal { delta } => Event::HistoryTraversal(delta),
-            BrowserEvent::Load => Event::Load,
-            BrowserEvent::DomContentLoaded => Event::DomContentLoaded,
+            ))),
+            BrowserEvent::HistoryTraversal { delta } => Some(Event::HistoryTraversal(delta)),
+            BrowserEvent::Load => Some(Event::Load),
+            BrowserEvent::DomContentLoaded => Some(Event::DomContentLoaded),
+            BrowserEvent::NavigationStarted { .. }
+            | BrowserEvent::FrameAdded { .. }
+            | BrowserEvent::FrameRemoved => None,
         },
-        RendererEvent::Timer(id) => Event::Timer(id.get()),
-        RendererEvent::Fetch { status } => Event::Fetch(status),
-        RendererEvent::FetchFailed => Event::FetchFailed,
-        RendererEvent::ScriptFailed => Event::ScriptFailed,
+        RendererEvent::Timer(id) => Some(Event::Timer(id.get())),
+        RendererEvent::Fetch { status } => Some(Event::Fetch(status)),
+        RendererEvent::FetchFailed => Some(Event::FetchFailed),
+        RendererEvent::ScriptFailed => Some(Event::ScriptFailed),
     }
 }
 

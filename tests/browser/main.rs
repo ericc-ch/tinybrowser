@@ -9,6 +9,7 @@ mod csp;
 mod daemon;
 mod fixture;
 mod forms;
+mod history;
 mod images;
 mod modes;
 mod pseudo_attributes;
