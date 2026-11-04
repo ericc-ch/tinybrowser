@@ -1240,3 +1240,137 @@ fn a_csp_sandbox_without_allow_popups_cannot_open_a_popup() {
         "a CSP sandbox without allow-popups blocks the popup"
     );
 }
+
+/// Every open tab as CDP reports it, so a test can watch a popup appear and
+/// disappear without depending on its renderer.
+fn target_count(client: &mut cdp::Client) -> usize {
+    client
+        .call("Target.getTargets", &json!({}), None)
+        .expect("targets")["targetInfos"]
+        .as_array()
+        .map_or(0, Vec::len)
+}
+
+/// Waits until the browser has `expected` open tabs.
+fn wait_for_targets(client: &mut cdp::Client, expected: usize) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if target_count(client) == expected {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the browser never had {expected} targets (saw {})",
+            target_count(client)
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// A same-origin popup is a browser tab on this engine, and a channel with its
+/// name still reaches the opener's listener through the browser's broadcast
+/// fan-out
+/// (<https://html.spec.whatwg.org/multipage/web-messaging.html#broadcasting-to-other-browsing-contexts>).
+#[test]
+fn a_popup_and_its_opener_share_a_broadcast_channel() {
+    let page = b"<!doctype html><script>\n\
+const name = String(Math.round(Math.random()*1e12));\n\
+window.__got = null;\n\
+const channel = new BroadcastChannel(name);\n\
+channel.addEventListener('message', function (event) { window.__got = event.data; });\n\
+window.open('/popup', name, undefined);\n\
+</script>";
+    let popup = b"<!doctype html><script>\n\
+const channel = new BroadcastChannel(window.name);\n\
+channel.postMessage({hello: 'world', n: 7});\n\
+</script>";
+    let server = TestServer::start(
+        vec![
+            ("/", ok("text/html", page)),
+            ("/popup", ok("text/html", popup)),
+        ],
+        None,
+    );
+    let origin = format!("http://{}", server.address());
+    let (_fixture, mut client, session) = open_page("tinybrowser-popup-broadcast", &origin);
+    wait_for_value(
+        &mut client,
+        &session,
+        "window.__got && window.__got.hello === 'world' && window.__got.n === 7",
+        &json!(true),
+    );
+}
+
+/// A cross-origin popup is a real tab, so its own `window.close()` closes that
+/// tab rather than a hidden frame the opener still owns
+/// (<https://html.spec.whatwg.org/multipage/window-object.html#dom-window-close>).
+#[test]
+fn a_cross_origin_popup_tab_closes_itself_through_window_close() {
+    let popup = b"<!doctype html><script>\n\
+opener.postMessage('bye', '*');\n\
+window.close();\n\
+</script>";
+    let (listener, address) = server();
+    let port = address.port();
+    let page = b"<!doctype html><script>\n\
+window.addEventListener('message', function (event) { window.__said = event.data; });\n\
+</script>";
+    TestServer::serve_on(
+        listener,
+        vec![
+            ("/", ok("text/html", page)),
+            ("/popup", ok("text/html", popup)),
+        ],
+    );
+    let origin = format!("http://127.0.0.1:{port}/");
+    let (_fixture, mut client, session) = open_page("tinybrowser-popup-self-close", &origin);
+    let baseline = target_count(&mut client);
+
+    evaluate(
+        &mut client,
+        &session,
+        &format!("window.__popup = window.open('http://localhost:{port}/popup', '_blank')"),
+    );
+    // Opening the popup is a target of its own, not a hidden child frame.
+    wait_for_targets(&mut client, baseline + 1);
+    wait_for_value(
+        &mut client,
+        &session,
+        "window.__said === 'bye'",
+        &json!(true),
+    );
+    // The popup closed itself, so the browser drops its tab.
+    wait_for_targets(&mut client, baseline);
+}
+
+/// The opener closes the cross-origin popup through its `WindowProxy`, and the
+/// popup's tab goes away. `closed` then reports the close because the proxy
+/// recorded it.
+#[test]
+fn an_opener_closes_its_popup_through_the_proxy() {
+    let (listener, address) = server();
+    let port = address.port();
+    TestServer::serve_on(
+        listener,
+        vec![
+            (
+                "/",
+                ok("text/html", b"<!doctype html><title>opener</title>"),
+            ),
+            ("/popup", ok("text/html", b"<!doctype html>peer")),
+        ],
+    );
+    let origin = format!("http://127.0.0.1:{port}/");
+    let (_fixture, mut client, session) = open_page("tinybrowser-popup-proxy-close", &origin);
+    let baseline = target_count(&mut client);
+
+    evaluate(
+        &mut client,
+        &session,
+        &format!("window.__popup = window.open('http://localhost:{port}/popup')"),
+    );
+    wait_for_targets(&mut client, baseline + 1);
+    evaluate(&mut client, &session, "window.__popup.close()");
+    wait_for_targets(&mut client, baseline);
+    wait_for_value(&mut client, &session, "window.__popup.closed", &json!(true));
+}

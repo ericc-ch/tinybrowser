@@ -1942,6 +1942,7 @@ impl Document {
             shared.tree.set_popup_sandbox(frame, tab.popup_sandbox);
         }
         self.world.borrow_mut().install_sandbox(tab.popup_sandbox);
+        self.world.borrow_mut().own_window = tab.id;
     }
 
     /// Opens a parse on `input`, taking ownership of the input stream.

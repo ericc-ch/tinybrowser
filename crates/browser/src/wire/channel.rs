@@ -54,10 +54,14 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// cross-origin reset. Version 22 adds the error for a history entry a
 /// traversal names but the tab no longer holds. Version 23 reports frame
 /// creation and teardown so the browser owns every frame's sandbox flags, and
-/// drops the renderer-supplied sandbox set from a navigation source.
-// Bumped for the browser-owned joint session history: child frames now send
-// navigation-start events and receive per-frame history snapshots.
-pub const PROTOCOL_VERSION: u8 = 24;
+/// drops the renderer-supplied sandbox set from a navigation source. Version
+/// 24 moved session history into one browser-owned joint list and added the
+/// per-frame history commands. Version 25 puts the owning tab id on a mount so
+/// a popup tab closes itself through the same path as its opener.
+// Bumped for the browser-owned joint session history (child navigation-start
+// events and per-frame history snapshots) and for the tab id a mount carries
+// so a popup tab can close itself.
+pub const PROTOCOL_VERSION: u8 = 25;
 
 /// Fixed frame header size in bytes.
 pub const HEADER_BYTES: usize = 16;
@@ -543,6 +547,7 @@ mod tests {
         );
         for head in [http, local, inherited] {
             let tab = renderer::TabState {
+                id: Some(renderer::WindowId::new(1)),
                 name: renderer::ContextName::parse("peer"),
                 auxiliary_with_opener: true,
                 popup_sandbox: renderer::SandboxFlags::parse(Some("allow-scripts allow-popups")),
@@ -550,12 +555,12 @@ mod tests {
             let message: crate::wire::ToRenderer = crate::exchange::Frame::Call {
                 id: crate::exchange::RequestId::new(1),
                 body: crate::wire::RendererCall::Response {
-                    response: crate::wire::ResponseStart {
+                    response: Box::new(crate::wire::ResponseStart {
                         assignment: crate::wire::RendererAssignmentId::new(1),
                         frame: renderer::FrameId::MAIN,
                         head: head.clone(),
                         tab: tab.clone(),
-                    },
+                    }),
                 },
             };
             let back: crate::wire::ToRenderer = round_trip(&message);

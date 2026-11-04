@@ -1676,9 +1676,14 @@ fn open_window(
     if !world.borrow().allows_auxiliary_navigation() {
         return None;
     }
-    // A same-origin popup stays in this renderer; a cross-origin one is a
-    // browser tab.
-    if let Some(frame) = World::create_auxiliary(world, plan.url.as_ref(), &target, plan.opener) {
+    // A blob URL names bytes in this renderer's object-URL store, which a
+    // browser tab cannot resolve, so a blob popup stays in this renderer. Every
+    // other URL is a real browser tab, so it gets its own target and webdriver
+    // handle
+    // (<https://html.spec.whatwg.org/multipage/window-object.html#dom-open>).
+    if plan.url.as_ref().is_some_and(|url| url.scheme() == "blob")
+        && let Some(frame) = World::create_auxiliary(world, plan.url.as_ref(), &target, plan.opener)
+    {
         return Some(WindowOpenAnswer {
             context: OpenedContext::Frame(frame),
             withholds: plan.withholds,
@@ -1716,6 +1721,17 @@ fn install_auxiliary_host_functions(
         "__tbCloseWindow",
         Func::from(move || {
             let world = close.borrow();
+            // A browser tab closes through the same `window_close` the opener's
+            // `WindowProxy.close()` uses, so either side reaches one path
+            // (<https://html.spec.whatwg.org/multipage/window-object.html#dom-window-close>).
+            if world.frame() == FrameId::MAIN
+                && let Some(window) = world.own_window
+            {
+                world.runtime.services.window_close(window);
+                return;
+            }
+            // A renderer-hosted blob popup is not a tab, so its frame is the
+            // context to close. An iframe has no opener and is left alone.
             world
                 .runtime
                 .shared

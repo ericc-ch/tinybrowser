@@ -180,8 +180,10 @@ pub enum RendererCall {
     /// Starts a streamed top-level response. Request chunks follow before the
     /// exchange's request-stream terminator.
     Response {
-        /// Response metadata needed to mount the completed body.
-        response: ResponseStart,
+        /// Response metadata needed to mount the completed body. Boxed: the
+        /// mount carries the whole document state, and it must not set the size
+        /// of every command frame.
+        response: Box<ResponseStart>,
     },
 }
 

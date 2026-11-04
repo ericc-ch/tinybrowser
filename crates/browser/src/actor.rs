@@ -834,6 +834,7 @@ impl Tab {
         let (dial_tx, dial_rx) = mpsc::unbounded_channel();
         let initial_name = tabs.name(id);
         let pending_mount = blank_mount(renderer::TabState {
+            id: Some(renderer::WindowId::new(id.get())),
             name: initial_name.clone(),
             auxiliary_with_opener: tabs.opener(id).is_some(),
             popup_sandbox: tab.popup_sandbox,
@@ -1218,6 +1219,7 @@ impl Tab {
     /// committed: the tab's name as it stands, with no reset.
     fn current_tab_state(&self) -> renderer::TabState {
         renderer::TabState {
+            id: Some(renderer::WindowId::new(self.id.get())),
             name: self.tabs.name(self.id),
             auxiliary_with_opener: self.auxiliary_with_opener(),
             popup_sandbox: self.popup_sandbox,

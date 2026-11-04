@@ -507,8 +507,137 @@ fn one_session_delete_closes_tabs_close_last_window_invalidates() {
     assert_eq!(invalid["value"]["error"], json!("invalid session id"));
 }
 
-const ELEMENT_KEY: &str = "element-6066-11e4-a52e-4f735466cecf";
+/// A page that calls `window.close()` while the driver is executing it must
+/// not deadlock the tab coordinator: the close runs after the script returns
+/// (<https://html.spec.whatwg.org/multipage/window-object.html#dom-window-close>).
+#[test]
+fn a_page_close_during_execute_returns() {
+    let page = spawn_page("<!doctype html><title>closer</title>");
+    let (addr, _fixture) = start(Vec::new());
+    let id = create_session(&addr);
+    navigate(
+        &addr,
+        &id,
+        &format!("http://127.0.0.1:{}/", page.address().port()),
+    );
 
+    let closed = request(
+        &addr,
+        "POST",
+        &format!("/session/{id}/execute/sync"),
+        Some(r#"{"script":"window.close(); return 1","args":[]}"#),
+    );
+    assert_eq!(closed["value"].as_f64(), Some(1.0), "{closed}");
+}
+
+/// A `window.open` popup is a real browser tab, so a `WebDriver` client sees a
+/// second window handle, can switch to it, read its URL, and close it
+/// (<https://w3c.github.io/webdriver/#get-window-handles>,
+/// <https://w3c.github.io/webdriver/#switch-to-window>).
+#[test]
+fn a_script_popup_is_a_switchable_window_handle() {
+    let page = b"<!doctype html><title>opener</title>";
+    let popup = b"<!doctype html><title>popup</title>";
+    let server = TestServer::start(
+        vec![
+            ("/", ok("text/html", page)),
+            ("/popup", ok("text/html", popup)),
+        ],
+        None,
+    );
+    let origin = format!("http://{}", server.address());
+    let (addr, _fixture) = start(Vec::new());
+    let id = create_session(&addr);
+    navigate(&addr, &id, &origin);
+
+    let before = request(&addr, "GET", &format!("/session/{id}/window/handles"), None);
+    assert_eq!(before["value"].as_array().map(Vec::len), Some(1));
+    let current = request(&addr, "GET", &format!("/session/{id}/window"), None);
+    let opener = current["value"].as_str().expect("handle").to_owned();
+
+    let popup_url = format!("http://localhost:{}/popup", server.address().port());
+    let opened_popup = request(
+        &addr,
+        "POST",
+        &format!("/session/{id}/execute/sync"),
+        Some(
+            &json!({
+                "script": format!("return window.open({popup_url:?}, '_blank') !== null"),
+                "args": [],
+            })
+            .to_string(),
+        ),
+    );
+    assert_eq!(opened_popup["value"], json!(true), "{opened_popup}");
+
+    // The script-created tab becomes a session window handle.
+    let handles = wait_for_handles(&addr, &id, 2);
+    let popup_handle = handles
+        .iter()
+        .find(|handle| **handle != opener)
+        .cloned()
+        .expect("the popup handle");
+    let switched = request(
+        &addr,
+        "POST",
+        &format!("/session/{id}/window"),
+        Some(&json!({"handle": popup_handle}).to_string()),
+    );
+    assert_eq!(switched["value"], Value::Null, "{switched}");
+    wait_for_url(&addr, &id, &popup_url);
+
+    let closed = request(&addr, "DELETE", &format!("/session/{id}/window"), None);
+    assert_eq!(
+        closed["value"].as_array().map(Vec::len),
+        Some(1),
+        "the opener's handle remains: {closed}"
+    );
+    wait_for_handles(&addr, &id, 1);
+}
+
+/// Polls the session's window handles until there are `count` of them.
+fn wait_for_handles(addr: &str, id: &str, count: usize) -> Vec<String> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let reply = request(addr, "GET", &format!("/session/{id}/window/handles"), None);
+        let handles: Vec<String> = reply["value"]
+            .as_array()
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if handles.len() == count {
+            return handles;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the session never had {count} window handles: {reply}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Polls the current window's URL until it equals `expected`.
+fn wait_for_url(addr: &str, id: &str, expected: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let reply = request(addr, "GET", &format!("/session/{id}/url"), None);
+        if reply["value"] == json!(expected) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the current window never reached {expected}: {reply}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+const ELEMENT_KEY: &str = "element-6066-11e4-a52e-4f735466cecf";
 /// Serves one page over HTTP for any request until the test process exits.
 fn spawn_page(html: &'static str) -> TestServer {
     TestServer::start(

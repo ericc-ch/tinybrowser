@@ -1209,6 +1209,10 @@ pub(crate) struct World {
     pub(crate) runtime: FrameRuntime,
     /// The frame this realm belongs to.
     frame: FrameId,
+    /// The browser tab this document belongs to, when a browser owns it. A
+    /// popup tab's `close()` names it; a child frame or an embedded carrier
+    /// has none.
+    pub(crate) own_window: Option<crate::protocol::WindowId>,
     /// This realm's id in the shared registry. It owns offscreen canvases even
     /// when the realm has no document.
     realm: u64,
@@ -1674,6 +1678,7 @@ impl World {
         Self {
             runtime: runtime.clone(),
             frame,
+            own_window: None,
             realm,
             init_scripts,
             viewport_size: Cell::new(crate::engine::DEFAULT_VIEWPORT),

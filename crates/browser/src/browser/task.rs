@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use tokio::sync::mpsc;
@@ -87,6 +87,10 @@ pub(crate) struct TabRegistry {
     /// renderer (and clears the child records) *before* it mounts, so a main
     /// record inside `frames` would be erased by its own commit.
     main_csp: Arc<Mutex<HashMap<TabId, renderer::SandboxFlags>>>,
+    /// Tabs `window.open` created. A script-created tab is script-closable
+    /// even without an opener (`noopener`) and before its first navigation
+    /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#script-closable>).
+    script_created: Arc<Mutex<HashSet<TabId>>>,
 }
 
 /// One frame's sandbox flags, as the browser owns them.
@@ -111,6 +115,7 @@ impl TabRegistry {
             sandboxes: Arc::new(Mutex::new(HashMap::new())),
             frames: Arc::new(Mutex::new(HashMap::new())),
             main_csp: Arc::new(Mutex::new(HashMap::new())),
+            script_created: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -554,6 +559,10 @@ impl TabRegistry {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clear();
+        self.script_created
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
         tasks
     }
 
@@ -589,6 +598,29 @@ impl TabRegistry {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&id);
+        self.script_created
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&id);
+    }
+
+    /// Records that `window.open` created `id`, which makes it script-closable
+    /// even with `noopener` and before it has a second history entry
+    /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#script-closable>).
+    fn mark_script_created(&self, id: TabId) {
+        self.script_created
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(id);
+    }
+
+    /// Whether script created `id`, rather than a form, a link, or the browser
+    /// itself.
+    pub(crate) fn is_script_created(&self, id: TabId) -> bool {
+        self.script_created
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&id)
     }
 }
 
@@ -750,6 +782,7 @@ impl BrowserTask {
             document_origin: initiator.origin.clone(),
         })?;
         let id = handle.id();
+        self.tabs.mark_script_created(id);
         if let Some(opener_tab) = opener_tab {
             self.context.copy_session(opener_tab, id);
         }

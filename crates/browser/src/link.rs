@@ -281,12 +281,12 @@ impl RendererHandle {
         frame: FrameId,
         mount: &Mount,
     ) -> Result<ResponseWriter, TabError> {
-        let start = ResponseStart {
+        let start = Box::new(ResponseStart {
             assignment,
             frame,
             head: mount.head.clone(),
             tab: mount.tab.clone(),
-        };
+        });
         let upload = if let Ok(result) = timeout(
             request_timeout(),
             self.client
@@ -775,17 +775,43 @@ async fn route_service_call(
     Ok(())
 }
 
-/// Whether a page may close `target`: itself or a tab it opened.
-fn close_related(context: &ServiceContext, assignment: &Assignment, target: TabId) -> bool {
-    target == assignment.tab || context.tabs.opener(target) == Some(assignment.tab)
-}
-
 /// Whether a page may address `target` with `postMessage`: itself, its
 /// opener, or a tab it opened.
 fn message_related(context: &ServiceContext, assignment: &Assignment, target: TabId) -> bool {
     target == assignment.tab
         || context.tabs.opener(target) == Some(assignment.tab)
         || context.tabs.opener(assignment.tab) == Some(target)
+}
+
+/// Authorizes and runs one `window.close()` after its synchronous reply.
+///
+/// The caller's renderer has already been answered, so the target's
+/// coordinator is free to report its history. A page may close itself or a tab
+/// it opened; a tab is script-closable when script created it (`noopener`
+/// included) or while it has one history entry
+/// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#script-closable>).
+fn spawn_window_close(
+    browser: crate::browser::BrowserHandle,
+    tabs: TabRegistry,
+    caller: TabId,
+    target: TabId,
+) {
+    tokio::spawn(async move {
+        if target != caller && tabs.opener(target) != Some(caller) {
+            return;
+        }
+        let script_closable = tabs.is_script_created(target)
+            || match browser.tab(target).await {
+                Ok(tab) => matches!(
+                    tab.history().await,
+                    Ok(history) if history.entries().len() == 1
+                ),
+                Err(_) => false,
+            };
+        if script_closable {
+            let _result = browser.close_tab(target).await;
+        }
+    });
 }
 
 /// The URL a browser-hosted popup may load.
@@ -1047,12 +1073,19 @@ async fn route_window_call(
         }
         BrowsingContextCall::WindowClose { window } => {
             let target = TabId::new(window.get());
-            // A page may close itself or a tab it opened; anything else is a
-            // forged target.
-            if close_related(context, assignment, target) {
-                let _result = context.browser.close_tab(target).await;
-            }
+            // Reply before the close runs. The renderer is blocked in this
+            // call, and the target may be the very tab executing the script,
+            // so asking it for its history here would deadlock the coordinator
+            // behind the renderer that is waiting for this reply. Closing is
+            // fire-and-forget by spec
+            // (<https://html.spec.whatwg.org/multipage/window-object.html#dom-window-close>).
             send_reply(&context.responder, id, ServiceReply::Unit).await?;
+            spawn_window_close(
+                context.browser.clone(),
+                context.tabs.clone(),
+                assignment.tab,
+                target,
+            );
         }
         BrowsingContextCall::Opener => {
             let opener = context

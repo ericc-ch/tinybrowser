@@ -708,6 +708,10 @@ impl SandboxFlags {
 /// default value: no name, no opener, and no sandbox.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TabState {
+    /// The browser tab this document belongs to, when a browser owns it.
+    /// `None` in the embedded and WASM carriers, which have no tab process to
+    /// close or address.
+    pub id: Option<WindowId>,
     /// The tab's target name (`window.name`) as of this commit, after any
     /// reset the navigation performed; `None` means it has no name
     /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#resetBCName>).

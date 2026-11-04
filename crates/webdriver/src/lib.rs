@@ -96,6 +96,40 @@ struct Window {
 }
 
 impl Sessions {
+    /// Adopts tabs that page script opened and forgets tabs that closed, so
+    /// `GET /window/handles` reports a `window.open` popup and
+    /// `POST /window` can select it
+    /// (<https://w3c.github.io/webdriver/#get-window-handles>).
+    async fn sync_windows(&mut self, session: &str) {
+        let browser = self.browser.clone();
+        let Ok(ids) = browser.tabs().await else {
+            return;
+        };
+        let Some(found) = self.open.get_mut(session) else {
+            return;
+        };
+        found
+            .windows
+            .retain(|_, window| ids.contains(&window.tab.id()));
+        for id in ids {
+            if found.windows.values().any(|window| window.tab.id() == id) {
+                continue;
+            }
+            let Ok(tab) = browser.tab(id).await else {
+                continue;
+            };
+            self.next_window += 1;
+            found
+                .windows
+                .insert(format!("w{}", self.next_window), Window { tab });
+        }
+        if !found.windows.contains_key(&found.current)
+            && let Some(next) = found.windows.keys().next().cloned()
+        {
+            found.current = next;
+        }
+    }
+
     async fn blank_window(&self) -> Result<Window, String> {
         let tab = self
             .browser
@@ -133,6 +167,12 @@ impl Sessions {
 
 async fn dispatch(method: &str, path: &str, body: &str, sessions: &mut Sessions) -> (u16, Value) {
     let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    // A page can open or close a tab from script, so the browser's live tab
+    // list is the source of truth for the session's window handles before any
+    // command runs (<https://w3c.github.io/webdriver/#get-window-handles>).
+    if let ["session", session, ..] = segments.as_slice() {
+        sessions.sync_windows(session).await;
+    }
     match (method, segments.as_slice()) {
         ("GET", ["status"]) => ok(json!({"ready": true, "message": "ready"})),
         ("POST", ["session"]) => {
