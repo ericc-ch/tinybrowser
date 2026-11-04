@@ -718,6 +718,10 @@ pub(crate) struct NavigationInitiator {
     pub(crate) referrer: Option<Url>,
     /// The concrete policy main fetch determines under.
     pub(crate) referrer_policy: net::ReferrerPolicy,
+    /// The initiating document's secure-context bit, which a popup's initial
+    /// `about:blank` inherits
+    /// (<https://html.spec.whatwg.org/multipage/webappapis.html#secure-contexts>).
+    pub(crate) secure_context: bool,
 }
 
 struct ActiveNavigation {
@@ -755,6 +759,10 @@ pub(crate) struct NewTab {
     /// context web content opened, opaque for one the browser created
     /// (<https://html.spec.whatwg.org/multipage/browsers.html#determining-the-origin>).
     pub(crate) document_origin: url::Origin,
+    /// The creator's secure-context bit, or `None` for a tab the browser
+    /// created itself
+    /// (<https://html.spec.whatwg.org/multipage/webappapis.html#secure-contexts>).
+    pub(crate) creator_secure_context: Option<bool>,
 }
 
 impl NewTab {
@@ -767,6 +775,7 @@ impl NewTab {
             opener_frame: None,
             popup_sandbox: renderer::SandboxFlags::empty(),
             document_origin: url::Origin::new_opaque(),
+            creator_secure_context: None,
         }
     }
 }
@@ -838,6 +847,7 @@ impl Tab {
             name: initial_name.clone(),
             auxiliary_with_opener: tabs.opener(id).is_some(),
             popup_sandbox: tab.popup_sandbox,
+            secure_context: tab.creator_secure_context,
         });
         Self {
             id,
@@ -1223,6 +1233,9 @@ impl Tab {
             name: self.tabs.name(self.id),
             auxiliary_with_opener: self.auxiliary_with_opener(),
             popup_sandbox: self.popup_sandbox,
+            // A navigation's own URL decides its secure context; only the
+            // tab's initial blank inherits the creator's bit.
+            secure_context: None,
         }
     }
 

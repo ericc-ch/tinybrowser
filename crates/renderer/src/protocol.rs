@@ -729,6 +729,11 @@ pub struct TabState {
     /// unsandboxed document
     /// (<https://html.spec.whatwg.org/multipage/browsers.html#popup-sandboxing-flag-set>).
     pub popup_sandbox: SandboxFlags,
+    /// The creator's secure-context bit for the tab's initial `about:blank`,
+    /// or `None` when the browser created the tab itself and there is no
+    /// creator to inherit from
+    /// (<https://html.spec.whatwg.org/multipage/webappapis.html#secure-contexts>).
+    pub secure_context: Option<bool>,
 }
 
 /// One top-level response: a complete [`ResponseHead`] plus its body. The
@@ -2078,6 +2083,10 @@ pub struct NavigationSource {
     /// that hosts the frame is not the document
     /// (<https://html.spec.whatwg.org/multipage/browsers.html#sandboxed-navigation-browsing-context-flag>).
     pub frame: FrameId,
+    /// The calling document's secure-context bit. A popup's initial
+    /// `about:blank` inherits it from its creator
+    /// (<https://html.spec.whatwg.org/multipage/webappapis.html#secure-contexts>).
+    pub secure_context: bool,
 }
 
 /// Browsing-context effects the page engine asks its host to perform.

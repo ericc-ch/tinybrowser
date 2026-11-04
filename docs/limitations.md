@@ -116,3 +116,11 @@ it drives itself keeps the target name. The browser's copy of the rule
 (`Tab::keeps_target_name_at`) is checked live, but a renderer-driven commit
 never consults it. The name survives the navigation and the group can still
 select the tab by it until a browser-driven commit clears it.
+
+A same-origin popup is a browser tab, and its `WindowProxy` in the opener is
+the restricted cross-tab proxy: `opener`, `postMessage`, `location`, and
+`close` work, but the full `Window` surface (`isSecureContext`, `document`,
+and the rest) is absent. The spec leaves same-origin proxy allocation to the
+UA but a conforming engine exposes the full Window. The popup's own document
+is correct; tests that need one of its properties attach to its target
+instead (`tests/browser/secure_context.rs`).

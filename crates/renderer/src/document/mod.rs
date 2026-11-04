@@ -637,6 +637,11 @@ pub(crate) struct Document {
     /// Whether init scripts were deferred because the realm was created while
     /// a navigation response was still streaming.
     init_scripts_deferred: bool,
+    /// Skip realm creation while an auxiliary or child document is installed
+    /// from inside the opener's live realm. Creating the realm there loses
+    /// the opener's load event; the engine creates it when it adopts the
+    /// frame instead.
+    defer_js: bool,
     /// The current parse's markup and delay, or `None` when no parse is active.
     active_parse: Option<ActiveParse>,
     /// Whether `document.open` or `document.close` ran and the engine still
@@ -895,6 +900,7 @@ impl Document {
             js_timers: HashMap::new(),
             load_delay: LoadDelay::default(),
             init_scripts_deferred: false,
+            defer_js: false,
             active_parse: None,
             stream_publish: None,
             executed_scripts: HashSet::new(),
@@ -1458,9 +1464,10 @@ impl Document {
     /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#process-the-iframe-attributes>).
     ///
     /// The tree exists before the caller returns so `contentDocument` is
-    /// available in the same task. A realm is created here when the document
-    /// needs one: the fork permits a nested realm under a live `Ctx`, so a
-    /// script that opens a window gets a live document synchronously.
+    /// available in the same task. The realm is deferred: creating a second
+    /// `QuickJS` realm under the opener's live `Ctx` loses the opener's load
+    /// event, so the engine creates the auxiliary realm when it adopts the
+    /// frame (`Engine::adopt_pending_frames`).
     pub(crate) fn load_about_blank_tree(
         &mut self,
         inherited_url: Option<&Url>,
@@ -1470,7 +1477,9 @@ impl Document {
         // The initial blank reports its creator's URL as its referrer
         // (<https://html.spec.whatwg.org/multipage/browsers.html#creating-a-new-browsing-context>).
         self.world.borrow_mut().document_referrer = inherited_url.cloned();
+        self.defer_js = true;
         self.load_html("");
+        self.defer_js = false;
         self.initial_blank = true;
     }
 
@@ -1943,6 +1952,9 @@ impl Document {
         }
         self.world.borrow_mut().install_sandbox(tab.popup_sandbox);
         self.world.borrow_mut().own_window = tab.id;
+        // A tab's initial blank inherits its creator's secure-context bit.
+        // Other mounts pass `None`, so the document's own URL decides.
+        self.set_creator_secure_context(tab.secure_context);
     }
 
     /// Opens a parse on `input`, taking ownership of the input stream.
@@ -2048,9 +2060,10 @@ impl Document {
         // (<https://html.spec.whatwg.org/multipage/browsers.html#determining-navigation-params-policy-container>).
         let creator = match &head.source {
             crate::protocol::ResponseSource::Http(_) => self.creator_secure_context,
-            crate::protocol::ResponseSource::Local { inherited } => {
-                inherited.as_ref().map(|policy| policy.secure_context)
-            }
+            crate::protocol::ResponseSource::Local { inherited } => inherited
+                .as_ref()
+                .map(|policy| policy.secure_context)
+                .or(self.creator_secure_context),
         };
         self.response_secure_context = secure_context::is_secure_environment(&head.url, creator);
         self.csp_from_response = true;
@@ -2475,7 +2488,7 @@ impl Document {
     /// whether a realm owns it afterwards.
     fn install_parsed(&mut self, parsed: Parsed) -> bool {
         if self.js.is_none() {
-            let skip_js = self.skip_nested_html_realm(&parsed);
+            let skip_js = self.defer_js || self.skip_nested_html_realm(&parsed);
             let document = self.world.borrow_mut().replace_document(parsed);
             self.register_document(document);
             // Style resolution and scripts both read the viewport; apply the

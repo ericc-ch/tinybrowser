@@ -838,6 +838,7 @@ fn window_initiator(
         // The browser checks the calling frame against its own per-frame
         // sandbox record; the initiator does not carry that state.
         frame: _,
+        secure_context,
     } = source;
     // The calling document's origin must belong to this renderer's site lock;
     // an opaque document may still open a window, but its origin stays opaque.
@@ -869,6 +870,7 @@ fn window_initiator(
         origin,
         referrer,
         referrer_policy,
+        secure_context,
     })
 }
 

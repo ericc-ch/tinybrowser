@@ -2218,6 +2218,7 @@ impl World {
                 referrer: self.referrer_url.clone(),
                 referrer_policy: self.policy.referrer_policy.unwrap_or_default(),
                 frame: self.frame,
+                secure_context: self.is_secure_context(),
             },
         })
     }

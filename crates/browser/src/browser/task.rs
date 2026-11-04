@@ -780,6 +780,10 @@ impl BrowserTask {
             // what the first navigation's target-name reset compares against
             // (<https://html.spec.whatwg.org/multipage/browsers.html#determining-the-origin>).
             document_origin: initiator.origin.clone(),
+            // The blank also inherits the opener's secure-context bit, so a
+            // popup opened by a `data:` document is insecure
+            // (<https://html.spec.whatwg.org/multipage/webappapis.html#secure-contexts>).
+            creator_secure_context: Some(initiator.secure_context),
         })?;
         let id = handle.id();
         self.tabs.mark_script_created(id);

@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use crate::fixture::{TestServer, evaluate, ok, open_page, server};
+use crate::fixture::{Fixture, TestServer, attach, evaluate, ok, open_page, server, wait_for_load};
 
 /// Percent-encodes `markup` into a `data:` URL.
 fn data_url(markup: &str) -> String {
@@ -118,6 +118,45 @@ fn a_child_inherits_its_creators_secure_context() {
     );
 }
 
+/// The target ids the browser reports before the test opens its page.
+fn target_ids(client: &mut cdp::Client) -> Vec<String> {
+    let targets = client
+        .call("Target.getTargets", &json!({}), None)
+        .expect("targets");
+    targets["targetInfos"]
+        .as_array()
+        .expect("target list")
+        .iter()
+        .filter_map(|target| target["targetId"].as_str().map(str::to_owned))
+        .collect()
+}
+
+/// Opens `url` and returns the popup target the page opened while loading.
+///
+/// A same-origin popup is a browser tab, and its `WindowProxy` is the
+/// restricted cross-tab proxy (`docs/upstream.md`), so the Interesting bit is
+/// read from the popup's own target rather than through the opener.
+fn open_page_with_popup(prefix: &str, url: &str) -> (Fixture, cdp::Client, String, String) {
+    let mut fixture = Fixture::new(prefix);
+    fixture.spawn_daemon();
+    fixture.wait_json();
+    let mut client = fixture.connect();
+    let before = target_ids(&mut client);
+    let created = client
+        .call("Target.createTarget", &json!({"url": "about:blank"}), None)
+        .expect("create");
+    let page = created["targetId"].as_str().expect("id").to_owned();
+    let session = attach(&mut client, &page);
+    client
+        .call("Page.navigate", &json!({"url": url}), Some(&session))
+        .expect("navigate");
+    wait_for_load(&mut client, &session, Duration::from_secs(10));
+    let mut after = target_ids(&mut client);
+    after.retain(|id| id != &page && !before.contains(id));
+    let popup = after.into_iter().next().expect("popup target");
+    (fixture, client, session, popup)
+}
+
 /// A popup's creator is its opener, so it inherits the opener's secure-context
 /// bit the same way a local-scheme frame does. An `about:blank` or `blob:`
 /// popup opened by a `data:` document is insecure
@@ -133,24 +172,20 @@ fn a_popup_inherits_its_openers_insecure_context() {
 const blank = open('about:blank');
 const blobMarkup = '<body onload="new Image().src = \'http://127.0.0.1:{marker_port}/\' + isSecureContext">';
 const blob = open(URL.createObjectURL(new Blob([blobMarkup], {{type: 'text/html'}})));
-window.__blankBit = () => {{
-  try {{ return String(blank.isSecureContext); }}
-  catch (error) {{ return 'pending'; }}
-}};
 </script>"#
     );
-    let (_fixture, mut client, session) =
-        open_page("tinybrowser-secure-context-popup", &data_url(&page));
+    let (_fixture, mut client, session, popup) =
+        open_page_with_popup("tinybrowser-secure-context-popup", &data_url(&page));
 
     assert_eq!(
         evaluate(&mut client, &session, "String(isSecureContext)"),
         json!("false")
     );
-    wait_for(
-        &mut client,
-        &session,
-        "window.__blankBit()",
-        &json!("false"),
+    let popup_session = attach(&mut client, &popup);
+    assert_eq!(
+        evaluate(&mut client, &popup_session, "String(isSecureContext)"),
+        json!("false"),
+        "an about:blank popup inherits the data document's insecure context"
     );
     markers.wait("/false");
 }
@@ -166,17 +201,19 @@ const blobMarkup = '<scr' + 'ipt>opener.postMessage(String(isSecureContext), "*"
 const blob = open(URL.createObjectURL(new Blob([blobMarkup], {type: 'text/html'})));
 window.__blobBit = null;
 addEventListener('message', (event) => { window.__blobBit = event.data; });
-window.__blankBit = () => {
-  try { return String(blank.isSecureContext); } catch (error) { return 'pending'; }
-};
 </script>"#;
     let (listener, address) = server();
     TestServer::serve_on(listener, vec![("/", ok("text/html", page.as_bytes()))]);
-    let (_fixture, mut client, session) = open_page(
+    let (_fixture, mut client, session, popup) = open_page_with_popup(
         "tinybrowser-secure-context-popup-secure",
         &format!("http://127.0.0.1:{}/", address.port()),
     );
 
-    wait_for(&mut client, &session, "window.__blankBit()", &json!("true"));
+    let popup_session = attach(&mut client, &popup);
+    assert_eq!(
+        evaluate(&mut client, &popup_session, "String(isSecureContext)"),
+        json!("true"),
+        "an about:blank popup inherits the loopback document's secure context"
+    );
     wait_for(&mut client, &session, "window.__blobBit", &json!("true"));
 }

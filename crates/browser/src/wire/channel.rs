@@ -61,7 +61,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 // Bumped for the browser-owned joint session history (child navigation-start
 // events and per-frame history snapshots) and for the tab id a mount carries
 // so a popup tab can close itself.
-pub const PROTOCOL_VERSION: u8 = 25;
+pub const PROTOCOL_VERSION: u8 = 26;
 
 /// Fixed frame header size in bytes.
 pub const HEADER_BYTES: usize = 16;
@@ -551,6 +551,7 @@ mod tests {
                 name: renderer::ContextName::parse("peer"),
                 auxiliary_with_opener: true,
                 popup_sandbox: renderer::SandboxFlags::parse(Some("allow-scripts allow-popups")),
+                secure_context: Some(false),
             };
             let message: crate::wire::ToRenderer = crate::exchange::Frame::Call {
                 id: crate::exchange::RequestId::new(1),
@@ -871,6 +872,7 @@ mod tests {
             referrer: url::Url::parse("https://a.test/page").expect("referrer"),
             referrer_policy: net::ReferrerPolicy::UnsafeUrl,
             frame: renderer::FrameId::new(7),
+            secure_context: false,
         };
         let cases = [
             (
