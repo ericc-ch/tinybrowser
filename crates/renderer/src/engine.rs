@@ -185,12 +185,29 @@ impl Engine {
     /// completion or stop arrives, so a carrier can wait instead of polling.
     /// `identity` is the browser's, and every page this engine hosts reports
     /// it verbatim.
+    ///
+    /// This builds a private font database. A host that creates many engines
+    /// on one thread should build [`crate::Fonts`] once and call
+    /// [`Self::with_fonts`] instead.
     #[must_use]
     pub fn new(
         services: Arc<dyn BrowserServices>,
         stop: Arc<Stop>,
         wake: Arc<Notify>,
         identity: net::ValidIdentity,
+    ) -> Self {
+        Self::with_fonts(services, stop, wake, identity, &crate::Fonts::default())
+    }
+
+    /// Builds an engine that shares `fonts` with any other engine handed the
+    /// same database.
+    #[must_use]
+    pub fn with_fonts(
+        services: Arc<dyn BrowserServices>,
+        stop: Arc<Stop>,
+        wake: Arc<Notify>,
+        identity: net::ValidIdentity,
+        fonts: &crate::Fonts,
     ) -> Self {
         let js_runtime = SharedJsRuntime::default();
         let init_scripts: Rc<RefCell<Vec<(u64, String)>>> = Rc::new(RefCell::new(Vec::new()));
@@ -205,7 +222,7 @@ impl Engine {
             shared: Rc::new(RefCell::new(crate::messaging::Shared::default())),
             pending_storage: Rc::new(RefCell::new(Vec::new())),
             turn_deadline: Rc::new(std::cell::Cell::new(None)),
-            font_ctx: parley::FontContext::default(),
+            font_ctx: fonts.0.clone(),
         };
         let main = Document::with_shared(FrameId::MAIN, &runtime, &init_scripts);
         let mut frames = BTreeMap::new();
@@ -783,6 +800,26 @@ impl Engine {
         frame: FrameId,
         request: &crate::ScreenshotRequest,
     ) -> Result<Vec<u8>, TabError> {
+        let image = self.render_frame(frame, request)?;
+        crate::render::encode_png(&image).map_err(|error| TabError::Render {
+            message: error.to_string(),
+        })
+    }
+
+    /// Renders one frame and returns the raw pixels.
+    ///
+    /// The reftest lane compares these buffers directly: PNG encoding and
+    /// decoding is pure overhead when both sides are rendered here.
+    ///
+    /// # Errors
+    ///
+    /// [`TabError::UnknownFrame`] when the frame is not mounted and
+    /// [`TabError::Render`] when the pipeline refuses the document.
+    pub fn render_frame(
+        &mut self,
+        frame: FrameId,
+        request: &crate::ScreenshotRequest,
+    ) -> Result<crate::RgbaImage, TabError> {
         let document = self
             .frames
             .get(&frame)
@@ -820,17 +857,14 @@ impl Engine {
             parsed.document.base.set_viewport(previous);
             image
         };
-        let image = match request.clip {
+        match request.clip {
             Some(clip) => image
                 .crop(clip.x, clip.y, clip.width, clip.height)
                 .map_err(|error| TabError::Render {
                     message: error.to_string(),
-                })?,
-            None => image,
-        };
-        crate::render::encode_png(&image).map_err(|error| TabError::Render {
-            message: error.to_string(),
-        })
+                }),
+            None => Ok(image),
+        }
     }
 
     /// Removes and returns every pending event, with its frame.

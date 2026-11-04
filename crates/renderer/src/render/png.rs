@@ -8,7 +8,7 @@ use crate::render::{RenderError, RgbaImage};
 ///
 /// # Errors
 ///
-/// [`RenderError::Encode`] when the encoder rejects the image; the pipeline
+/// `RenderError::Encode` when the encoder rejects the image; the pipeline
 /// only produces 8-bit RGBA, so a failure means the image dimensions
 /// overflow the format limits.
 pub fn encode_png(image: &RgbaImage) -> Result<Vec<u8>, RenderError> {

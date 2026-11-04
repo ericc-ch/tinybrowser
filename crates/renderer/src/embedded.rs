@@ -23,10 +23,30 @@ pub struct EmbeddedRenderer {
 impl EmbeddedRenderer {
     /// Creates a renderer whose external effects are handled by `host`, and
     /// whose pages report `identity`.
+    ///
+    /// This builds a private font database. A host that creates many
+    /// renderers on one thread should build [`crate::Fonts`] once and call
+    /// [`Self::with_fonts`] instead.
     #[must_use]
     pub fn new(host: Arc<dyn BrowserServices>, identity: net::ValidIdentity) -> Self {
+        Self::with_fonts(host, identity, &crate::Fonts::default())
+    }
+
+    /// Creates a renderer that shares `fonts` with other renderers.
+    #[must_use]
+    pub fn with_fonts(
+        host: Arc<dyn BrowserServices>,
+        identity: net::ValidIdentity,
+        fonts: &crate::Fonts,
+    ) -> Self {
         let stop = Arc::new(Stop::new());
-        let mut engine = Engine::new(host, Arc::clone(&stop), Arc::new(Notify::new()), identity);
+        let mut engine = Engine::with_fonts(
+            host,
+            Arc::clone(&stop),
+            Arc::new(Notify::new()),
+            identity,
+            fonts,
+        );
         engine.use_standalone_history();
         Self {
             engine,
@@ -88,6 +108,27 @@ impl EmbeddedRenderer {
     ) -> Result<RemoteValue, TabError> {
         self.engine
             .execute_remote_in(FrameId::MAIN, crate::ScriptSource::Page(source), timeout)
+    }
+
+    /// Renders the main frame and returns the encoded PNG.
+    ///
+    /// # Errors
+    ///
+    /// The render pipeline refused the document.
+    pub fn screenshot(&mut self, request: &crate::ScreenshotRequest) -> Result<Vec<u8>, TabError> {
+        self.engine.screenshot_frame(FrameId::MAIN, request)
+    }
+
+    /// Renders the main frame and returns the raw RGBA pixels.
+    ///
+    /// # Errors
+    ///
+    /// The render pipeline refused the document.
+    pub fn render(
+        &mut self,
+        request: &crate::ScreenshotRequest,
+    ) -> Result<crate::RgbaImage, TabError> {
+        self.engine.render_frame(FrameId::MAIN, request)
     }
 
     /// Runs ready tasks until the script budget without blocking.

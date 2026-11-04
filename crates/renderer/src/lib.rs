@@ -38,6 +38,16 @@ mod xml;
 
 pub use embedded::EmbeddedRenderer;
 pub use engine::{DEFAULT_VIEWPORT, Engine, decode_data_url, decode_data_url_bounded};
+pub use render::RgbaImage;
+
+/// A system font database engines on one thread can share.
+///
+/// Building one walks the installed fonts (tens of milliseconds on every
+/// engine construction); cloning it is a reference-count bump. A harness that
+/// mounts thousands of documents should build one per worker and hand a clone
+/// to every engine it creates.
+#[derive(Clone, Default)]
+pub struct Fonts(parley::FontContext);
 pub use js::{Stop, TURN_SCRIPT_BUDGET};
 pub use protocol::{
     BodyDelivery, BrowserEvent, BrowserServices, BrowsingContextHost, ContextName, CorsMode,

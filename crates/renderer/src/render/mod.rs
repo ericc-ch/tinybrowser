@@ -81,7 +81,13 @@ impl RgbaImage {
         clippy::cast_precision_loss,
         reason = "coordinates are clamped to the capped image bounds, well below u32"
     )]
-    pub fn crop(&self, x: f32, y: f32, width: f32, height: f32) -> Result<Self, RenderError> {
+    pub(crate) fn crop(
+        &self,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+    ) -> Result<Self, RenderError> {
         let image_width = self.width as f32;
         let image_height = self.height as f32;
         let left = x.max(0.0).min(image_width).floor();
