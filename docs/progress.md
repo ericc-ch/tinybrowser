@@ -4,6 +4,12 @@
 
 ## WPT
 
+Since 2026-11-05 the push gate in `wpt.yml` runs in-process (`fast-harness`,
+plus WebDriver only for testdriver and worker/module wrappers, plus native
+test262); `wpt-nightly.yml` keeps the full WebDriver run below as the
+fidelity backstop. A 2,195-test same-build comparison of the two executors
+agreed on 94.9% of verdicts and passed 1,148 vs 1,150.
+
 CI 2026-10-23 run 39980734258 (wpt.yml, 20 chunks), --exclude=worker
 testharness+crashtest+reftest+test262
 
