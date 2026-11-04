@@ -310,6 +310,7 @@ dependencies = [
 name = "browser"
 version = "0.1.0"
 dependencies = [
+ "dial",
  "httpdate",
  "logging",
  "net",
@@ -728,6 +729,15 @@ dependencies = [
  "quote",
  "rustc_version",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "dial"
+version = "0.1.0"
+dependencies = [
+ "net",
+ "renderer",
+ "url",
 ]
 
 [[package]]
@@ -4294,7 +4304,10 @@ dependencies = [
 name = "wpt-harness"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "cookies",
+ "dial",
+ "http-body-util",
  "net",
  "percent-encoding",
  "renderer",

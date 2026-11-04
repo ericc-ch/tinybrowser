@@ -103,20 +103,21 @@ The host serves files the way wptserve does: the content-type table comes from
 `.headers`, templates expanded), and `.any.html`/`.window.html` documents are
 rendered from their sources. `document.cookie` goes through the browser's own
 jar (`crates/cookies`). Still unimplemented: wptserve's query-param `pipe`
-handlers, `.sub.` body substitution (a `.sub.html` is served literally),
-`.py` handlers (a network error rather than the handler's source), and
-server-set `Set-Cookie`. Popups, workers, and WebDriver are out of scope:
-`window.open` returns null and `testdriver.js` files are skipped.
+handlers, `.sub.` body substitution (a `.sub.html` is served literally), and
+`.py` handlers (a network error rather than the handler's source). Popups,
+workers, and WebDriver are out of scope: `window.open` returns null and
+`testdriver.js` files are skipped.
 
-**The lane runs without the browser's fetch security model.** `FsServices` is
-a `NetworkHost`, and the CORS protocol, response tainting, the no-CORS request
-guards, redirect policy, and the browser-side cache live in `crates/browser`
-and `crates/net`, which this process never loads. Every URL is a same-origin
-`200` from the checkout, so a file that asserts a cross-origin `fetch` fails
-with `TypeError`, or that a `no-cors` response is `opaque`, gets the wrong
-answer here whichever way the engine behaves. Those files are skipped or
-should be; the `--score` parity numbers exclude them. Running the lane over the
-real fetch core with an in-memory transport is tracked by #233.
+**The lane runs the real fetch core.** `FsServices` is a `NetworkHost` over
+`net::Agent::with_transport`: response tainting, CORS and preflight, the
+no-CORS request guards, redirect policy, `Sec-Fetch-*`, referrer selection, and
+cookies all run in this process, and only the one HTTP exchange is an in-memory
+transport that maps `web-platform.test`, `www1.web-platform.test`, `:8443`
+and the other wptserve hosts to the checkout. A file that asserts a
+cross-origin `fetch` fails with `TypeError`, or that a `no-cors` response is
+`opaque`, now measures the same policy the native browser does, so those files
+belong in the parity numbers. Opaque Response Blocking and the browser-side
+HTTP cache still live in `crates/browser` and are not exercised here.
 
 A conformance change is a failure-list diff: failures prints the
 canonical list of a --score log, baseline runs both sides in a detached

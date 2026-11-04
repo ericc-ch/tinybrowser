@@ -17,7 +17,9 @@ it (#239).
 | Enumerated attributes | `enumerated!` (`crates/enumerated`) | generated `parse`/`Deserialize` |
 | Secure context | `net::secure_context` | the computed bit |
 | Wall/monotonic time | `net::Clock`/`ClockSource` | an injected clock |
-| Fetch policy and cache | `crates/browser/src/network.rs` with `crates/net` | the transport only feeds bytes (#233) |
+| Fetch policy | `net::Agent` with `net::Transport` | the transport only feeds bytes (#233) |
+| HTTP cache | `crates/browser/src/network.rs` | the browser's response store |
+| Carrier dial adapter | `crates/dial` | one conversion from `DialRequest` to `net::Request` |
 | WPT timeout policy | `tools/wpt/timeouts.py` | flags from `cli.py` |
 | WPT test selection | `tools/wpt-harness/src/suite.rs` (manifest) | — |
 | WPT response metadata | `tools/wpt-harness/src/{services,wrapper,template}.rs` | — |

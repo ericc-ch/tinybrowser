@@ -11,7 +11,10 @@ use crate::error::{NetError, TimeoutKind, TransportError};
 use crate::protocol::{HeaderMap, Method};
 use crate::referrer::{Referrer, ReferrerPolicy, determine_referrer};
 use crate::resolve::ResolveRule;
-use crate::transport::{CallBudget, HopBudget, HttpEngine, Proxy, TrustedCa, basic_authorization};
+use crate::transport::{
+    CallBudget, HopBudget, HttpEngine, Proxy, Transport, TrustedCa, WireBody, WireRequest,
+    WireResponse, basic_authorization,
+};
 use async_compression::tokio::bufread::{BrotliDecoder, DeflateDecoder, GzipDecoder, ZlibDecoder};
 use bytes::Bytes;
 use cookies::{CookieJar, CookieOp, RetrievalKind};
@@ -160,19 +163,22 @@ impl Default for AgentOptions {
 /// Cloning is cheap. Debug output does not include proxy credentials.
 #[derive(Clone)]
 pub struct Agent {
-    pub(crate) engine: HttpEngine,
+    transport: Arc<dyn Transport>,
     identity: crate::ValidIdentity,
     max_redirects: u32,
     jar: Arc<Mutex<CookieJar>>,
     clock: Clock,
+    timeout_global: Option<Duration>,
+    timeout_per_call: Option<Duration>,
 }
 
 impl std::fmt::Debug for Agent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Agent")
-            .field("engine", &self.engine)
             .field("max_redirects", &self.max_redirects)
             .field("jar", &self.jar)
+            .field("timeout_global", &self.timeout_global)
+            .field("timeout_per_call", &self.timeout_per_call)
             .finish_non_exhaustive()
     }
 }
@@ -193,20 +199,46 @@ impl Agent {
             resolve,
             tls_cas,
         } = options;
+        let transport = Arc::new(HttpEngine::new(proxy, resolve.into(), &tls_cas));
         Agent {
-            engine: HttpEngine::new(
-                timeout_global,
-                timeout_per_call,
-                proxy,
-                clock.clone(),
-                resolve.into(),
-                &tls_cas,
-            ),
+            transport,
             identity,
             max_redirects,
             jar: Arc::new(Mutex::new(CookieJar::default())),
             clock,
+            timeout_global,
+            timeout_per_call,
         }
+    }
+
+    /// Builds an agent whose bytes move through `transport` instead of hyper.
+    ///
+    /// Every fetch rule — tainting, CORS, redirects, cookies, `Sec-Fetch-*`,
+    /// referrer — still runs in this crate; only the one HTTP exchange is
+    /// delegated. A host without sockets (wasm, an in-memory conformance
+    /// origin) therefore runs the same fetch algorithm as the native browser
+    /// (<https://fetch.spec.whatwg.org/#concept-http-network-fetch>).
+    #[must_use]
+    pub fn with_transport(options: AgentOptions, transport: Arc<dyn Transport>) -> Agent {
+        let clock = options.clock.clone();
+        Agent {
+            transport,
+            identity: options.identity,
+            max_redirects: options.max_redirects,
+            jar: Arc::new(Mutex::new(CookieJar::default())),
+            clock,
+            timeout_global: options.timeout_global,
+            timeout_per_call: options.timeout_per_call,
+        }
+    }
+
+    /// The timeout budget one `send` call starts with.
+    fn call_budget(&self) -> CallBudget {
+        CallBudget::new(
+            self.timeout_global,
+            self.timeout_per_call,
+            self.clock.clone(),
+        )
     }
 
     /// The identity every request, page, and CDP answer reports.
@@ -354,11 +386,21 @@ impl Agent {
             header::USER_AGENT,
             self.identity.user_agent.header().clone(),
         );
-        let (status, preflight_headers, body, _http2) = self
-            .engine
-            .send(&Method::OPTIONS, wire, &preflight, None, budget)
+        let preflight_response = self
+            .transport
+            .exchange(
+                WireRequest {
+                    method: Method::OPTIONS,
+                    url: wire.clone(),
+                    headers: preflight,
+                    body: None,
+                },
+                budget,
+            )
             .await?;
-        drop(body);
+        let status = preflight_response.status;
+        let preflight_headers = preflight_response.headers;
+        drop(preflight_response.body);
         if !crate::cors::preflight_ok(
             status,
             &preflight_headers,
@@ -501,7 +543,7 @@ impl Agent {
         Self::write_referer(&mut hop.headers, determined.as_ref())?;
         let mut followed = 0u32;
         let mut cross_site_redirect = false;
-        let mut budget = self.engine.call_budget();
+        let mut budget = self.call_budget();
         // The request's own deadline only tightens the engine's global
         // timeout; a later deadline must not stretch it.
         if let Some(deadline) = request.deadline {
@@ -595,28 +637,7 @@ impl Agent {
         cross_site_redirect: bool,
         budget: CallBudget,
     ) -> Result<Response, NetError> {
-        let taint = hop_taint(dial.cors, url)?;
-        if taint != crate::cors::ResponseType::Basic {
-            hop.response_type = taint;
-        }
-        // Tainting is sticky: a no-cors request that crosses an origin is
-        // opaque, and a later hop back to the request's origin does not make
-        // it basic again
-        // (<https://fetch.spec.whatwg.org/#concept-request-response-tainting>).
-        if url.origin() != dial.cors.origin {
-            hop.crossed_origin = true;
-        }
-        // The redirect-taint: once a hop crosses an origin that is neither
-        // the previous URL's nor the request's own, the serialized origin
-        // becomes `null` for this and every later hop
-        // (<https://fetch.spec.whatwg.org/#concept-request-tainted-origin>).
-        if let Some(previous) = hop.previous_url.as_ref()
-            && previous.origin() != url.origin()
-            && dial.cors.origin != previous.origin()
-        {
-            hop.origin_tainted = true;
-        }
-        hop.previous_url = Some(url.clone());
+        apply_tainting(dial, url, hop)?;
         if budget.is_expired() {
             return Err(NetError::Transport(TransportError::Timeout(
                 TimeoutKind::Global,
@@ -642,16 +663,24 @@ impl Agent {
         prepare_credentials(dial, url, cross_origin, &mut hop_headers)?;
         let send_credentials =
             crate::cors::credentials_admitted(dial.cors.credentials, cross_origin);
-        let (status, response_headers, reader, http2) = self
-            .engine
-            .send(
-                &hop.method,
-                &wire,
-                &hop_headers,
-                hop.body.clone(),
+        let wire_response = self
+            .transport
+            .exchange(
+                WireRequest {
+                    method: hop.method.clone(),
+                    url: wire,
+                    headers: hop_headers,
+                    body: hop.body.clone(),
+                },
                 budget.clone(),
             )
             .await?;
+        let WireResponse {
+            status,
+            headers: response_headers,
+            body: reader,
+            http2,
+        } = wire_response;
         let content_encoding: Vec<String> =
             crate::get_decode_split(&response_headers, "content-encoding")
                 .into_iter()
@@ -707,6 +736,32 @@ impl Agent {
 
 /// Decides whether a redirect hop may be followed.
 pub type RedirectGate = Arc<dyn Fn(&Url, u32) -> bool + Send + Sync>;
+
+/// Applies the sticky CORS tainting and redirect-taint rules for one hop.
+///
+/// Tainting never resets: a `no-cors` request that crosses an origin is opaque,
+/// and a later hop back to the request's origin does not make it basic again
+/// (<https://fetch.spec.whatwg.org/#concept-request-response-tainting>). Once a
+/// hop crosses an origin that is neither the previous URL's nor the request's
+/// own, the serialized origin becomes `null` for this and every later hop
+/// (<https://fetch.spec.whatwg.org/#concept-request-tainted-origin>).
+fn apply_tainting(dial: &Dial<'_>, url: &Url, hop: &mut Hop) -> Result<(), NetError> {
+    let taint = hop_taint(dial.cors, url)?;
+    if taint != crate::cors::ResponseType::Basic {
+        hop.response_type = taint;
+    }
+    if url.origin() != dial.cors.origin {
+        hop.crossed_origin = true;
+    }
+    if let Some(previous) = hop.previous_url.as_ref()
+        && previous.origin() != url.origin()
+        && dial.cors.origin != previous.origin()
+    {
+        hop.origin_tainted = true;
+    }
+    hop.previous_url = Some(url.clone());
+    Ok(())
+}
 
 /// One outbound request as plain data. Set fields directly, then hand it to
 /// [`Agent::send`].
@@ -1321,7 +1376,7 @@ impl Body {
 
 /// Raw socket body before content decoders.
 struct RawBody {
-    inner: hyper::body::Incoming,
+    inner: WireBody,
     budget: HopBudget,
     current: Option<Bytes>,
     offset: usize,
@@ -1382,8 +1437,6 @@ impl AsyncRead for RawBody {
                     }
                 }
                 Poll::Ready(Some(Err(error))) => {
-                    let error =
-                        NetError::Transport(TransportError::Io(std::io::Error::other(error)));
                     set_body_error(&this.shared_error, error);
                     return Poll::Ready(Err(std::io::Error::other("body read failed")));
                 }
@@ -1689,5 +1742,248 @@ mod decode_tests {
         )
         .await;
         assert_eq!(read_all(body).await.expect("empty"), Vec::<u8>::new());
+    }
+}
+
+#[cfg(test)]
+mod transport_port_tests {
+    //! The fetch core must not depend on hyper: a host supplies only the one
+    //! exchange, and every policy step still runs above it (#233).
+
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex, PoisonError};
+
+    use bytes::Bytes;
+    use http_body_util::BodyExt as _;
+    use url::Url;
+
+    use super::{Agent, AgentOptions, Method, NetError, Request};
+    use crate::cors::{CorsSettings, CredentialsMode, RedirectMode, RequestMode, ResponseType};
+    use crate::transport::{HopBudget, Transport, WireRequest, WireResponse};
+
+    /// A transport that records the request it was handed and answers with one
+    /// header.
+    struct FakeTransport {
+        allow_origin: Option<&'static str>,
+        seen: Arc<Mutex<Vec<(String, String)>>>,
+    }
+
+    impl Transport for FakeTransport {
+        fn exchange(
+            &self,
+            request: WireRequest,
+            _budget: HopBudget,
+        ) -> Pin<Box<dyn Future<Output = Result<WireResponse, NetError>> + Send + '_>> {
+            let allow_origin = self.allow_origin;
+            let seen = Arc::clone(&self.seen);
+            Box::pin(async move {
+                let mut recorded = seen.lock().unwrap_or_else(PoisonError::into_inner);
+                for (name, value) in request.headers.iter() {
+                    recorded.push((
+                        name.to_ascii_lowercase(),
+                        String::from_utf8_lossy(value).into_owned(),
+                    ));
+                }
+                drop(recorded);
+                let mut headers = crate::HeaderMap::new();
+                if let Some(origin) = allow_origin {
+                    headers
+                        .insert("access-control-allow-origin", origin)
+                        .expect("a static header value");
+                }
+                let body = http_body_util::Full::new(Bytes::from_static(b"body"))
+                    .map_err(|infallible| match infallible {})
+                    .boxed_unsync();
+                Ok(WireResponse {
+                    status: 200,
+                    headers,
+                    body,
+                    http2: false,
+                })
+            })
+        }
+    }
+
+    fn cross_origin_request() -> Request {
+        let initiator = Url::parse("http://a.test/page")
+            .expect("initiator")
+            .origin();
+        let mut request = Request::new(
+            Method::GET,
+            Url::parse("http://b.test/resource").expect("target"),
+        );
+        request.cors = CorsSettings {
+            mode: RequestMode::Cors,
+            credentials: CredentialsMode::SameOrigin,
+            redirect: RedirectMode::Follow,
+            origin: initiator.clone(),
+        };
+        request.initiator = Some(initiator);
+        request
+    }
+
+    /// A `cors` response without `Access-Control-Allow-Origin` is a network
+    /// error even when the bytes came from a non-hyper transport
+    /// (<https://fetch.spec.whatwg.org/#cors-check>).
+    #[tokio::test]
+    async fn a_cross_origin_cors_response_without_acao_is_rejected() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let agent = Agent::with_transport(
+            AgentOptions::default(),
+            Arc::new(FakeTransport {
+                allow_origin: None,
+                seen: Arc::clone(&seen),
+            }),
+        );
+        let error = agent
+            .send(cross_origin_request())
+            .await
+            .expect_err("no ACAO");
+        assert!(matches!(error, NetError::RejectedRequest));
+        let seen = seen.lock().unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(
+            seen.iter()
+                .find(|(name, _)| name == "sec-fetch-site")
+                .map(|(_, value)| value.as_str()),
+            Some("cross-site"),
+            "the core shapes the request before the transport sees it"
+        );
+        assert_eq!(
+            seen.iter()
+                .find(|(name, _)| name == "origin")
+                .map(|(_, value)| value.as_str()),
+            Some("http://a.test"),
+            "the core writes Origin for a cors request"
+        );
+    }
+
+    /// The same exchange with an approving header reaches the caller as a
+    /// `cors` response.
+    #[tokio::test]
+    async fn a_cross_origin_cors_response_with_acao_is_cors_typed() {
+        let agent = Agent::with_transport(
+            AgentOptions::default(),
+            Arc::new(FakeTransport {
+                allow_origin: Some("*"),
+                seen: Arc::new(Mutex::new(Vec::new())),
+            }),
+        );
+        let response = agent
+            .send(cross_origin_request())
+            .await
+            .expect("ACAO admits the response");
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.response_type(), ResponseType::Cors);
+    }
+
+    /// One scripted response: status plus static headers.
+    type ScriptedResponse = (u16, Vec<(&'static str, &'static str)>);
+
+    /// A scripted transport: one response per exchange, in order.
+    struct ScriptedTransport {
+        script: Mutex<std::collections::VecDeque<ScriptedResponse>>,
+        seen: Arc<Mutex<Vec<(String, String)>>>,
+    }
+
+    impl Transport for ScriptedTransport {
+        fn exchange(
+            &self,
+            request: WireRequest,
+            _budget: HopBudget,
+        ) -> Pin<Box<dyn Future<Output = Result<WireResponse, NetError>> + Send + '_>> {
+            self.seen
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((request.method.as_str().to_owned(), request.url.to_string()));
+            let (status, scripted) = self
+                .script
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .pop_front()
+                .expect("one scripted response per exchange");
+            Box::pin(async move {
+                let mut headers = crate::HeaderMap::new();
+                for (name, value) in scripted {
+                    headers.insert(name, value).expect("a static header value");
+                }
+                let body = http_body_util::Full::new(Bytes::from_static(b"body"))
+                    .map_err(|infallible| match infallible {})
+                    .boxed_unsync();
+                Ok(WireResponse {
+                    status,
+                    headers,
+                    body,
+                    http2: false,
+                })
+            })
+        }
+    }
+
+    /// A redirect runs a second exchange through the same port, and the final
+    /// URL and count reach the caller
+    /// (<https://fetch.spec.whatwg.org/#http-redirect-fetch>).
+    #[tokio::test]
+    async fn a_redirect_crosses_the_same_port() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let agent = Agent::with_transport(
+            AgentOptions::default(),
+            Arc::new(ScriptedTransport {
+                script: Mutex::new(std::collections::VecDeque::from([
+                    (302, vec![("location", "http://b.test/final")]),
+                    (200, vec![]),
+                ])),
+                seen: Arc::clone(&seen),
+            }),
+        );
+        let response = agent
+            .send(Request::new(
+                Method::GET,
+                Url::parse("http://b.test/start").expect("start URL"),
+            ))
+            .await
+            .expect("redirect followed");
+        assert_eq!(response.final_url().as_str(), "http://b.test/final");
+        assert_eq!(response.redirect_count(), 1);
+        let seen = seen.lock().unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(seen.len(), 2, "one exchange per hop");
+        assert_eq!(seen[0].1, "http://b.test/start");
+        assert_eq!(seen[1].1, "http://b.test/final");
+    }
+
+    /// A non-safelisted cross-origin request sends its preflight through the
+    /// same port before the actual hop
+    /// (<https://fetch.spec.whatwg.org/#cors-preflight-fetch>).
+    #[tokio::test]
+    async fn a_cors_preflight_uses_the_same_port() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let agent = Agent::with_transport(
+            AgentOptions::default(),
+            Arc::new(ScriptedTransport {
+                script: Mutex::new(std::collections::VecDeque::from([
+                    (
+                        204,
+                        vec![
+                            ("access-control-allow-origin", "http://a.test"),
+                            ("access-control-allow-methods", "PUT"),
+                            ("access-control-allow-headers", "x-custom"),
+                        ],
+                    ),
+                    (200, vec![("access-control-allow-origin", "http://a.test")]),
+                ])),
+                seen: Arc::clone(&seen),
+            }),
+        );
+        let mut request = cross_origin_request();
+        request.method = Method::PUT;
+        request
+            .headers
+            .insert("x-custom", "1")
+            .expect("a test header");
+        let response = agent.send(request).await.expect("preflight then request");
+        assert_eq!(response.status(), 200);
+        let seen = seen.lock().unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(seen[0].0, "OPTIONS", "the preflight goes first");
+        assert_eq!(seen[1].0, "PUT", "then the actual request");
     }
 }

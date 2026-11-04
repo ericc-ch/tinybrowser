@@ -1743,32 +1743,6 @@ pub struct DialOutcome {
     pub referrer: Option<Url>,
 }
 
-impl DialOutcome {
-    /// An unfiltered (`basic`) response, for carriers that do not run the CORS
-    /// protocol.
-    #[must_use]
-    pub fn basic(
-        status: u16,
-        final_url: Url,
-        content_type: Option<String>,
-        headers: Vec<(String, String)>,
-        body: Vec<u8>,
-    ) -> Self {
-        Self {
-            status,
-            status_text: String::new(),
-            final_url,
-            content_type,
-            headers,
-            body: ResponseBody::Bytes(body),
-            response_type: net::cors::ResponseType::Basic,
-            crossed_origin: false,
-            redirect_count: 0,
-            referrer: None,
-        }
-    }
-}
-
 /// Completion for a dial submitted to the browser process.
 pub type DialCompletion = Box<dyn FnOnce(Result<DialOutcome, DialFailure>) + Send + 'static>;
 

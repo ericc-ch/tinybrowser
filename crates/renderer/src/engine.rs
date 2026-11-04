@@ -803,6 +803,15 @@ impl Engine {
         self.frames.values().any(Document::has_ready_work)
     }
 
+    /// Whether any frame's document has a dial queued or in flight.
+    ///
+    /// A host that is driven by in-process effect completions waits on this
+    /// instead of treating a page with no queued task as finished.
+    #[must_use]
+    pub fn has_pending_dials(&self) -> bool {
+        self.frames.values().any(Document::has_pending_dials)
+    }
+
     /// Queues one remote `postMessage` payload on the main frame's task
     /// source; the frame dispatches a trusted `message` event with a null
     /// source after checking the intended target origin against whichever

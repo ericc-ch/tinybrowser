@@ -242,6 +242,15 @@ async fn run_testharness(
         if started.elapsed() > limit {
             return Err(timeout_failure(renderer));
         }
+        // A dial completion arrives from the fetch thread through a std
+        // channel. Wait for it before advancing the virtual clock: otherwise a
+        // testharness timeout fires while its own response is still in flight.
+        // The sleep is real time, not tokio time, so a paused clock cannot jump
+        // past the work the page is waiting on.
+        if renderer.has_pending_dials() {
+            std::thread::sleep(Duration::from_micros(200));
+            continue;
+        }
         let Some(delay) = renderer.time_until_deadline() else {
             // Nothing is ready and nothing is scheduled. The in-memory host
             // has no pending I/O, so this page cannot make progress.
@@ -287,6 +296,13 @@ async fn run_crashtest(
         let _yielded = renderer.drain_until(deadline);
         if started.elapsed() > limit {
             return Err(Failure::Timeout);
+        }
+        // A crashtest can also start a fetch. Wait for the in-process dial
+        // before judging the file complete, or the continuation that contains
+        // the crash never runs and a hung page is reported as PASS.
+        if renderer.has_pending_dials() {
+            std::thread::sleep(Duration::from_micros(200));
+            continue;
         }
         match renderer.time_until_deadline() {
             Some(delay) if !delay.is_zero() => {

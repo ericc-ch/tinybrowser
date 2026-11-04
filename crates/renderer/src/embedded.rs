@@ -117,6 +117,15 @@ impl EmbeddedRenderer {
         self.engine.take_events()
     }
 
+    /// Whether any frame has a dial queued or in flight.
+    ///
+    /// A host driven by in-process effect completions waits on this instead of
+    /// treating a page with no queued task as finished.
+    #[must_use]
+    pub fn has_pending_dials(&self) -> bool {
+        self.engine.has_pending_dials()
+    }
+
     /// Duration until the next page timer is ready.
     ///
     /// `Some(0)` when ready work is queued. Fired timers are not a deadline,

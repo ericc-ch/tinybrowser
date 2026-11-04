@@ -19,7 +19,6 @@ use base64::Engine as _;
 use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Empty, Full};
-use hyper::body::Incoming;
 use hyper::header::HeaderValue;
 use hyper_tls::HttpsConnector;
 use hyper_util::client::legacy::Client;
@@ -46,14 +45,16 @@ pub(crate) struct CallBudget {
 }
 
 impl CallBudget {
-    /// Starts the budget for one call from `engine`'s timeouts.
-    pub(crate) fn start(engine: &HttpEngine) -> Self {
+    /// Starts the budget for one fetch call from the agent's timeouts.
+    pub(crate) fn new(
+        timeout_global: Option<Duration>,
+        timeout_per_call: Option<Duration>,
+        clock: Clock,
+    ) -> Self {
         Self {
-            global: engine
-                .timeout_global
-                .map(|limit| engine.clock.monotonic() + limit),
-            per_call: engine.timeout_per_call,
-            clock: engine.clock.clone(),
+            global: timeout_global.map(|limit| clock.monotonic() + limit),
+            per_call: timeout_per_call,
+            clock,
         }
     }
 
@@ -78,17 +79,93 @@ impl CallBudget {
     }
 }
 
+/// One HTTP exchange handed to a [`Transport`]: the request the fetch core has
+/// already shaped, with no policy left for the transport to apply.
+///
+/// Redirects, cookies, CORS, `Sec-Fetch-*`, and referrers are decided above the
+/// port; a transport only moves bytes for one URL
+/// (<https://fetch.spec.whatwg.org/#concept-http-network-fetch>).
+pub struct WireRequest {
+    /// Request method.
+    pub method: Method,
+    /// Absolute URL. The fragment is already stripped.
+    pub url: Url,
+    /// Headers in wire order, with every policy header already applied.
+    pub headers: HeaderMap,
+    /// Body bytes, empty for `GET` and `HEAD`.
+    pub body: Option<Bytes>,
+}
+
+impl std::fmt::Debug for WireRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WireRequest")
+            .field("method", &self.method)
+            .field("url", &self.url)
+            .field("headers", &self.headers)
+            .field("has_body", &self.body.is_some())
+            .finish()
+    }
+}
+
+/// The body a transport returns. It is a `http_body` stream so the fetch core
+/// can apply content decoders and the caller can read it chunk by chunk.
+pub type WireBody = http_body_util::combinators::UnsyncBoxBody<Bytes, NetError>;
+
+/// One HTTP exchange's answer: status, headers, and the body stream.
+pub struct WireResponse {
+    /// Status code.
+    pub status: u16,
+    /// Response headers, including `Set-Cookie`, before filtering.
+    pub headers: HeaderMap,
+    /// The body stream.
+    pub body: WireBody,
+    /// Whether the exchange ran over HTTP/2, which has no reason phrase
+    /// (<https://www.rfc-editor.org/rfc/rfc9113#section-8.3.2>).
+    pub http2: bool,
+}
+
+impl std::fmt::Debug for WireResponse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WireResponse")
+            .field("status", &self.status)
+            .field("headers", &self.headers)
+            .field("http2", &self.http2)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The one seam between fetch policy and a byte mover.
+///
+/// The fetch core calls this once per hop with a [`WireRequest`] and a
+/// [`HopBudget`]; the implementation performs one HTTP exchange and nothing
+/// else. Hyper, an embedder's own client, and an in-memory test origin all
+/// implement the same port, so every host runs the same fetch algorithm
+/// (<https://fetch.spec.whatwg.org/#concept-http-network-fetch>).
+pub trait Transport: Send + Sync + 'static {
+    /// Performs one exchange. The future is boxed so the port stays
+    /// object-safe without an async-trait dependency.
+    fn exchange(
+        &self,
+        request: WireRequest,
+        budget: HopBudget,
+    ) -> Pin<Box<dyn Future<Output = Result<WireResponse, NetError>> + Send + '_>>;
+}
+
 /// The deadlines for one hop of a `send` call: the call's global deadline
 /// plus the hop's own `timeout_per_call` deadline.
 #[derive(Clone, Debug)]
-pub(crate) struct HopBudget {
+pub struct HopBudget {
     global: Option<Instant>,
     hop: Option<Instant>,
     clock: Clock,
 }
 
 impl HopBudget {
-    pub(crate) fn deadline(&self) -> Option<Instant> {
+    /// The tighter of the call's global deadline and this hop's own deadline.
+    #[must_use]
+    pub fn deadline(&self) -> Option<Instant> {
         match (self.global, self.hop) {
             (Some(global), Some(hop)) => Some(global.min(hop)),
             (global, hop) => global.or(hop),
@@ -233,10 +310,7 @@ impl fmt::Debug for Proxy {
 #[derive(Clone)]
 pub(crate) struct HttpEngine {
     client: Client<HttpsConnector<HttpConnector<HostResolver>>, RequestBody>,
-    timeout_global: Option<Duration>,
-    timeout_per_call: Option<Duration>,
     proxied: Option<ProxiedClient>,
-    clock: Clock,
 }
 
 type ProxiedClient = Client<HttpsConnector<Tunnel<HttpConnector<HostResolver>>>, RequestBody>;
@@ -289,19 +363,7 @@ fn tls_connector(cas: &[TrustedCa]) -> tokio_native_tls::TlsConnector {
 }
 
 impl HttpEngine {
-    /// The budget one `send` call starts with.
-    pub(crate) fn call_budget(&self) -> CallBudget {
-        CallBudget::start(self)
-    }
-
-    pub(crate) fn new(
-        timeout_global: Option<Duration>,
-        timeout_per_call: Option<Duration>,
-        proxy: Option<Proxy>,
-        clock: Clock,
-        host_map: HostMap,
-        tls_cas: &[TrustedCa],
-    ) -> Self {
+    pub(crate) fn new(proxy: Option<Proxy>, host_map: HostMap, tls_cas: &[TrustedCa]) -> Self {
         let resolver = HostResolver {
             host_map,
             system: GaiResolver::new(),
@@ -321,84 +383,96 @@ impl HttpEngine {
         });
         let connector = HttpsConnector::from((http, tls));
         let client = Client::builder(TokioExecutor::new()).build(connector);
-        Self {
-            client,
-            timeout_global,
-            timeout_per_call,
-            proxied,
-            clock,
-        }
+        Self { client, proxied }
     }
+}
 
-    /// Sends one hop. Redirects, cookies, and header shaping belong to the
-    /// caller; this method applies the deadline and maps transport failures.
+impl Transport for HttpEngine {
+    /// Sends one hop over hyper. Redirects, cookies, and header shaping belong
+    /// to the fetch core; this port applies the deadline and maps transport
+    /// failures.
     ///
     /// # Errors
     ///
     /// [`NetError::Transport`] for DNS, connect, TLS, timeout, or I/O failure.
     /// [`NetError::RejectedRequest`] when the request cannot be represented.
-    pub(crate) async fn send(
+    fn exchange(
         &self,
-        method: &Method,
-        wire_url: &Url,
-        headers: &HeaderMap,
-        body: Option<Bytes>,
+        request: WireRequest,
         budget: HopBudget,
-    ) -> Result<(u16, HeaderMap, Incoming, bool), NetError> {
-        if budget.is_expired() {
-            return Err(timed_out(budget.timeout_kind(TimeoutKind::Global)));
-        }
-        let request_body = match body {
-            Some(bytes) => Full::new(bytes).boxed(),
-            None => Empty::<Bytes>::new().boxed(),
-        };
-        let mut request = hyper::Request::builder()
-            .method(method.as_http().clone())
-            .uri(
-                wire_url
-                    .as_str()
-                    .parse::<hyper::Uri>()
-                    .map_err(|_| NetError::RejectedRequest)?,
-            )
-            .body(request_body)
-            .map_err(|_| NetError::RejectedRequest)?;
-        // Browsers state the HTTP/1.1 default explicitly. hyper leaves the
-        // field to the caller, and ALPN can only select HTTP/2 over TLS, so a
-        // cleartext URL is always the HTTP/1.1 connection this field belongs
-        // on (<https://www.rfc-editor.org/rfc/rfc9110#section-7.6.1>).
-        if wire_url.scheme() == "http" && headers.value("connection").is_none() {
-            request.headers_mut().append(
-                hyper::header::CONNECTION,
-                hyper::header::HeaderValue::from_static("keep-alive"),
-            );
-        }
-        for (name, value) in headers.typed_iter() {
-            request.headers_mut().append(name.clone(), value.clone());
-        }
+    ) -> Pin<Box<dyn Future<Output = Result<WireResponse, NetError>> + Send + '_>> {
+        Box::pin(async move {
+            let WireRequest {
+                method,
+                url: wire_url,
+                headers,
+                body,
+            } = request;
+            if budget.is_expired() {
+                return Err(timed_out(budget.timeout_kind(TimeoutKind::Global)));
+            }
+            let request_body = match body {
+                Some(bytes) => Full::new(bytes).boxed(),
+                None => Empty::<Bytes>::new().boxed(),
+            };
+            let mut request = hyper::Request::builder()
+                .method(method.as_http().clone())
+                .uri(
+                    wire_url
+                        .as_str()
+                        .parse::<hyper::Uri>()
+                        .map_err(|_| NetError::RejectedRequest)?,
+                )
+                .body(request_body)
+                .map_err(|_| NetError::RejectedRequest)?;
+            // Browsers state the HTTP/1.1 default explicitly. hyper leaves the
+            // field to the caller, and ALPN can only select HTTP/2 over TLS, so a
+            // cleartext URL is always the HTTP/1.1 connection this field belongs
+            // on (<https://www.rfc-editor.org/rfc/rfc9110#section-7.6.1>).
+            if wire_url.scheme() == "http" && headers.value("connection").is_none() {
+                request.headers_mut().append(
+                    hyper::header::CONNECTION,
+                    hyper::header::HeaderValue::from_static("keep-alive"),
+                );
+            }
+            for (name, value) in headers.typed_iter() {
+                request.headers_mut().append(name.clone(), value.clone());
+            }
 
-        let host = wire_url.host_str().unwrap_or_default().to_owned();
-        let request_future = match &self.proxied {
-            Some(proxied) => proxied.request(request),
-            None => self.client.request(request),
-        };
-        let response = match within(budget, TimeoutKind::Global, request_future).await {
-            Ok(Ok(response)) => response,
-            Ok(Err(error)) => return Err(map_client_error(error, &host)),
-            Err(error) => return Err(error),
-        };
-        // HTTP/2 has no reason phrase; `StatusCode::canonical_reason` would
-        // invent one (<https://www.rfc-editor.org/rfc/rfc9113#section-8.3.2>).
-        let http2 = response.version() == hyper::Version::HTTP_2;
-        let mut mapped = HeaderMap::new();
-        for (name, value) in response.headers() {
-            mapped.insert_wire(name.clone(), value.clone());
-        }
-        Ok((
-            response.status().as_u16(),
-            mapped,
-            response.into_body(),
-            http2,
-        ))
+            let host = wire_url.host_str().unwrap_or_default().to_owned();
+            let request_future = match &self.proxied {
+                Some(proxied) => proxied.request(request),
+                None => self.client.request(request),
+            };
+            let response = match within(budget, TimeoutKind::Global, request_future).await {
+                Ok(Ok(response)) => response,
+                Ok(Err(error)) => return Err(map_client_error(error, &host)),
+                Err(error) => return Err(error),
+            };
+            // HTTP/2 has no reason phrase; `StatusCode::canonical_reason` would
+            // invent one (<https://www.rfc-editor.org/rfc/rfc9113#section-8.3.2>).
+            let http2 = response.version() == hyper::Version::HTTP_2;
+            let status = response.status().as_u16();
+            let mut mapped = HeaderMap::new();
+            for (name, value) in response.headers() {
+                mapped.insert_wire(name.clone(), value.clone());
+            }
+            // The port's body is a `http_body` stream so the fetch core decodes
+            // it uniformly, whether the bytes come from a socket or from an
+            // embedder's in-memory origin.
+            let body = response
+                .into_body()
+                .map_err(|error| {
+                    NetError::Transport(TransportError::Io(std::io::Error::other(error)))
+                })
+                .boxed_unsync();
+            Ok(WireResponse {
+                status,
+                headers: mapped,
+                body,
+                http2,
+            })
+        })
     }
 }
 

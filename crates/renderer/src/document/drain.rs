@@ -72,6 +72,16 @@ impl Document {
             .any(|timer| !timer.fired && timer.when.is_some_and(|when| when <= now))
     }
 
+    /// Whether a dial is queued, in flight, or waiting for its completion task.
+    ///
+    /// A host that can make progress only through a dial uses this to wait for
+    /// the completion instead of declaring the page idle. [`Self::has_ready_work`]
+    /// deliberately excludes an in-flight dial so the native engine can sleep on
+    /// its wake handle rather than spin.
+    pub(crate) fn has_pending_dials(&self) -> bool {
+        self.dials.has_pending()
+    }
+
     fn adopt_dial_completions(&mut self) {
         let AdoptedDials { settled, abandoned } = self.dials.adopt();
         for (id, completed) in settled {

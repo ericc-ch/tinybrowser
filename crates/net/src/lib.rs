@@ -28,7 +28,10 @@ pub use protocol::{
 };
 pub use referrer::{Referrer, ReferrerClient, ReferrerPolicy, determine_referrer};
 pub use resolve::{InvalidResolveRule, ResolveRule};
-pub use transport::{InvalidCa, InvalidProxy, Proxy, TrustedCa};
+pub use transport::{
+    HopBudget, InvalidCa, InvalidProxy, Proxy, Transport, TrustedCa, WireBody, WireRequest,
+    WireResponse,
+};
 
 /// The URL a tuple origin serializes to; `None` for an opaque origin.
 ///

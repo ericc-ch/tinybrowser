@@ -455,10 +455,36 @@ fn next_hop(chain: &Chain, response: &FetchResponse) -> Result<Option<Url>, Dial
     Ok(Some(next))
 }
 
+/// A response the WASM carrier builds without the fetch core.
+///
+/// The component still moves its own bytes until #192 puts it on the
+/// [`net::Transport`] port, so the outcome is spelled out here instead of a
+/// `DialOutcome` constructor a real fetch core would have decided.
+fn basic_outcome(
+    status: u16,
+    final_url: Url,
+    content_type: Option<String>,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+) -> DialOutcome {
+    DialOutcome {
+        status,
+        status_text: String::new(),
+        final_url,
+        content_type,
+        headers,
+        body: renderer::ResponseBody::Bytes(body),
+        response_type: net::cors::ResponseType::Basic,
+        crossed_origin: false,
+        redirect_count: 0,
+        referrer: None,
+    }
+}
+
 /// A redirect the policy refused. Status 0 is not a response the page can
 /// use; `final_url` is the blocked hop so the renderer can report it.
 fn csp_blocked(url: &Url) -> DialOutcome {
-    DialOutcome::basic(0, url.clone(), None, Vec::new(), Vec::new())
+    basic_outcome(0, url.clone(), None, Vec::new(), Vec::new())
 }
 
 fn decode_fetch_result(response: FetchResponse, hop_url: &Url) -> Result<DialOutcome, DialFailure> {
@@ -474,7 +500,7 @@ fn decode_fetch_result(response: FetchResponse, hop_url: &Url) -> Result<DialOut
     // This transport answers with the whole body, so a page that asked for a
     // progressive body gets it buffered. The renderer accepts a body in place
     // of a stream, and the page sees a response that was not streamed.
-    let mut outcome = DialOutcome::basic(
+    let mut outcome = basic_outcome(
         response.status,
         final_url,
         response.content_type,
@@ -526,7 +552,7 @@ impl NetworkHost for WasmServices {
         // dropped here instead of sent as a bogus GET. The native carrier
         // sends the real POST; the renderer already fired the event.
         if request.policy.kind() == DialKind::CspReport {
-            completion(Ok(DialOutcome::basic(
+            completion(Ok(basic_outcome(
                 204,
                 request.url,
                 None,

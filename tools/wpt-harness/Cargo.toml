@@ -19,8 +19,11 @@ wpt-report = { workspace = true }
 # The real page engine, hosted in this process instead of a renderer child.
 renderer = { workspace = true }
 net = { workspace = true }
+dial = { workspace = true }
 # The browser's own cookie jar, so `document.cookie` behaves as it does there.
 cookies = { workspace = true }
+bytes = "1"
+http-body-util = "0.1"
 percent-encoding = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

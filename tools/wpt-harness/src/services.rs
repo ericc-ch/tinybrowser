@@ -5,17 +5,30 @@
 //! message queue. Response metadata follows wptserve: the content-type table
 //! comes from `wptserve.constants` (passed by `cli.py`), and headers are read
 //! the way `wptserve.handlers.load_headers` reads them.
+//!
+//! The host runs the *real* fetch core: [`dial::outbound_request`] builds the
+//! request, [`net::Agent`] applies tainting, CORS, redirects, cookies,
+//! `Sec-Fetch-*`, and referrer, and only the bottom exchange is this in-memory
+//! transport. A verdict here therefore exercises the same policy the native
+//! browser does (#233).
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, PoisonError};
-use std::time::SystemTime;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Instant;
 
-use cookies::{CookieJar, CookieOp, InitiatorKind, RetrievalKind};
+use bytes::Bytes;
+use dial::{DialHead, dial_failure, outbound_request};
+use http_body_util::BodyExt;
+use net::{NetError, TransportError, WireRequest, WireResponse};
 use renderer::{
     BrowsingContextHost, DialCancellation, DialCompletion, DialFailure, DialOutcome, DialRequest,
-    FrameId, MessagingHost, NetworkHost, OpenerPolicy, PostedMessage, StorageChange, StorageError,
-    StorageHost, StorageKey, StorageKind, TargetName, WindowId,
+    FrameId, MAX_RESPONSE_BODY_BYTES, MessagingHost, NetworkHost, OpenerPolicy, PostedMessage,
+    ResponseBody, StorageChange, StorageError, StorageHost, StorageKey, StorageKind, TargetName,
+    WindowId,
 };
 use url::Url;
 
@@ -24,6 +37,11 @@ use crate::wrapper::Wrapper;
 
 /// The origin wptserve gives ordinary test documents.
 pub const BASE: &str = "http://web-platform.test:8000/";
+
+/// The per-dial deadline the harness gives the fetch core. The in-memory
+/// transport never needs it, but a request that names one keeps the core on the
+/// same path a browser uses.
+const DIAL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Replaces wptrunner's report script. The page records the same completion
 /// payload the `WebDriver` harness reads from its message queue.
@@ -66,53 +84,42 @@ pub(crate) struct RequestContext<'a> {
     pub(crate) headers: &'a [(String, String)],
 }
 
-/// A host that maps every URL path to a file under one checkout.
-pub struct FsServices {
+/// One response the in-memory origin produced.
+struct Served {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+/// The files under one checkout, independent of any fetch state.
+///
+/// Split from [`FsServices`] so the transport can hold it while the service
+/// holds the agent whose transport is it: no reference cycle, and a cookie jar
+/// is not reachable from the file mapper.
+struct Origin {
     root: PathBuf,
     /// `wptserve.constants.content_types`, as a JSON map handed over by
     /// `cli.py`. An extension it does not name is `application/octet-stream`,
     /// exactly like `guess_content_type`.
     content_types: HashMap<String, String>,
-    /// The engine's own jar, so `document.cookie` obeys path, domain, expiry,
-    /// and `SameSite` here exactly as it does in a browser tab.
-    cookies: Mutex<CookieJar>,
-    storage: Mutex<HashMap<(bool, StorageKey, String), String>>,
-    /// Every path this host read or tried to read for the current file.
+    /// Every path this origin read or tried to read for the current file.
     read: Mutex<Vec<PathBuf>>,
 }
 
-impl FsServices {
-    /// Creates a host rooted at `root`.
-    #[must_use]
-    pub fn new(root: PathBuf, content_types: HashMap<String, String>) -> Self {
+impl Origin {
+    fn new(root: PathBuf, content_types: HashMap<String, String>) -> Self {
         Self {
             root,
             content_types,
-            cookies: Mutex::new(CookieJar::default()),
-            storage: Mutex::new(HashMap::new()),
             read: Mutex::new(Vec::new()),
         }
     }
 
-    /// Drops cookies and storage between files.
-    ///
-    /// A worker builds a fresh engine per file, so state a file leaves behind
-    /// must not reach the next one. Upstream also clears browser state between
-    /// tests.
-    pub fn clear(&self) {
-        self.jar().clear();
-        self.storage
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clear();
+    fn clear(&self) {
         self.read
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clear();
-    }
-
-    fn jar(&self) -> MutexGuard<'_, CookieJar> {
-        self.cookies.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Records one path as an input and returns it.
@@ -125,18 +132,12 @@ impl FsServices {
     }
 
     /// Takes the paths read since the last [`Self::clear`].
-    #[must_use]
-    pub fn take_inputs(&self) -> Vec<PathBuf> {
+    fn take_inputs(&self) -> Vec<PathBuf> {
         std::mem::take(&mut *self.read.lock().unwrap_or_else(PoisonError::into_inner))
     }
 
-    /// Records `path` as an input without reading it.
-    pub fn record_file(&self, path: PathBuf) {
-        self.record(path);
-    }
-
-    /// The content type wptserve's `guess_content_type` returns for `file`.
-    pub(crate) fn content_type_for(&self, file: &Path) -> String {
+    /// The content type `guess_content_type` returns for `file`.
+    fn content_type_for(&self, file: &Path) -> String {
         file.extension()
             .and_then(|extension| extension.to_str())
             .and_then(|extension| self.content_types.get(extension))
@@ -145,7 +146,7 @@ impl FsServices {
     }
 
     /// Reads the headers wptserve sends for `file`.
-    pub(crate) fn headers_for(&self, file: &Path, request: &RequestContext<'_>) -> Headers {
+    fn headers_for(&self, file: &Path, request: &RequestContext<'_>) -> Headers {
         let mut list = Vec::new();
         // Directory headers apply to the whole directory, then the file's own
         // headers follow
@@ -218,18 +219,17 @@ impl FsServices {
         }
     }
 
-    fn serve(&self, request: &DialRequest) -> Result<DialOutcome, DialFailure> {
-        let path = percent_encoding::percent_decode_str(request.url.path())
+    /// Answers one request from the checkout.
+    fn respond(&self, url: &Url, request_headers: &[(String, String)]) -> Result<Served, NetError> {
+        let path = percent_encoding::percent_decode_str(url.path())
             .decode_utf8()
-            .map_err(|_| DialFailure::Connect)?;
+            .map_err(|_| connect("malformed path"))?;
         if path == "/resources/testharnessreport.js" {
-            return Ok(DialOutcome::basic(
-                200,
-                request.url.clone(),
-                Some("text/javascript".into()),
-                Vec::new(),
-                REPORT.as_bytes().to_vec(),
-            ));
+            return Ok(Served {
+                status: 200,
+                headers: vec![("content-type".to_owned(), "text/javascript".to_owned())],
+                body: REPORT.as_bytes().to_vec(),
+            });
         }
         let relative = Path::new(path.trim_start_matches('/'));
         // A test URL is trusted input, but a `..` segment would read outside
@@ -238,7 +238,7 @@ impl FsServices {
             .components()
             .any(|component| component == Component::ParentDir)
         {
-            return Err(DialFailure::Connect);
+            return Err(connect("path escapes the checkout"));
         }
         // wptserve executes a `.py` handler for such a path. Serving the
         // handler's own source instead would hand a test a 200 body no browser
@@ -248,46 +248,187 @@ impl FsServices {
             .extension()
             .is_some_and(|extension| extension == "py")
         {
-            return Err(DialFailure::Connect);
+            return Err(connect("wptserve handler is not implemented"));
         }
         let context = RequestContext {
-            url: &request.url,
-            headers: &request.headers,
+            url,
+            headers: request_headers,
         };
         // `.any.html` and `.window.html` are synthesized from their script.
         if let Some((wrapper, source)) = Wrapper::for_url(&path) {
             let file = self.record(self.root.join(&source));
-            let body = std::fs::read(&file).map_err(|_| DialFailure::Connect)?;
+            let body = std::fs::read(&file).map_err(|_| connect("missing wrapped script"))?;
             let headers = self.headers_for(&file, &context);
-            let js_url = &request.url.path()[..request.url.path().len() - ".html".len()];
+            let js_url = &url.path()[..url.path().len() - ".html".len()];
             let html = wrapper.render(&body, &format!("{js_url}.js"));
-            return Ok(DialOutcome::basic(
-                200,
-                request.url.clone(),
-                Some(
-                    headers
-                        .content_type
-                        .unwrap_or_else(|| "text/html".to_owned()),
-                ),
-                headers.list,
-                html.into_bytes(),
-            ));
+            let content_type = headers
+                .content_type
+                .unwrap_or_else(|| "text/html".to_owned());
+            return Ok(Served {
+                status: 200,
+                headers: with_content_type(headers.list, content_type),
+                body: html.into_bytes(),
+            });
         }
         let file = self.record(self.root.join(relative));
-        let body = std::fs::read(&file).map_err(|_| DialFailure::Connect)?;
+        let body = std::fs::read(&file).map_err(|_| connect("missing file"))?;
         let headers = self.headers_for(&file, &context);
-        Ok(DialOutcome::basic(
-            200,
-            request.url.clone(),
-            Some(
-                headers
-                    .content_type
-                    .unwrap_or_else(|| self.content_type_for(&file)),
-            ),
-            headers.list,
+        let content_type = headers
+            .content_type
+            .unwrap_or_else(|| self.content_type_for(&file));
+        Ok(Served {
+            status: 200,
+            headers: with_content_type(headers.list, content_type),
             body,
-        ))
+        })
     }
+}
+
+/// Appends one `Content-Type` field to a wptserve header list.
+fn with_content_type(
+    mut list: Vec<(String, String)>,
+    content_type: String,
+) -> Vec<(String, String)> {
+    list.push(("content-type".to_owned(), content_type));
+    list
+}
+
+/// A network error this origin raises for a resource no browser could fetch.
+fn connect(reason: &str) -> NetError {
+    NetError::Transport(TransportError::Connect(reason.into()))
+}
+
+/// The in-memory byte mover under the real fetch core.
+struct FrameTransport {
+    origin: Arc<Origin>,
+}
+
+impl net::Transport for FrameTransport {
+    fn exchange(
+        &self,
+        request: WireRequest,
+        _budget: net::HopBudget,
+    ) -> Pin<Box<dyn Future<Output = Result<WireResponse, NetError>> + Send + '_>> {
+        Box::pin(async move {
+            let headers: Vec<(String, String)> = request
+                .headers
+                .iter()
+                .map(|(name, value)| (name.to_owned(), net::isomorphic_decode(value)))
+                .collect();
+            let served = self.origin.respond(&request.url, &headers)?;
+            let mut mapped = net::HeaderMap::new();
+            for (name, value) in served.headers {
+                mapped
+                    .insert(&name, value)
+                    .map_err(|_| connect("invalid response header"))?;
+            }
+            let body = http_body_util::Full::new(Bytes::from(served.body))
+                .map_err(|infallible| match infallible {})
+                .boxed_unsync();
+            Ok(WireResponse {
+                status: served.status,
+                headers: mapped,
+                body,
+                http2: false,
+            })
+        })
+    }
+}
+
+/// A host that maps every URL path to a file under one checkout.
+pub struct FsServices {
+    origin: Arc<Origin>,
+    /// The real fetch core. Every policy decision is this crate's; only the
+    /// one exchange underneath is the in-memory transport.
+    agent: net::Agent,
+    storage: Mutex<HashMap<(bool, StorageKey, String), String>>,
+}
+
+impl FsServices {
+    /// Creates a host rooted at `root`.
+    #[must_use]
+    pub fn new(root: PathBuf, content_types: HashMap<String, String>) -> Self {
+        let origin = Arc::new(Origin::new(root, content_types));
+        let transport = Arc::new(FrameTransport {
+            origin: Arc::clone(&origin),
+        });
+        Self {
+            origin,
+            agent: net::Agent::with_transport(net::AgentOptions::default(), transport),
+            storage: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Drops cookies, storage, and recorded inputs between files.
+    ///
+    /// A worker builds a fresh engine per file, so state a file leaves behind
+    /// must not reach the next one. Upstream also clears browser state between
+    /// tests.
+    pub fn clear(&self) {
+        self.agent.clear_cookies();
+        self.storage
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+        self.origin.clear();
+    }
+
+    /// Takes the paths read since the last [`Self::clear`].
+    #[must_use]
+    pub fn take_inputs(&self) -> Vec<PathBuf> {
+        self.origin.take_inputs()
+    }
+
+    /// Records `path` as an input without reading it.
+    pub fn record_file(&self, path: PathBuf) {
+        self.origin.record(path);
+    }
+
+    /// Reads the headers wptserve sends for `file`.
+    pub(crate) fn headers_for(&self, file: &Path, request: &RequestContext<'_>) -> Headers {
+        self.origin.headers_for(file, request)
+    }
+}
+
+/// Runs one dial through the real fetch core and buffers its body.
+fn fetch(agent: &net::Agent, request: &DialRequest) -> Result<DialOutcome, DialFailure> {
+    let initiator = request
+        .initiator
+        .to_url()
+        .map_or_else(|| net::about_blank().origin(), |url| url.origin());
+    let sheets = HashMap::new();
+    let outbound = outbound_request(request, &initiator, Instant::now() + DIAL_DEADLINE, &sheets)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| DialFailure::Connect)?;
+    runtime.block_on(async move {
+        let response = agent
+            .send(outbound)
+            .await
+            .map_err(|error| dial_failure(&error))?;
+        let head = DialHead::read(request, &response);
+        let body = if head.null_body() {
+            ResponseBody::Bytes(Vec::new())
+        } else {
+            let mut reader = response.into_body().await;
+            let mut bytes = Vec::new();
+            loop {
+                match reader.read_chunk().await {
+                    Ok(Some(chunk)) => {
+                        bytes.extend_from_slice(&chunk);
+                        if bytes.len() > MAX_RESPONSE_BODY_BYTES {
+                            return Err(DialFailure::Limit);
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(_) => return Err(DialFailure::Connect),
+                }
+            }
+            ResponseBody::Bytes(bytes)
+        };
+        Ok(head.into_outcome(body))
+    })
 }
 
 /// Appends `suffix` to a path that has no extension of its own, such as
@@ -311,34 +452,37 @@ fn set_header(list: &mut Vec<(String, String)>, name: &str, value: &str) {
 
 impl NetworkHost for FsServices {
     fn start_dial(&self, request: DialRequest, completion: DialCompletion) -> DialCancellation {
-        completion(self.serve(&request));
-        Box::new(|| {})
+        // The engine thread must not block on the fetch, and it owns a
+        // current-thread runtime that cannot be re-entered. A dedicated thread
+        // with its own runtime keeps the core async without a nested
+        // `block_on`.
+        let agent = self.agent.clone();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let thread_flag = Arc::clone(&cancelled);
+        let cancel_flag = Arc::clone(&cancelled);
+        std::thread::Builder::new()
+            .name("wpt-fetch".to_owned())
+            .spawn(move || {
+                let outcome = if thread_flag.load(Ordering::Acquire) {
+                    Err(DialFailure::Cancelled)
+                } else {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        fetch(&agent, &request)
+                    }))
+                    .unwrap_or(Err(DialFailure::Connect))
+                };
+                completion(outcome);
+            })
+            .expect("spawn the WPT fetch thread");
+        Box::new(move || cancel_flag.store(true, Ordering::Release))
     }
 
     fn cookies_for(&self, url: &Url) -> String {
-        self.jar().cookie_string(cookie_op(url))
+        self.agent.cookies_for(url)
     }
 
     fn set_cookie(&self, value: &str, url: &Url) {
-        let _stored = self.jar().store(value, cookie_op(url));
-    }
-}
-
-/// One `document.cookie` operation for `url`.
-///
-/// `now` is the wall clock, not the paused one: expiry is a property of the
-/// cookie, and a WPT file should not be able to observe it as time travel.
-/// The document is its own initiator, so a request with no initiator context
-/// (same-site) is the honest description of a script-set cookie.
-fn cookie_op(url: &Url) -> CookieOp<'_> {
-    CookieOp {
-        url,
-        now: SystemTime::now(),
-        kind: RetrievalKind::NonHttp,
-        initiator_kind: InitiatorKind::Fetch,
-        method_is_safe: true,
-        initiator: None,
-        cross_site_redirect: false,
+        self.agent.set_cookie(value, url);
     }
 }
 
@@ -466,7 +610,7 @@ mod tests {
 
     use renderer::{DialFailure, DialOutcome};
 
-    use super::{FsServices, RequestContext};
+    use super::{FsServices, RequestContext, fetch};
 
     fn root(name: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
@@ -488,17 +632,20 @@ mod tests {
     fn outcome(services: &FsServices, path: &str) -> Result<DialOutcome, DialFailure> {
         let url =
             url::Url::parse(&format!("http://web-platform.test:8000{path}")).expect("test URL");
-        services.serve(&renderer::DialRequest::new(
-            renderer::RequestPolicy::Image { crossorigin: None },
-            &url,
-            &url.origin(),
-        ))
+        fetch(
+            &services.agent,
+            &renderer::DialRequest::new(
+                renderer::RequestPolicy::Image { crossorigin: None },
+                &url,
+                &url.origin(),
+            ),
+        )
     }
 
     fn headers(services: &FsServices, url: &str) -> super::Headers {
         let url = url::Url::parse(url).expect("URL");
         services.headers_for(
-            &services.root.join("dir/data.txt"),
+            &services.origin.root.join("dir/data.txt"),
             &RequestContext {
                 url: &url,
                 headers: &[],
@@ -509,7 +656,7 @@ mod tests {
     #[test]
     fn a_static_file_is_served_and_a_handler_is_not() {
         let services = services("handler");
-        let root = services.root.clone();
+        let root = services.origin.root.clone();
         std::fs::write(root.join("dir/data.txt"), b"from a file").expect("file written");
         std::fs::write(
             root.join("dir/handler.py"),
@@ -538,7 +685,7 @@ mod tests {
     #[test]
     fn content_types_and_header_files_follow_wptserve() {
         let services = services("headers");
-        let root = services.root.clone();
+        let root = services.origin.root.clone();
         std::fs::write(root.join("dir/data.txt"), b"x").expect("file");
         // Directory headers apply to every file below the directory.
         std::fs::write(
@@ -568,7 +715,9 @@ mod tests {
         assert_eq!(headers.content_type, None);
         // The table is wptserve's: `txt` is text/plain, unknown is binary.
         assert_eq!(
-            services.content_type_for(std::path::Path::new("a.txt")),
+            services
+                .origin
+                .content_type_for(std::path::Path::new("a.txt")),
             "application/octet-stream",
             "only extensions the passed table names are known"
         );
@@ -578,7 +727,7 @@ mod tests {
     #[test]
     fn an_any_wrapper_is_served_from_its_script() {
         let services = services("wrapper");
-        let root = services.root.clone();
+        let root = services.origin.root.clone();
         std::fs::write(
             root.join("dir/multi.any.js"),
             "// META: global=window\ntest(() => {}, 'x');\n",

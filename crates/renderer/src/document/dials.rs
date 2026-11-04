@@ -98,12 +98,19 @@ impl DialLedger {
         self.queued.pop_front()
     }
 
-    /// Whether the document owes dial work: an unstarted dial, or a completion
-    /// that was sent and has not been adopted yet.
+    /// Whether the document owes dial work: an unstarted dial, a started dial
+    /// that has not completed, or a completion that was sent and has not been
+    /// adopted yet.
     ///
     /// A host that waits on this must not call it "nothing to do" while a
-    /// completion sits in the channel; the document cannot make progress
-    /// without running its completion task.
+    /// dial is in flight; the document cannot make progress without running its
+    /// completion task.
+    pub(crate) fn has_pending(&self) -> bool {
+        !self.queued.is_empty()
+            || !self.in_flight.is_empty()
+            || self.pending.load(Ordering::Acquire) > 0
+    }
+
     pub(crate) fn has_queued(&self) -> bool {
         !self.queued.is_empty() || self.pending.load(Ordering::Acquire) > 0
     }
