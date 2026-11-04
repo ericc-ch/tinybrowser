@@ -36,12 +36,76 @@ const SUBDOMAINS: [&str; 5] = [
     "xn--lve-6lad",
 ];
 
-/// Replaces every `{{...}}` expression in `text`.
+/// How a substituted value is escaped in the payload.
+///
+/// wptserve picks this from the response's extension: markup gets HTML
+/// escaping, every other pipe (`sub(none)`) gets the raw value
+/// (`wptserve/handlers.py::wrap_pipeline`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Escape {
+    /// `html.escape(value, quote=True)`.
+    Html,
+    /// The value as the template produced it.
+    None,
+}
+
+impl Escape {
+    /// The escape mode wptserve uses for a path's extension.
+    #[must_use]
+    pub fn for_path(path: &str) -> Self {
+        let extension = path.rsplit('.').next().unwrap_or_default();
+        if matches!(extension, "html" | "htm" | "xht" | "xhtml" | "xml" | "svg") {
+            Self::Html
+        } else {
+            Self::None
+        }
+    }
+
+    /// Applies the mode to one expanded value.
+    fn apply(self, value: &str) -> String {
+        match self {
+            Self::None => value.to_owned(),
+            Self::Html => {
+                let mut out = String::with_capacity(value.len());
+                for character in value.chars() {
+                    match character {
+                        '&' => out.push_str("&amp;"),
+                        '<' => out.push_str("&lt;"),
+                        '>' => out.push_str("&gt;"),
+                        '"' => out.push_str("&quot;"),
+                        // `html.escape(quote=True)` uses this named form.
+                        '\'' => out.push_str("&#x27;"),
+                        other => out.push(other),
+                    }
+                }
+                out
+            }
+        }
+    }
+}
+
+/// Replaces every `{{...}}` expression in `text`, without escaping.
+///
+/// This is the header form: wptserve expands `.sub.headers` with
+/// `template(..., escape_type="none")`.
 ///
 /// # Errors
 ///
 /// An unterminated expression, or one this module does not implement.
 pub fn substitute(text: &str, context: &Context<'_>) -> Result<String, String> {
+    substitute_escaped(text, context, Escape::None)
+}
+
+/// Replaces every `{{...}}` expression in `text`, escaping each value.
+///
+/// # Errors
+///
+/// An unterminated expression, or one this module does not implement.
+pub fn substitute_escaped(
+    text: &str,
+    context: &Context<'_>,
+    escape: Escape,
+) -> Result<String, String> {
     let mut out = String::with_capacity(text.len());
     let mut variables: HashMap<String, String> = HashMap::new();
     let mut rest = text;
@@ -51,7 +115,8 @@ pub fn substitute(text: &str, context: &Context<'_>) -> Result<String, String> {
         let Some(end) = after.find("}}") else {
             return Err(format!("unterminated template expression in {rest:?}"));
         };
-        out.push_str(&evaluate(after[..end].trim(), context, &mut variables)?);
+        let expanded = evaluate(after[..end].trim(), context, &mut variables)?;
+        out.push_str(&escape.apply(&expanded));
         rest = &after[end + 2..];
     }
     out.push_str(rest);
@@ -200,17 +265,22 @@ fn expect_arguments(head: &str, selectors: &[Selector], expected: &str) -> Resul
 
 /// The port serve.py gives a scheme and index.
 ///
-/// `http` is the only scheme this lane serves. The rest are placeholders for
-/// header values: a test that actually dials them cannot be run here either
-/// way, but both sides of the URL it builds agree on the number.
+/// The table is the one the `WebDriver` lane runs against
+/// (`tools/wptrunner/wptrunner/environment.py::TestEnvironment.build_config`);
+/// the standalone `serve.py` defaults differ in the second `http` port and in
+/// every `auto` scheme.
 fn port(scheme: &str, index: &str) -> Option<String> {
     let ports: &[u16] = match scheme {
-        "http" => &[8000],
+        "http" => &[8000, 8001],
+        "http-local" => &[8002],
+        "http-public" => &[8003],
         "https" => &[8443, 8444],
+        "https-local" => &[8445],
+        "https-public" => &[8446],
+        "ws" => &[8888],
+        "wss" => &[8889],
         "h2" => &[9000],
-        "ws" => &[8080],
-        "wss" => &[8443],
-        "webtransport-h3" => &[9021],
+        "webtransport-h3" => &[11000],
         "dns" => &[8053],
         _ => return None,
     };

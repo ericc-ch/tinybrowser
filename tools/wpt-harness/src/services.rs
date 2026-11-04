@@ -32,11 +32,57 @@ use renderer::{
 };
 use url::Url;
 
+use crate::sidecar::Sidecar;
 use crate::template::{self, Context};
 use crate::wrapper::Wrapper;
 
 /// The origin wptserve gives ordinary test documents.
 pub const BASE: &str = "http://web-platform.test:8000/";
+
+/// The origin for a test whose filename carries the `https` flag.
+pub const HTTPS_BASE: &str = "https://web-platform.test:8443/";
+
+/// The origin for an `h2` test: `server_url` maps the protocol to TLS on
+/// wptserve's h2 port (`tools/serve/serve.py`).
+pub const H2_BASE: &str = "https://web-platform.test:9000/";
+
+/// The origin a test's filename flags select.
+///
+/// wptrunner reads the flags out of the last path segment (`foo.https.any.html`
+/// carries `https` and `any`) plus the `wpt_flags` query parameter, and serves
+/// `https`, `serviceworker`, and `serviceworker-module` tests over TLS
+/// (`tools/manifest/item.py::Item.https`, `tools/wptrunner/wptrunner/wpttest.py::
+/// server_protocol`). The in-process transport answers every host and scheme
+/// from the checkout, so the origin only has to match what the page observes.
+#[must_use]
+pub fn base_for(relative: &str) -> &'static str {
+    let (path, query) = relative.split_once('?').unwrap_or((relative, ""));
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let mut flags: Vec<String> = Vec::new();
+    let mut segments = name.split('.');
+    // The first segment is the test's name and the last is the extension.
+    let _ = segments.next();
+    let mut tail: Vec<&str> = segments.collect();
+    let _ = tail.pop();
+    flags.extend(tail.into_iter().map(str::to_owned));
+    for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+        if key == "wpt_flags" {
+            flags.extend(value.split('|').map(str::to_owned));
+        }
+    }
+    if flags.iter().any(|flag| flag == "h2") {
+        H2_BASE
+    } else if flags.iter().any(|flag| {
+        matches!(
+            flag.as_str(),
+            "https" | "serviceworker" | "serviceworker-module"
+        )
+    }) {
+        HTTPS_BASE
+    } else {
+        BASE
+    }
+}
 
 /// The per-dial deadline the harness gives the fetch core. The in-memory
 /// transport never needs it, but a request that names one keeps the core on the
@@ -66,6 +112,16 @@ const REPORT: &str = r#"
          message_events: ["completion"]});
 })();
 "#;
+
+/// Why the in-memory origin could not answer a request.
+enum Unserved {
+    /// A handler route: wptserve runs a program for this path.
+    Handler,
+    /// No file at this path. wptserve answers 404; the sidecar does too.
+    Missing,
+    /// The request itself is refused before any server sees it.
+    Refused(NetError),
+}
 
 /// The headers and content type wptserve answers one resource with.
 pub(crate) struct Headers {
@@ -187,10 +243,10 @@ impl Origin {
     }
 
     /// Answers one request from the checkout.
-    fn respond(&self, url: &Url, request_headers: &[(String, String)]) -> Result<Served, NetError> {
+    fn respond(&self, url: &Url, request_headers: &[(String, String)]) -> Result<Served, Unserved> {
         let path = percent_encoding::percent_decode_str(url.path())
             .decode_utf8()
-            .map_err(|_| connect("malformed path"))?;
+            .map_err(|_| Unserved::Refused(connect("malformed path")))?;
         if path == "/resources/testharnessreport.js" {
             return Ok(Served {
                 status: 200,
@@ -205,26 +261,28 @@ impl Origin {
             .components()
             .any(|component| component == Component::ParentDir)
         {
-            return Err(connect("path escapes the checkout"));
+            return Err(Unserved::Refused(connect("path escapes the checkout")));
         }
-        // wptserve executes a `.py` handler for such a path. Serving the
-        // handler's own source instead would hand a test a 200 body no browser
-        // ever sees, so the resource is a network error in this lane until the
-        // handlers are implemented.
+        // wptserve executes a `.py` handler for such a path; the file is a
+        // program, not a response body.
         if relative
             .extension()
             .is_some_and(|extension| extension == "py")
         {
-            return Err(connect("wptserve handler is not implemented"));
+            return Err(Unserved::Handler);
         }
         let context = RequestContext {
             url,
             headers: request_headers,
         };
-        // `.any.html` and `.window.html` are synthesized from their script.
+        // `.any.html` and `.window.html` are synthesized from their script. A
+        // wrapper's source can be missing too, and then wptserve answers 404
+        // just as it does for any absent file.
         if let Some((wrapper, source)) = Wrapper::for_url(&path) {
             let file = self.root.join(&source);
-            let body = std::fs::read(&file).map_err(|_| connect("missing wrapped script"))?;
+            let Ok(body) = std::fs::read(&file) else {
+                return Err(Unserved::Missing);
+            };
             let headers = Self::headers_for(&file, &context);
             let js_url = &url.path()[..url.path().len() - ".html".len()];
             let html = wrapper.render(&body, &format!("{js_url}.js"));
@@ -238,11 +296,43 @@ impl Origin {
             });
         }
         let file = self.root.join(relative);
-        let body = std::fs::read(&file).map_err(|_| connect("missing file"))?;
+        let Ok(body) = std::fs::read(&file) else {
+            return Err(Unserved::Missing);
+        };
         let headers = Self::headers_for(&file, &context);
         let content_type = headers
             .content_type
+            .clone()
             .unwrap_or_else(|| self.content_type_for(&file));
+        // A `.sub.` path is a wptserve pipe: the body's `{{...}}` expressions
+        // are expanded against the request, with the escaping its extension
+        // selects (`wptserve/handlers.py::wrap_pipeline`). A body this module
+        // cannot expand is a server error, exactly as wptserve raises and
+        // answers 500.
+        let body = if path.contains(".sub.") {
+            let text = String::from_utf8_lossy(&body);
+            let template_context = Context {
+                url: context.url,
+                headers: context.headers,
+            };
+            match template::substitute_escaped(
+                &text,
+                &template_context,
+                template::Escape::for_path(&path),
+            ) {
+                Ok(expanded) => expanded.into_bytes(),
+                Err(error) => {
+                    eprintln!("wpt-harness: {path}: {error}");
+                    return Ok(Served {
+                        status: 500,
+                        headers: with_content_type(headers.list, content_type),
+                        body: error.into_bytes(),
+                    });
+                }
+            }
+        } else {
+            body
+        };
         Ok(Served {
             status: 200,
             headers: with_content_type(headers.list, content_type),
@@ -268,6 +358,8 @@ fn connect(reason: &str) -> NetError {
 /// The in-memory byte mover under the real fetch core.
 struct FrameTransport {
     origin: Arc<Origin>,
+    /// The wptserve process that runs handler routes, when the run has one.
+    sidecar: Option<Sidecar>,
 }
 
 impl net::Transport for FrameTransport {
@@ -282,7 +374,19 @@ impl net::Transport for FrameTransport {
                 .iter()
                 .map(|(name, value)| (name.to_owned(), net::isomorphic_decode(value)))
                 .collect();
-            let served = self.origin.respond(&request.url, &headers)?;
+            let served = match self.origin.respond(&request.url, &headers) {
+                Ok(served) => served,
+                Err(Unserved::Refused(error)) => return Err(error),
+                Err(Unserved::Handler | Unserved::Missing) => {
+                    let Some(sidecar) = self.sidecar else {
+                        // Without a sidecar a handler is a network error, not
+                        // its own source, and an absent file is a failed
+                        // fetch rather than a 404.
+                        return Err(connect("wptserve is not running"));
+                    };
+                    return sidecar.exchange(&request);
+                }
+            };
             let mut mapped = net::HeaderMap::new();
             for (name, value) in served.headers {
                 mapped
@@ -316,11 +420,19 @@ pub struct FsServices {
 
 impl FsServices {
     /// Creates a host rooted at `root`.
+    ///
+    /// `sidecar` is the wptserve process that answers handler routes and 404s;
+    /// without one, those requests are network errors.
     #[must_use]
-    pub fn new(root: PathBuf, content_types: HashMap<String, String>) -> Self {
+    pub fn new(
+        root: PathBuf,
+        content_types: HashMap<String, String>,
+        sidecar: Option<Sidecar>,
+    ) -> Self {
         let origin = Arc::new(Origin::new(root, content_types));
         let transport = Arc::new(FrameTransport {
             origin: Arc::clone(&origin),
+            sidecar,
         });
         Self {
             #[cfg(test)]
@@ -585,6 +697,7 @@ mod tests {
         FsServices::new(
             root(name),
             HashMap::from([("html".to_owned(), "text/html".to_owned())]),
+            None,
         )
     }
 
@@ -681,6 +794,65 @@ mod tests {
             "only extensions the passed table names are known"
         );
         std::fs::remove_dir_all(&root).expect("root removed");
+    }
+
+    #[test]
+    fn a_sub_body_is_expanded_with_wptserve_escaping() {
+        let services = services("sub-body");
+        let root = services.origin.root.clone();
+        std::fs::write(
+            root.join("dir/t.sub.html"),
+            b"<p>{{host}}</p><p>{{GET[q]}}</p>",
+        )
+        .expect("template body");
+        std::fs::write(root.join("dir/plain.txt"), b"{{host}}").expect("plain body");
+        std::fs::write(root.join("dir/raw.sub.txt"), b"{{GET[q]}}").expect("raw template");
+
+        let served = outcome(&services, "/dir/t.sub.html?q=a%26b%3Cc").expect("template");
+        let renderer::ResponseBody::Bytes(bytes) = served.body else {
+            panic!("a template has a byte body");
+        };
+        assert_eq!(
+            String::from_utf8(bytes).expect("UTF-8"),
+            "<p>web-platform.test</p><p>a&amp;b&lt;c</p>",
+            "markup escapes each substituted value"
+        );
+
+        let served = outcome(&services, "/dir/raw.sub.txt?q=a%26b").expect("raw template");
+        let renderer::ResponseBody::Bytes(bytes) = served.body else {
+            panic!("a template has a byte body");
+        };
+        assert_eq!(
+            String::from_utf8(bytes).expect("UTF-8"),
+            "a&b",
+            "a non-markup pipe does not escape"
+        );
+
+        let served = outcome(&services, "/dir/plain.txt").expect("plain body");
+        let renderer::ResponseBody::Bytes(bytes) = served.body else {
+            panic!("a plain file has a byte body");
+        };
+        assert_eq!(
+            String::from_utf8(bytes).expect("UTF-8"),
+            "{{host}}",
+            "a file without .sub. is not a template"
+        );
+        std::fs::remove_dir_all(&root).expect("root removed");
+    }
+
+    #[test]
+    fn a_test_filename_flag_selects_its_origin() {
+        use super::{BASE, H2_BASE, HTTPS_BASE, base_for};
+
+        assert_eq!(base_for("dom/nodes/plain.html"), BASE);
+        assert_eq!(base_for("dom/nodes/thing.https.html"), HTTPS_BASE);
+        assert_eq!(base_for("dom/nodes/thing.https.any.html?1-10"), HTTPS_BASE);
+        assert_eq!(base_for("dom/nodes/thing.h2.html"), H2_BASE);
+        assert_eq!(base_for("websockets/thing.any.html?wpt_flags=h2"), H2_BASE);
+        assert_eq!(
+            base_for("dom/nodes/thing.any.html?wpt_flags=https"),
+            HTTPS_BASE
+        );
     }
 
     #[test]

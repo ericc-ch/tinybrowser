@@ -81,6 +81,18 @@ impl TestCase {
     }
 }
 
+/// How a run narrows the full selection.
+pub struct Selection {
+    /// Skip the first `offset` tests of the sorted selection.
+    pub offset: usize,
+    /// Keep at most `limit` tests.
+    pub limit: usize,
+    /// `(index, count)` of a wptrunner-style directory-hash chunk.
+    pub shard: Option<(usize, usize)>,
+    /// Drop `testdriver` tests; the `WebDriver` lane runs those.
+    pub exclude_testdriver: bool,
+}
+
 /// Reads the manifest's testharness, crashtest, and reftest items below the
 /// requested paths.
 ///
@@ -95,9 +107,8 @@ impl TestCase {
 pub fn select(
     root: &Path,
     paths: &[String],
-    offset: usize,
-    limit: usize,
     content_types: &HashMap<String, String>,
+    selection: &Selection,
 ) -> io::Result<Vec<TestCase>> {
     let manifest = read_manifest(root)?;
     let mut selected: Vec<Item> = Vec::new();
@@ -115,6 +126,18 @@ pub fn select(
     }
     selected.sort_by(|left, right| left.relative.cmp(&right.relative));
     selected.dedup_by(|left, right| left.relative == right.relative);
+    // A chunk keeps every variant of one source together (an `.any.js` source
+    // produces several URLs), and the variants' ids are the source path.
+    // wptrunner hashes the directory instead, to keep tests that share
+    // server-side state in one job; this lane's origin is read-only and every
+    // file gets a fresh engine, so hashing the source itself spreads the work
+    // evenly without giving that up.
+    if let Some((index, count)) = selection.shard {
+        selected.retain(|item| chunk_of_source(&item.source, count) == index);
+    }
+    if selection.exclude_testdriver {
+        selected.retain(|item| item.kind != Kind::Testdriver);
+    }
     if selected.is_empty() {
         return Err(io::Error::other(format!(
             "no manifest test matches {}",
@@ -125,10 +148,29 @@ pub fn select(
     // can shrink a slice that crashes the engine without changing what the
     // slice means.
     let mut cases = Vec::new();
-    for item in selected.into_iter().skip(offset).take(limit) {
+    for item in selected
+        .into_iter()
+        .skip(selection.offset)
+        .take(selection.limit)
+    {
         cases.push(item.materialize(root, content_types)?);
     }
     Ok(cases)
+}
+
+/// The chunk a test's source belongs to.
+///
+/// FNV-1a over the source path; only stability and spread matter, since the
+/// chunks are this lane's own.
+fn chunk_of_source(source: &str, count: usize) -> usize {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in source.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    // `count` is at least 1 (the argument parser rejects zero) and the modulo
+    // is below it, so the conversion cannot fail on any target this runs on.
+    usize::try_from(hash % u64::try_from(count).unwrap_or(u64::MAX)).unwrap_or(0)
 }
 
 /// A test the manifest listed that still has to be matched and materialized.
@@ -446,7 +488,17 @@ mod tests {
     use std::collections::HashMap;
     use std::fs;
 
-    use super::{Kind, Relation, select};
+    use super::{Kind, Relation, Selection, select};
+
+    /// The whole selection: no shard, no window, nothing excluded.
+    fn all() -> Selection {
+        Selection {
+            offset: 0,
+            limit: usize::MAX,
+            shard: None,
+            exclude_testdriver: false,
+        }
+    }
 
     /// A checkout with a manifest listing one testharness file, one `.any.js`
     /// source, a worker variant, a jsshell variant, a crashtest, and a helper
@@ -474,6 +526,11 @@ mod tests {
         )
         .expect("window source");
         fs::write(
+            root.join("dom/nodes/driver.html"),
+            "<script src=/resources/testharness.js></script>",
+        )
+        .expect("testdriver test");
+        fs::write(
             root.join("dom/nodes/resources/helper.html"),
             "<p>helper</p>",
         )
@@ -494,6 +551,7 @@ mod tests {
                 "testharness": {
                     "dom": {"nodes": {
                         "plain.html": ["p", [null, {}]],
+                        "driver.html": ["d", [null, {"testdriver": true}]],
                         "multi.any.js": ["m",
                             [null, {"jsshell": true}],
                             ["dom/nodes/multi.any.html", {"timeout": "long"}],
@@ -535,18 +593,20 @@ mod tests {
     #[test]
     fn the_manifest_decides_type_timeout_and_wrapper() {
         let root = checkout("all");
-        let cases =
-            select(&root, &["dom/nodes".into()], 0, usize::MAX, &types()).expect("selection");
+        let cases = select(&root, &["dom/nodes".into()], &types(), &all()).expect("selection");
         let ids: Vec<&str> = cases.iter().map(|case| case.relative.as_str()).collect();
         assert_eq!(
             ids,
             vec![
+                "dom/nodes/driver.html",
                 "dom/nodes/multi.any.html",
                 "dom/nodes/plain.html",
                 "dom/nodes/window.window.html",
             ],
             "the worker wrapper and the jsshell variant are not browser tests"
         );
+        assert_eq!(cases[0].kind, Kind::Testdriver);
+        let cases = &cases[1..];
         let multi = &cases[0];
         assert_eq!(multi.kind, Kind::Testharness);
         assert!(multi.long_timeout, "the manifest marks the long timeout");
@@ -570,8 +630,8 @@ mod tests {
 
         // A crashtest is a crashtest, and its testdriver flag is irrelevant:
         // the executor only loads the page.
-        let crash = select(&root, &["crashtests".into()], 0, usize::MAX, &types())
-            .expect("crashtest selection");
+        let crash =
+            select(&root, &["crashtests".into()], &types(), &all()).expect("crashtest selection");
         assert_eq!(crash.len(), 1);
         assert_eq!(crash[0].kind, Kind::Crashtest);
         assert!(crash[0].long_timeout);
@@ -581,7 +641,7 @@ mod tests {
     #[test]
     fn a_reftest_carries_its_references_and_fuzzy_tolerance() {
         let root = checkout("reftest");
-        let cases = select(&root, &["css".into()], 0, usize::MAX, &types()).expect("selection");
+        let cases = select(&root, &["css".into()], &types(), &all()).expect("selection");
         assert_eq!(cases.len(), 1);
         let case = &cases[0];
         assert_eq!(case.kind, Kind::Reftest);
@@ -609,8 +669,58 @@ mod tests {
             serde_json::to_vec(&manifest).expect("manifest"),
         )
         .expect("manifest written");
-        let cases = select(&root, &["t.html".into()], 0, usize::MAX, &types()).expect("selection");
+        let cases = select(&root, &["t.html".into()], &types(), &all()).expect("selection");
         assert_eq!(cases[0].kind, Kind::Testdriver);
+        fs::remove_dir_all(&root).expect("checkout removed");
+    }
+
+    #[test]
+    fn chunks_partition_the_selection_and_testdriver_can_be_left_out() {
+        let root = checkout("chunks");
+        let paths = ["dom".to_string(), "css".into(), "crashtests".into()];
+        let whole = select(&root, &paths, &types(), &all()).expect("selection");
+
+        // Every case lands in exactly one chunk, and the two chunks together
+        // are the whole selection.
+        let mut seen = Vec::new();
+        for index in 0..2 {
+            let shard = Selection {
+                offset: 0,
+                limit: usize::MAX,
+                shard: Some((index, 2)),
+                exclude_testdriver: false,
+            };
+            let cases = select(&root, &paths, &types(), &shard).expect("chunk");
+            seen.extend(cases.into_iter().map(|case| case.relative));
+        }
+        seen.sort();
+        let mut expected: Vec<String> = whole.iter().map(|case| case.relative.clone()).collect();
+        expected.sort();
+        assert_eq!(seen, expected);
+
+        // The testdriver file is selected by default and dropped on request.
+        let mut without = select(
+            &root,
+            &paths,
+            &types(),
+            &Selection {
+                offset: 0,
+                limit: usize::MAX,
+                shard: None,
+                exclude_testdriver: true,
+            },
+        )
+        .expect("without testdriver");
+        assert!(
+            !without.iter().any(|case| case.kind == Kind::Testdriver),
+            "the excluded kind is gone"
+        );
+        without.sort_by(|left, right| left.relative.cmp(&right.relative));
+        assert!(
+            expected
+                .iter()
+                .any(|relative| relative == "dom/nodes/driver.html")
+        );
         fs::remove_dir_all(&root).expect("checkout removed");
     }
 
@@ -618,46 +728,39 @@ mod tests {
     fn paths_select_files_directories_and_sources() {
         let root = checkout("paths");
         assert_eq!(
-            select(
-                &root,
-                &["dom/nodes/plain.html".into()],
-                0,
-                usize::MAX,
-                &types()
-            )
-            .expect("file")
-            .len(),
+            select(&root, &["dom/nodes/plain.html".into()], &types(), &all())
+                .expect("file")
+                .len(),
             1
         );
         assert_eq!(
-            select(
-                &root,
-                &["dom/nodes/multi.any.js".into()],
-                0,
-                usize::MAX,
-                &types()
-            )
-            .expect("source name")
-            .len(),
+            select(&root, &["dom/nodes/multi.any.js".into()], &types(), &all())
+                .expect("source name")
+                .len(),
             1
         );
         assert_eq!(
             select(
                 &root,
                 &["dom/nodes/multi.any.html".into()],
-                0,
-                usize::MAX,
-                &types()
+                &types(),
+                &all()
             )
             .expect("test URL")
             .len(),
             1
         );
         // A slice keeps its place in the sorted selection.
-        let sliced = select(&root, &["dom/nodes".into()], 1, 1, &types()).expect("slice");
+        let window = Selection {
+            offset: 1,
+            limit: 1,
+            shard: None,
+            exclude_testdriver: false,
+        };
+        let sliced = select(&root, &["dom/nodes".into()], &types(), &window).expect("slice");
         assert_eq!(sliced.len(), 1);
-        assert_eq!(sliced[0].relative, "dom/nodes/plain.html");
-        assert!(select(&root, &["missing".into()], 0, 10, &types()).is_err());
+        assert_eq!(sliced[0].relative, "dom/nodes/multi.any.html");
+        assert!(select(&root, &["missing".into()], &types(), &all()).is_err());
         fs::remove_dir_all(&root).expect("checkout removed");
     }
 }

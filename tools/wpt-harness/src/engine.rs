@@ -8,7 +8,7 @@ use renderer::{EmbeddedRenderer, Mount, RendererEvent, ResponseHead, TabError};
 use serde_json::Value;
 use url::Url;
 
-use crate::services::{BASE, FsServices};
+use crate::services::FsServices;
 pub use wpt_report::Subtest;
 use wpt_report::SubtestStatus;
 
@@ -91,8 +91,13 @@ impl Session {
         content_types: HashMap<String, String>,
         budgets: Budgets,
         fonts: &renderer::Fonts,
+        sidecar: Option<crate::sidecar::Sidecar>,
     ) -> Self {
-        let services = Arc::new(FsServices::new(root.to_path_buf(), content_types.clone()));
+        let services = Arc::new(FsServices::new(
+            root.to_path_buf(),
+            content_types.clone(),
+            sidecar,
+        ));
         let renderer = EmbeddedRenderer::with_fonts(
             Arc::clone(&services) as Arc<dyn renderer::BrowserServices>,
             net::ValidIdentity::default(),
@@ -174,8 +179,11 @@ impl Session {
         // file must not be read as this one's.
         let _stale = self.renderer.take_events();
         self.services.clear();
-        let url = Url::parse(&format!("{BASE}{relative}"))
-            .map_err(|error| Failure::Error(format!("bad url: {error}")))?;
+        let url = Url::parse(&format!(
+            "{}{relative}",
+            crate::services::base_for(relative)
+        ))
+        .map_err(|error| Failure::Error(format!("bad url: {error}")))?;
         let path = self.root.join(source);
         let headers = crate::services::FsServices::headers_for(
             &path,
@@ -185,6 +193,26 @@ impl Session {
             },
         );
         let content_type = headers.content_type.unwrap_or(fallback_content_type);
+        // The main document is mounted from the bytes on disk, so the
+        // transport's `.sub.` pipe never sees it. Apply the same expansion a
+        // subresource gets; a page whose own body kept `{{host}}` would fail
+        // every test that reads its own source.
+        let body = if url.path().contains(".sub.") {
+            let text = String::from_utf8_lossy(&body);
+            let context = crate::template::Context {
+                url: &url,
+                headers: &[],
+            };
+            crate::template::substitute_escaped(
+                &text,
+                &context,
+                crate::template::Escape::for_path(url.path()),
+            )
+            .map_err(|error| Failure::Error(format!("{relative}: {error}")))?
+            .into_bytes()
+        } else {
+            body
+        };
         let head = ResponseHead::http(200, url, Some(content_type), &headers.list);
         self.renderer
             .mount_bounded(
@@ -541,6 +569,12 @@ fn parse_result(raw: &str) -> Result<Completed, Failure> {
         .map(|tests| tests.iter().map(parse_subtest).collect::<Result<_, _>>())
         .transpose()?
         .unwrap_or_default();
+    // The status is the *harness* verdict, not the test's: `OK` with a
+    // failing subtest is still an `OK` file in a wptreport. `ERROR` is a
+    // harness-level failure (a script threw during setup, so no subtest ever
+    // ran), and wptrunner writes it as `ERROR` rather than as a failing
+    // subtest. The codes are the ones `TestharnessResultConverter` maps
+    // (`tools/wptrunner/wptrunner/executors/base.py`).
     let status = match harness_status {
         0 if subtests
             .iter()
@@ -548,12 +582,12 @@ fn parse_result(raw: &str) -> Result<Completed, Failure> {
         {
             Status::Pass
         }
-        0 | 1 => Status::Fail,
+        0 => Status::Fail,
+        1 => Status::Error,
         2 => Status::Timeout,
-        // `NOTRUN` and `PRECONDITION_FAILED`: the harness stopped before the
-        // file ran, or optional features the test needs are absent. wptrunner
-        // reports both as skips.
-        3 | 4 => Status::Skip,
+        // `PRECONDITION_FAILED`: optional features the test needs are absent.
+        // wptrunner reports it as a skip, and the score counts it as one.
+        3 => Status::Skip,
         other => {
             return Err(Failure::Error(format!(
                 "harness reported unknown status code {other}"

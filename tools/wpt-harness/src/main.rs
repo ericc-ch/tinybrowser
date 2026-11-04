@@ -11,6 +11,7 @@
 
 mod engine;
 mod services;
+mod sidecar;
 mod suite;
 mod template;
 mod wrapper;
@@ -35,9 +36,82 @@ struct Options {
     list: bool,
     limit: usize,
     offset: usize,
-    virtual_time: bool,
+    /// `(index, count)` of the source-hash chunk to run.
+    shard: Option<(usize, usize)>,
+    /// Drop `testdriver` tests; the `WebDriver` lane runs them.
+    exclude_testdriver: bool,
+    clock: Clock,
     budgets: engine::Budgets,
     content_types: HashMap<String, String>,
+    sidecar: Option<sidecar::Sidecar>,
+}
+
+/// Which clock a worker's Tokio runtime uses.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Clock {
+    /// Paused: a timer wait costs no wall time.
+    Paused,
+    /// The wall clock, for reproducing a hang.
+    Real,
+}
+
+impl Options {
+    /// The defaults every flag adjusts.
+    fn defaults() -> Self {
+        Self {
+            root: suite::default_root(),
+            paths: Vec::new(),
+            jobs: std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
+            report: None,
+            baseline: None,
+            verbose: false,
+            list: false,
+            limit: usize::MAX,
+            offset: 0,
+            shard: None,
+            exclude_testdriver: false,
+            clock: Clock::Paused,
+            // Replaced by the required flags below. Zero is never a real
+            // budget: `for_case` would time out before mounting, and the flag
+            // parser rejects it.
+            budgets: engine::Budgets {
+                normal: Duration::ZERO,
+                long: Duration::ZERO,
+            },
+            content_types: HashMap::new(),
+            sidecar: None,
+        }
+    }
+
+    /// Rejects a command line that cannot run.
+    fn validate(mut self) -> Result<Self, String> {
+        if self.paths.is_empty() {
+            return Err("pass at least one test path".into());
+        }
+        if self.budgets.normal.is_zero() || self.budgets.long.is_zero() {
+            return Err("pass --normal-budget and --long-budget in seconds \
+                 (cli.py computes them from tools/wpt/timeouts.py)"
+                .into());
+        }
+        if self.content_types.is_empty() {
+            return Err("pass --content-types with wptserve's extension map \
+                 (cli.py reads it from wptserve.constants)"
+                .into());
+        }
+        if let Some((index, count)) = self.shard {
+            if count < 1 {
+                return Err("pass --total-chunks with a count of at least 1".into());
+            }
+            if index < 1 || index > count {
+                return Err(format!(
+                    "--this-chunk must be in 1..={count} with --total-chunks {count}, got {index}"
+                ));
+            }
+            // Stored zero-based for the selection filter.
+            self.shard = Some((index - 1, count));
+        }
+        Ok(self)
+    }
 }
 
 fn main() {
@@ -59,9 +133,13 @@ fn main() {
     let cases = match suite::select(
         &options.root,
         &options.paths,
-        options.offset,
-        options.limit,
         &options.content_types,
+        &suite::Selection {
+            offset: options.offset,
+            limit: options.limit,
+            shard: options.shard,
+            exclude_testdriver: options.exclude_testdriver,
+        },
     ) {
         Ok(cases) => cases,
         Err(error) => {
@@ -128,9 +206,10 @@ fn run_selected(options: &Options, cases: &[TestCase]) -> Vec<Outcome> {
         &options.root,
         cases,
         options.jobs,
-        options.virtual_time,
+        options.clock,
         options.budgets,
         &options.content_types,
+        options.sidecar,
     )
 }
 
@@ -139,9 +218,10 @@ fn run_all(
     root: &std::path::Path,
     cases: &[TestCase],
     jobs: usize,
-    virtual_time: bool,
+    clock: Clock,
     budgets: engine::Budgets,
     content_types: &HashMap<String, String>,
+    sidecar: Option<sidecar::Sidecar>,
 ) -> Vec<Outcome> {
     if cases.is_empty() {
         return Vec::new();
@@ -156,7 +236,7 @@ fn run_all(
             scope.spawn(move || {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_time()
-                    .start_paused(virtual_time)
+                    .start_paused(clock == Clock::Paused)
                     .build()
                     .unwrap_or_else(|error| {
                         eprintln!("wpt-harness: cannot create runtime: {error}");
@@ -172,14 +252,14 @@ fn run_all(
                     };
                     let started = Instant::now();
                     let mut session =
-                        engine::Session::new(root, content_types.clone(), budgets, &fonts);
+                        engine::Session::new(root, content_types.clone(), budgets, &fonts, sidecar);
                     // Layout, paint, and the bindings can panic on a hostile
                     // page. A panic is this file's ERROR, not the end of the
                     // run; the engine that saw it is abandoned rather than
                     // dropped, because dropping a half-torn heap can panic
                     // again during unwinding.
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        runtime.block_on(session.run(case, virtual_time))
+                        runtime.block_on(session.run(case, clock == Clock::Paused))
                     }));
                     let outcome = result.unwrap_or_else(|_| {
                         Box::leak(Box::new(session));
@@ -254,9 +334,13 @@ Runs WPT testharness and crashtest files in-process.
   --baseline PATH   compare with an earlier --report and exit 1 on regressions
   --limit N         stop after N selected files
   --offset N        skip the first N selected files (shards)
+  --total-chunks N  split the selection into N directory-hashed chunks
+  --this-chunk K    run chunk K of N (1-based, with --total-chunks)
+  --exclude-testdriver  leave testdriver files to the WebDriver lane
   --normal-budget S wall-clock seconds before a normal file is TIMEOUT
   --long-budget S  wall-clock seconds before a long-timeout file is TIMEOUT
   --content-types JSON  wptserve's extension-to-content-type map
+  --sidecar HOST:PORT  wptserve process for `.py` handler routes
   --real-time       use the wall clock instead of the paused clock
   --verbose         print failing tests and the ten slowest files
   --list            print the selected files and exit
@@ -275,87 +359,91 @@ fn path_arg(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<PathB
 }
 
 fn parse_args() -> Result<Options, String> {
-    let mut options = Options {
-        root: suite::default_root(),
-        paths: Vec::new(),
-        jobs: std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
-        report: None,
-        baseline: None,
-        verbose: false,
-        list: false,
-        limit: usize::MAX,
-        offset: 0,
-        virtual_time: true,
-        // Replaced by the required flags below. Zero is never a real budget:
-        // `for_case` would time out before mounting, and the flag parser
-        // rejects it.
-        budgets: engine::Budgets {
-            normal: Duration::ZERO,
-            long: Duration::ZERO,
-        },
-        content_types: HashMap::new(),
-    };
+    let mut options = Options::defaults();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "-h" | "--help" => {
-                print!("{HELP}");
-                std::process::exit(0);
-            }
-            "--wpt-root" => options.root = path_arg(&mut args, "--wpt-root")?,
-            "--jobs" => {
-                options.jobs = args
-                    .next()
-                    .ok_or("--jobs needs a number")?
-                    .parse()
-                    .map_err(|_| "--jobs needs a number")?;
-            }
-            "--report" => options.report = Some(path_arg(&mut args, "--report")?),
-            "--baseline" => options.baseline = Some(path_arg(&mut args, "--baseline")?),
-            "--limit" => {
-                options.limit = args
-                    .next()
-                    .ok_or("--limit needs a number")?
-                    .parse()
-                    .map_err(|_| "--limit needs a number")?;
-            }
-            "--offset" => {
-                options.offset = args
-                    .next()
-                    .ok_or("--offset needs a number")?
-                    .parse()
-                    .map_err(|_| "--offset needs a number")?;
-            }
-            "--normal-budget" => {
-                options.budgets.normal = seconds_arg(&mut args, "--normal-budget")?;
-            }
-            "--long-budget" => options.budgets.long = seconds_arg(&mut args, "--long-budget")?,
-            "--content-types" => {
-                let raw = args.next().ok_or("--content-types needs a JSON map")?;
-                options.content_types = serde_json::from_str(&raw)
-                    .map_err(|error| format!("--content-types is not a JSON map: {error}"))?;
-            }
-            "--real-time" => options.virtual_time = false,
-            "--verbose" => options.verbose = true,
-            "--list" => options.list = true,
-            other if other.starts_with('-') => return Err(format!("unknown flag {other}")),
-            other => options.paths.push(other.trim_start_matches('/').to_owned()),
+        parse_flag(&mut options, &arg, &mut args)?;
+    }
+    options.validate()
+}
+
+/// Applies one command-line argument.
+fn parse_flag(
+    options: &mut Options,
+    arg: &str,
+    args: &mut impl Iterator<Item = String>,
+) -> Result<(), String> {
+    match arg {
+        "-h" | "--help" => {
+            print!("{HELP}");
+            std::process::exit(0);
         }
+        "--wpt-root" => options.root = path_arg(args, "--wpt-root")?,
+        "--jobs" => {
+            options.jobs = args
+                .next()
+                .ok_or("--jobs needs a number")?
+                .parse()
+                .map_err(|_| "--jobs needs a number")?;
+        }
+        "--report" => options.report = Some(path_arg(args, "--report")?),
+        "--baseline" => options.baseline = Some(path_arg(args, "--baseline")?),
+        "--limit" => {
+            options.limit = args
+                .next()
+                .ok_or("--limit needs a number")?
+                .parse()
+                .map_err(|_| "--limit needs a number")?;
+        }
+        "--offset" => {
+            options.offset = args
+                .next()
+                .ok_or("--offset needs a number")?
+                .parse()
+                .map_err(|_| "--offset needs a number")?;
+        }
+        "--total-chunks" => {
+            options.shard = Some((
+                options.shard.map_or(0, |(index, _)| index),
+                args.next()
+                    .ok_or("--total-chunks needs a number")?
+                    .parse()
+                    .map_err(|_| "--total-chunks needs a number")?,
+            ));
+        }
+        "--this-chunk" => {
+            options.shard = Some((
+                args.next()
+                    .ok_or("--this-chunk needs a number")?
+                    .parse()
+                    .map_err(|_| "--this-chunk needs a number")?,
+                options.shard.map_or(0, |(_, count)| count),
+            ));
+        }
+        "--exclude-testdriver" => options.exclude_testdriver = true,
+        "--normal-budget" => {
+            options.budgets.normal = seconds_arg(args, "--normal-budget")?;
+        }
+        "--long-budget" => options.budgets.long = seconds_arg(args, "--long-budget")?,
+        "--content-types" => {
+            let raw = args.next().ok_or("--content-types needs a JSON map")?;
+            options.content_types = serde_json::from_str(&raw)
+                .map_err(|error| format!("--content-types is not a JSON map: {error}"))?;
+        }
+        "--sidecar" => {
+            let raw = args.next().ok_or("--sidecar needs an address")?;
+            let address = raw
+                .parse()
+                .map_err(|_| format!("--sidecar needs HOST:PORT, got {raw}"))?;
+            options.sidecar = Some(sidecar::Sidecar::new(address));
+        }
+        "--real-time" => options.clock = Clock::Real,
+        "--verbose" => options.verbose = true,
+        "--list" => options.list = true,
+        other if other.starts_with('-') => return Err(format!("unknown flag {other}")),
+        other => options.paths.push(other.trim_start_matches('/').to_owned()),
     }
-    if options.paths.is_empty() {
-        return Err("pass at least one test path".into());
-    }
-    if options.budgets.normal.is_zero() || options.budgets.long.is_zero() {
-        return Err("pass --normal-budget and --long-budget in seconds \
-             (cli.py computes them from tools/wpt/timeouts.py)"
-            .into());
-    }
-    if options.content_types.is_empty() {
-        return Err("pass --content-types with wptserve's extension map \
-             (cli.py reads it from wptserve.constants)"
-            .into());
-    }
-    Ok(options)
+    Ok(())
 }
 
 /// Takes the next argument as a positive number of seconds.
