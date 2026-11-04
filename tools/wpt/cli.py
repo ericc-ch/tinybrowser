@@ -2026,7 +2026,6 @@ def take_shard_size(argv: list[str]) -> tuple[int | None, list[str]]:
 HARNESS_VALUE_FLAGS = {
     "--wpt-root",
     "--jobs",
-    "--mark-crashed",
 }
 
 
@@ -2038,7 +2037,6 @@ class HarnessArgs:
         self.forward: list[str] = []
         self.report: Path | None = None
         self.baseline: Path | None = None
-        self.cache: Path | None = None
         self.offset = 0
         self.limit: int | None = None
 
@@ -2061,13 +2059,6 @@ def split_harness_args(argv: list[str]) -> HarnessArgs:
             continue
         if arg == "--baseline" and value is not None:
             args.baseline = Path(value)
-            index += 2
-            continue
-        if arg == "--cache" and value is not None:
-            # Forwarded as-is, and remembered because a warm cache is the one
-            # case that needs no sharding.
-            args.cache = Path(value)
-            args.forward.extend(argv[index : index + 2])
             index += 2
             continue
         if arg in ("--offset", "--limit") and value is not None and value.isdigit():
@@ -2139,28 +2130,18 @@ def fast_harness_shards(
         return die("fast-harness", "no tests selected")
     with tempfile.TemporaryDirectory(prefix="wpt-harness-shards-") as scratch:
         scratch_path = Path(scratch)
-        # A warm cache needs no sharding: nothing runs, so nothing can crash.
-        # Try one process first and only split when it dies.
-        reports: list[Path] = []
-        if args.cache is not None:
-            single = run_one_harness(
-                binary, wpt, args, ids, scratch_path / "single.json", policy
-            )
-            if single is not None:
-                reports = [single]
-        if not reports:
-            reports = run_shard_range(
-                binary,
-                wpt,
-                args,
-                ids,
-                0,
-                len(ids),
-                max(1, shard_size),
-                scratch_path,
-                1,
-                policy,
-            )
+        reports = run_shard_range(
+            binary,
+            wpt,
+            args,
+            ids,
+            0,
+            len(ids),
+            max(1, shard_size),
+            scratch_path,
+            1,
+            policy,
+        )
         if not reports:
             return die("fast-harness", "no shard produced a report")
         loaded: list[tuple[Path, dict]] = []
@@ -2183,58 +2164,6 @@ def fast_harness_shards(
                 f"({len(merged['results'])} results)"
             )
         return summarize_results(merged["results"])
-
-
-def run_one_harness(
-    binary: Path,
-    wpt: Path,
-    args: HarnessArgs,
-    ids: list[str],
-    out: Path,
-    policy: list[str],
-) -> Path | None:
-    """Runs the whole selection in one process; None means it died."""
-    command = [
-        str(binary),
-        "--wpt-root",
-        str(wpt),
-        *policy,
-        *args.paths,
-        "--offset",
-        str(args.offset),
-        "--limit",
-        str(len(ids)),
-        "--report",
-        str(out),
-        *args.forward,
-    ]
-    eprint("wpt: " + " ".join(command))
-    try:
-        code = subprocess.run(command, cwd=str(ROOT), check=False).returncode
-    except OSError as error:
-        eprint(f"wpt: fast-harness: cannot run {binary}: {error}")
-        return None
-    return out if code == 0 and out.exists() else None
-
-
-def mark_crashed(
-    binary: Path, wpt: Path, cache: Path, test_id: str, policy: list[str]
-) -> None:
-    """Stores an ERROR verdict so a later run does not retry a known crash."""
-    command = [
-        str(binary),
-        "--wpt-root",
-        str(wpt),
-        *policy,
-        "--cache",
-        str(cache),
-        "--mark-crashed",
-        "/" + test_id.lstrip("/"),
-    ]
-    try:
-        subprocess.run(command, cwd=str(ROOT), check=False)
-    except OSError as error:
-        eprint(f"wpt: fast-harness: cannot mark {test_id}: {error}")
 
 
 def run_shard_range(
@@ -2305,8 +2234,6 @@ def run_shard_range(
                 )
             )
             eprint(f"wpt: fast-harness: engine crashed on /{ids[offset]}")
-            if args.cache is not None:
-                mark_crashed(binary, wpt, args.cache, ids[offset], policy)
             reports.append(broken)
             offset += 1
             continue
@@ -3169,23 +3096,21 @@ def _selftest() -> None:
     assert take_shard_size(["dom"]) == (None, ["dom"])
     assert take_shard_size(["dom", "--shard-size"]) == (None, ["dom", "--shard-size"])
     parsed = split_harness_args(
-        ["dom", "--jobs", "8", "--report", "r.json", "--cache", "c.json", "--verbose"]
+        ["dom", "--jobs", "8", "--report", "r.json", "--verbose"]
     )
     assert (
         parsed.paths,
         parsed.forward,
         parsed.report,
         parsed.baseline,
-        parsed.cache,
     ) == (
         ["dom"],
-        ["--jobs", "8", "--cache", "c.json", "--verbose"],
+        ["--jobs", "8", "--verbose"],
         Path("r.json"),
         None,
-        Path("c.json"),
     )
     # The driver owns the window and keeps every other flag's value attached:
-    # a forwarded `--cache` whose value was read as a test path would run a
+    # a forwarded flag whose value was read as a test path would run a
     # different selection than the caller asked for.
     parsed = split_harness_args(
         [
@@ -3196,13 +3121,12 @@ def _selftest() -> None:
             "10",
             "--limit",
             "5",
-            "--cache",
-            "c.json",
+            "--verbose",
         ]
     )
     assert parsed.paths == ["dom/nodes"]
     assert (parsed.offset, parsed.limit) == (10, 5)
-    assert parsed.forward == ["--cache", "c.json"]
+    assert parsed.forward == ["--verbose"]
 
     _selftest_profile()
     _selftest_failures()
@@ -3463,8 +3387,8 @@ TOP_HELP = """tinybrowser WPT harness: run | score | rerun | merge | profile | f
   fast-harness PATH... [--jobs N] [--report FILE] [--baseline FILE]
     Run WPT testharness and crashtest files in the engine process, with a
     paused clock. No WebDriver, wptserve, or renderer child. Reftests and
-    testdriver are not implemented yet. --cache FILE reuses unchanged
-    verdicts; --shard-size N isolates an engine abort to one file.
+    testdriver are not implemented yet. --shard-size N isolates an engine
+    abort to one file.
   overnight [--save-report FILE] [--dry-run] [-- runner...]
     Full-suite run + score. Long; needs explicit approval per AGENTS.md.
   selftest

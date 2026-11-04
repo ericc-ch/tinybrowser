@@ -87,7 +87,7 @@ fn main() {
     let started = Instant::now();
     let outcomes = run_all(cases, &harness, options.jobs);
     let wall = started.elapsed();
-    wpt_report::summarize(&outcomes, wall, 0, options.verbose);
+    wpt_report::summarize(&outcomes, wall, options.verbose);
     if let Some(path) = &options.report
         && let Err(error) = wpt_report::write_report(path, &outcomes)
     {

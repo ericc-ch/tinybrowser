@@ -65,8 +65,6 @@ pub struct Outcome {
     pub subtests: Vec<Subtest>,
     /// Wall time spent in this file.
     pub duration: Duration,
-    /// Every file the test read, for the result cache.
-    pub inputs: Vec<std::path::PathBuf>,
 }
 
 /// One file's engine and the in-memory host that serves the checkout.
@@ -137,14 +135,6 @@ impl Session {
                 (status, message, subtests)
             }
         };
-        let mut inputs = self.services.take_inputs();
-        // Every verdict depends on the file itself. Mounts record it already,
-        // but a skipped kind (reftest, testdriver) never mounts, and a WPT
-        // pin change to that file must still invalidate the stored SKIP.
-        let test_file = self.root.join(&case.source);
-        if !inputs.contains(&test_file) {
-            inputs.push(test_file);
-        }
         Outcome {
             id: case.id(),
             kind: case.kind,
@@ -152,7 +142,6 @@ impl Session {
             message,
             subtests,
             duration: started.elapsed(),
-            inputs,
         }
     }
 
@@ -163,14 +152,10 @@ impl Session {
         // file must not be read as this one's.
         let _stale = self.renderer.take_events();
         self.services.clear();
-        // The mounted document may be a synthesized wrapper, but the on-disk
-        // source is still an input: editing it must invalidate a cached
-        // verdict, and its `.headers` decide the response metadata.
-        self.services.record_file(self.root.join(&case.source));
         let url = Url::parse(&format!("{BASE}{}", case.relative))
             .map_err(|error| Failure::Error(format!("bad url: {error}")))?;
         let path = self.root.join(&case.source);
-        let headers = self.services.headers_for(
+        let headers = crate::services::FsServices::headers_for(
             &path,
             &crate::services::RequestContext {
                 url: &url,

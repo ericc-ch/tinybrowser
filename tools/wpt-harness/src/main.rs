@@ -9,7 +9,6 @@
 //! replacement is `/resources/testharnessreport.js`, which records the
 //! completion payload the host polls.
 
-mod cache;
 mod engine;
 mod services;
 mod suite;
@@ -22,7 +21,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use cache::Cache;
 use engine::Outcome;
 use suite::{Kind, TestCase};
 
@@ -33,12 +31,10 @@ struct Options {
     jobs: usize,
     report: Option<PathBuf>,
     baseline: Option<PathBuf>,
-    cache: Option<PathBuf>,
     verbose: bool,
     list: bool,
     limit: usize,
     offset: usize,
-    mark_crashed: Option<String>,
     virtual_time: bool,
     budgets: engine::Budgets,
     content_types: HashMap<String, String>,
@@ -59,32 +55,6 @@ fn main() {
             options.root.display()
         );
         std::process::exit(2);
-    }
-    if let Some(id) = &options.mark_crashed {
-        let Some(path) = &options.cache else {
-            eprintln!("wpt-harness: --mark-crashed needs --cache");
-            exit(2);
-        };
-        let binary = match cache::binary_digest(Some(path)) {
-            Ok(binary) => binary,
-            Err(error) => {
-                eprintln!("wpt-harness: cannot hash the harness binary: {error}");
-                exit(2);
-            }
-        };
-        let mut stored = match Cache::load(path, &binary) {
-            Ok(cache) => cache,
-            Err(error) => {
-                eprintln!("wpt-harness: cannot read {}: {error}", path.display());
-                exit(2);
-            }
-        };
-        stored.mark_crashed(id, &options.root);
-        if let Err(error) = stored.save(path) {
-            eprintln!("wpt-harness: cannot write {}: {error}", path.display());
-            exit(2);
-        }
-        exit(0);
     }
     let cases = match suite::select(
         &options.root,
@@ -110,10 +80,10 @@ fn main() {
         return;
     }
     let started = Instant::now();
-    let (outcomes, cached) = run_selected(&options, &cases);
+    let outcomes = run_selected(&options, &cases);
     let wall = started.elapsed();
     let reported: Vec<_> = outcomes.iter().map(reported).collect();
-    wpt_report::summarize(&reported, wall, cached, options.verbose);
+    wpt_report::summarize(&reported, wall, options.verbose);
     if let Some(path) = &options.report
         && let Err(error) = wpt_report::write_report(path, &reported)
     {
@@ -152,84 +122,16 @@ fn exit(code: i32) -> ! {
     std::process::exit(code)
 }
 
-/// Runs every case, reusing cached verdicts whose binary and inputs match.
-///
-/// Returns the outcomes in test order and how many came from the cache.
-fn run_selected(options: &Options, cases: &[TestCase]) -> (Vec<Outcome>, usize) {
-    let binary = match cache::binary_digest(options.cache.as_deref()) {
-        Ok(binary) => binary,
-        Err(error) => {
-            eprintln!("wpt-harness: cannot hash the harness binary: {error}");
-            std::process::exit(2);
-        }
-    };
-    let mut stored = match &options.cache {
-        Some(path) => match Cache::load(path, &binary) {
-            Ok(cache) => Some(cache),
-            Err(error) => {
-                eprintln!("wpt-harness: cannot read {}: {error}", path.display());
-                std::process::exit(2);
-            }
-        },
-        None => None,
-    };
-    // A cached verdict is reused only when the binary and every file the test
-    // read are unchanged, so a warm run costs hashing instead of execution.
-    let mut slots: Vec<Option<Outcome>> = (0..cases.len()).map(|_| None).collect();
-    let mut pending = Vec::new();
-    if let Some(cache) = &stored {
-        for (index, case) in cases.iter().enumerate() {
-            match cache.lookup(&case.id(), &options.root) {
-                Some(outcome) => slots[index] = Some(outcome),
-                None => pending.push(index),
-            }
-        }
-    } else {
-        pending.extend(0..cases.len());
-    }
-    let cached = cases.len() - pending.len();
-    if cached > 0 {
-        eprintln!("wpt-harness: {cached} cached, {} to run", pending.len());
-    }
-    let selected: Vec<TestCase> = pending.iter().map(|index| cases[*index].clone()).collect();
-    let fresh = run_all(
+/// Runs every case in the selection.
+fn run_selected(options: &Options, cases: &[TestCase]) -> Vec<Outcome> {
+    run_all(
         &options.root,
-        &selected,
+        cases,
         options.jobs,
         options.virtual_time,
         options.budgets,
         &options.content_types,
-    );
-    for (index, outcome) in pending.into_iter().zip(fresh) {
-        slots[index] = Some(outcome);
-    }
-    let outcomes: Vec<Outcome> = slots
-        .into_iter()
-        .enumerate()
-        .map(|(index, outcome)| {
-            outcome.unwrap_or_else(|| Outcome {
-                id: cases[index].id(),
-                kind: cases[index].kind,
-                status: engine::Status::Skip,
-                message: Some("worker stopped before this test".into()),
-                subtests: Vec::new(),
-                duration: std::time::Duration::ZERO,
-                inputs: Vec::new(),
-            })
-        })
-        .collect();
-    if let Some(cache) = &mut stored {
-        for outcome in &outcomes {
-            cache.insert(outcome, &options.root);
-        }
-        if let Some(path) = &options.cache
-            && let Err(error) = cache.save(path)
-        {
-            eprintln!("wpt-harness: cannot write {}: {error}", path.display());
-            std::process::exit(2);
-        }
-    }
-    (outcomes, cached)
+    )
 }
 
 /// Runs every case, one current-thread runtime per worker.
@@ -288,7 +190,6 @@ fn run_all(
                             message: Some("engine panicked".into()),
                             subtests: Vec::new(),
                             duration: started.elapsed(),
-                            inputs: Vec::new(),
                         }
                     });
                     if sender.send((index, outcome)).is_err() {
@@ -313,18 +214,16 @@ fn run_all(
                     message: Some("worker stopped before this test".into()),
                     subtests: Vec::new(),
                     duration: std::time::Duration::ZERO,
-                    inputs: Vec::new(),
                 })
             })
             .collect()
     })
 }
 
-/// Prints counts and the slowest files.
 /// The shared report shape for one engine outcome.
 ///
-/// The engine keeps its own `kind` (it drives the executor) and `inputs` (the
-/// result cache), which a wptreport has no field for.
+/// The engine keeps its own `kind` (it drives the executor), which a wptreport
+/// has no field for.
 fn reported(outcome: &Outcome) -> wpt_report::Outcome {
     wpt_report::Outcome {
         id: outcome.id.clone(),
@@ -353,10 +252,8 @@ Runs WPT testharness and crashtest files in-process.
   --jobs N          worker threads (default: available CPUs)
   --report PATH     write a wptreport JSON
   --baseline PATH   compare with an earlier --report and exit 1 on regressions
-  --cache PATH      reuse unchanged verdicts from this cache file (and update it)
   --limit N         stop after N selected files
   --offset N        skip the first N selected files (shards)
-  --mark-crashed ID store an ERROR verdict for ID in --cache and exit
   --normal-budget S wall-clock seconds before a normal file is TIMEOUT
   --long-budget S  wall-clock seconds before a long-timeout file is TIMEOUT
   --content-types JSON  wptserve's extension-to-content-type map
@@ -384,12 +281,10 @@ fn parse_args() -> Result<Options, String> {
         jobs: std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
         report: None,
         baseline: None,
-        cache: None,
         verbose: false,
         list: false,
         limit: usize::MAX,
         offset: 0,
-        mark_crashed: None,
         virtual_time: true,
         // Replaced by the required flags below. Zero is never a real budget:
         // `for_case` would time out before mounting, and the flag parser
@@ -417,7 +312,6 @@ fn parse_args() -> Result<Options, String> {
             }
             "--report" => options.report = Some(path_arg(&mut args, "--report")?),
             "--baseline" => options.baseline = Some(path_arg(&mut args, "--baseline")?),
-            "--cache" => options.cache = Some(path_arg(&mut args, "--cache")?),
             "--limit" => {
                 options.limit = args
                     .next()
@@ -431,9 +325,6 @@ fn parse_args() -> Result<Options, String> {
                     .ok_or("--offset needs a number")?
                     .parse()
                     .map_err(|_| "--offset needs a number")?;
-            }
-            "--mark-crashed" => {
-                options.mark_crashed = Some(args.next().ok_or("--mark-crashed needs a test id")?);
             }
             "--normal-budget" => {
                 options.budgets.normal = seconds_arg(&mut args, "--normal-budget")?;
@@ -451,7 +342,7 @@ fn parse_args() -> Result<Options, String> {
             other => options.paths.push(other.trim_start_matches('/').to_owned()),
         }
     }
-    if options.paths.is_empty() && options.mark_crashed.is_none() {
+    if options.paths.is_empty() {
         return Err("pass at least one test path".into());
     }
     if options.budgets.normal.is_zero() || options.budgets.long.is_zero() {

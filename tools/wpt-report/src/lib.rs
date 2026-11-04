@@ -315,7 +315,7 @@ fn verdict(result: &Value) -> &str {
 }
 
 /// Prints the run summary and, when `verbose`, the failures and slowest tests.
-pub fn summarize(outcomes: &[Outcome], wall: Duration, cached: usize, verbose: bool) {
+pub fn summarize(outcomes: &[Outcome], wall: Duration, verbose: bool) {
     let mut pass = 0;
     let mut fail = 0;
     let mut timeout = 0;
@@ -339,7 +339,7 @@ pub fn summarize(outcomes: &[Outcome], wall: Duration, cached: usize, verbose: b
     let count = u32::try_from(outcomes.len()).unwrap_or(u32::MAX);
     println!(
         "{} tests in {:.1?} ({:.2} ms/test): {pass} pass, {fail} fail, {timeout} timeout, \
-         {error} error, {skip} skip, {cached} cached",
+         {error} error, {skip} skip",
         outcomes.len(),
         wall,
         wall.as_secs_f64() * 1000.0 / f64::from(count)

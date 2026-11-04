@@ -15,8 +15,8 @@ use serde_json::{Map, Value};
 
 use crate::wrapper::Wrapper;
 
-/// Which executor a test needs, shared with the cache so an unknown stored
-/// spelling is a cache miss rather than a silent testharness file.
+/// Which executor a test needs, shared with the report so the two agree on a
+/// test's kind.
 pub use wpt_report::Kind;
 
 /// One selected test.
@@ -25,8 +25,7 @@ pub struct TestCase {
     /// The URL path and query the browser navigates to, relative to the
     /// origin. This is the wptreport id without its leading slash.
     pub relative: String,
-    /// The on-disk source, relative to the WPT root. It is the file whose
-    /// bytes decide the verdict, so the result cache keys on it.
+    /// The on-disk source, relative to the WPT root.
     pub source: String,
     /// The executor to use.
     pub kind: Kind,

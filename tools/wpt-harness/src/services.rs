@@ -102,8 +102,6 @@ struct Origin {
     /// `cli.py`. An extension it does not name is `application/octet-stream`,
     /// exactly like `guess_content_type`.
     content_types: HashMap<String, String>,
-    /// Every path this origin read or tried to read for the current file.
-    read: Mutex<Vec<PathBuf>>,
 }
 
 impl Origin {
@@ -111,29 +109,7 @@ impl Origin {
         Self {
             root,
             content_types,
-            read: Mutex::new(Vec::new()),
         }
-    }
-
-    fn clear(&self) {
-        self.read
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clear();
-    }
-
-    /// Records one path as an input and returns it.
-    fn record(&self, path: PathBuf) -> PathBuf {
-        self.read
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(path.clone());
-        path
-    }
-
-    /// Takes the paths read since the last [`Self::clear`].
-    fn take_inputs(&self) -> Vec<PathBuf> {
-        std::mem::take(&mut *self.read.lock().unwrap_or_else(PoisonError::into_inner))
     }
 
     /// The content type `guess_content_type` returns for `file`.
@@ -146,15 +122,15 @@ impl Origin {
     }
 
     /// Reads the headers wptserve sends for `file`.
-    fn headers_for(&self, file: &Path, request: &RequestContext<'_>) -> Headers {
+    fn headers_for(file: &Path, request: &RequestContext<'_>) -> Headers {
         let mut list = Vec::new();
         // Directory headers apply to the whole directory, then the file's own
         // headers follow
         // (`wptserve/handlers.py::load_headers`).
         if let Some(directory) = file.parent() {
-            self.load_headers(&directory.join("__dir__"), request, &mut list);
+            Self::load_headers(&directory.join("__dir__"), request, &mut list);
         }
-        self.load_headers(file, request, &mut list);
+        Self::load_headers(file, request, &mut list);
         let content_type = list
             .iter()
             .rev()
@@ -171,18 +147,9 @@ impl Origin {
     /// A `.sub.headers` sibling wins over `.headers`, and its templates are
     /// expanded against the request. An expression this harness cannot expand
     /// is a visible error: dropping the header would change the page silently.
-    fn load_headers(
-        &self,
-        base: &Path,
-        request: &RequestContext<'_>,
-        list: &mut Vec<(String, String)>,
-    ) {
+    fn load_headers(base: &Path, request: &RequestContext<'_>, list: &mut Vec<(String, String)>) {
         let sub = path_with_suffix(base, ".sub.headers");
         let plain = path_with_suffix(base, ".headers");
-        // Both candidates are inputs, whether or not they exist: creating one
-        // later must invalidate a cached verdict.
-        self.record(sub.clone());
-        self.record(plain.clone());
         let (path, expand) = if sub.is_file() {
             (sub, true)
         } else if plain.is_file() {
@@ -256,9 +223,9 @@ impl Origin {
         };
         // `.any.html` and `.window.html` are synthesized from their script.
         if let Some((wrapper, source)) = Wrapper::for_url(&path) {
-            let file = self.record(self.root.join(&source));
+            let file = self.root.join(&source);
             let body = std::fs::read(&file).map_err(|_| connect("missing wrapped script"))?;
-            let headers = self.headers_for(&file, &context);
+            let headers = Self::headers_for(&file, &context);
             let js_url = &url.path()[..url.path().len() - ".html".len()];
             let html = wrapper.render(&body, &format!("{js_url}.js"));
             let content_type = headers
@@ -270,9 +237,9 @@ impl Origin {
                 body: html.into_bytes(),
             });
         }
-        let file = self.record(self.root.join(relative));
+        let file = self.root.join(relative);
         let body = std::fs::read(&file).map_err(|_| connect("missing file"))?;
-        let headers = self.headers_for(&file, &context);
+        let headers = Self::headers_for(&file, &context);
         let content_type = headers
             .content_type
             .unwrap_or_else(|| self.content_type_for(&file));
@@ -337,6 +304,9 @@ impl net::Transport for FrameTransport {
 
 /// A host that maps every URL path to a file under one checkout.
 pub struct FsServices {
+    /// Kept for the tests that inspect the checkout root and content types.
+    /// Production reaches the origin through the transport below.
+    #[cfg(test)]
     origin: Arc<Origin>,
     /// The real fetch core. Every policy decision is this crate's; only the
     /// one exchange underneath is the in-memory transport.
@@ -353,13 +323,14 @@ impl FsServices {
             origin: Arc::clone(&origin),
         });
         Self {
+            #[cfg(test)]
             origin,
             agent: net::Agent::with_transport(net::AgentOptions::default(), transport),
             storage: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Drops cookies, storage, and recorded inputs between files.
+    /// Drops cookies and storage between files.
     ///
     /// A worker builds a fresh engine per file, so state a file leaves behind
     /// must not reach the next one. Upstream also clears browser state between
@@ -370,23 +341,11 @@ impl FsServices {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clear();
-        self.origin.clear();
-    }
-
-    /// Takes the paths read since the last [`Self::clear`].
-    #[must_use]
-    pub fn take_inputs(&self) -> Vec<PathBuf> {
-        self.origin.take_inputs()
-    }
-
-    /// Records `path` as an input without reading it.
-    pub fn record_file(&self, path: PathBuf) {
-        self.origin.record(path);
     }
 
     /// Reads the headers wptserve sends for `file`.
-    pub(crate) fn headers_for(&self, file: &Path, request: &RequestContext<'_>) -> Headers {
-        self.origin.headers_for(file, request)
+    pub(crate) fn headers_for(file: &Path, request: &RequestContext<'_>) -> Headers {
+        Origin::headers_for(file, request)
     }
 }
 
@@ -644,7 +603,7 @@ mod tests {
 
     fn headers(services: &FsServices, url: &str) -> super::Headers {
         let url = url::Url::parse(url).expect("URL");
-        services.headers_for(
+        FsServices::headers_for(
             &services.origin.root.join("dir/data.txt"),
             &RequestContext {
                 url: &url,
@@ -740,13 +699,6 @@ mod tests {
         let html = String::from_utf8(bytes).expect("HTML");
         assert!(html.contains("self.GLOBAL"));
         assert!(html.contains("<script src=\"/dir/multi.any.js\"></script>"));
-        assert!(
-            services
-                .take_inputs()
-                .iter()
-                .any(|path| path.ends_with("dir/multi.any.js")),
-            "the wrapped script is a cache input"
-        );
         std::fs::remove_dir_all(&root).expect("root removed");
     }
 }

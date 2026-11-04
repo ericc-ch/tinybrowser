@@ -59,15 +59,12 @@ pages are not selected, because this lane has no executor for them.
 
     nix develop --command python3 tools/wpt/cli.py fast-harness dom/nodes --jobs 8
 
-`--cache FILE` keeps verdicts keyed by the harness binary plus the SHA-256 of
-every file a test read, so an unchanged file is reused without running it.
-The digest of the `wpt` binary (hundreds of MB with debug info) is remembered
-in `FILE.binary` and refreshed when the executable's path, size, or mtime
-changes. On dom/nodes/ (422 manifest tests) a cold run is ~11 s at 12 jobs; a
-warm run is ~100 ms. A truncated file is never cached as a verdict:
-testharness reports `interrupted` when the engine cuts a script short, and
-the runner gives each file one drain with its whole budget instead of a short
-slice.
+The lane has no result cache: every run executes the selection. It is fast
+because the engine is in-process and the clock is paused, not because an
+earlier verdict is reused. On dom/nodes/ (422 manifest tests) a run is ~11 s
+at 12 jobs. A truncated file is never mistaken for a verdict: testharness
+reports `interrupted` when the engine cuts a script short, and the runner
+gives each file one drain with its whole budget instead of a short slice.
 
 `--shard-size N` (in cli.py) runs the sorted selection in N-file processes.
 Each shard is a separate `--offset`/`--limit` slice, so an engine abort costs
@@ -75,22 +72,15 @@ one shard instead of the run; a shard that exits non-zero is bisected until
 the single crashing file is found, and that file is recorded as ERROR. The
 driver owns the window: a `--offset`/`--limit` on the command line slices the
 selection once and every shard's slice stays inside it, and the other runner
-flags (`--cache`, `--jobs`) pass through with their
-values. Use it for directories where layout or paint can panic (html/
-currently does): a panic in-process bypasses the harness's per-file error
-framing, and unwinding a half-torn engine can abort outright. dom/ needs no
-sharding and runs 788 manifest tests in ~26 s at 16 jobs, with 109 testdriver
-skips. html/ selects 7,895 manifest tests, so it is sharded. The parity
-counts from the older tree-walking selector are gone with it: that selector
-counted support pages and references (always PASS) and could not see
-`.any.js`/`.window.js` sources at all, so its "matched" numbers were over an
-intersection rather than the suite.
-
-A warm cache needs no sharding, so the driver tries one process first and
-only splits when it dies; on a warm cache the shards cost nothing because no
-file runs. A file that aborts the engine cannot record its own verdict, so
-the driver marks it with `--mark-crashed` and later runs read it as an
-ordinary cached ERROR instead of bisecting again.
+flags (`--jobs`) pass through with their values. Use it for directories where
+layout or paint can panic (html/ currently does): a panic in-process bypasses
+the harness's per-file error framing, and unwinding a half-torn engine can
+abort outright. dom/ needs no sharding and runs 788 manifest tests in ~26 s
+at 16 jobs, with 109 testdriver skips. html/ selects 7,895 manifest tests, so
+it is sharded. The parity counts from the older tree-walking selector are
+gone with it: that selector counted support pages and references (always
+PASS) and could not see `.any.js`/`.window.js` sources at all, so its
+"matched" numbers were over an intersection rather than the suite.
 
 Known gap: an async listener that leaves a host object borrowed makes
 rquickjs panic with `AlreadyBorrowed` in `Class::borrow_mut`; rquickjs
