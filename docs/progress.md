@@ -10,15 +10,18 @@ test262); `wpt-nightly.yml` keeps the full WebDriver run below as the
 fidelity backstop. A 2,195-test same-build comparison of the two executors
 agreed on 94.9% of verdicts and passed 1,148 vs 1,150.
 
-The whole gate passed for the first time in run 41972597140: 15m03 wall for
+The gate first passed in run 41972597140 at the 11/9 split: 15m03 wall for
 the 119k-test suite, of which 1m34 was queue, 1m42 plan, 3m17 build (one job
-per binary, three links in parallel), 9m47 test and 22s score. The harness
-lane is ~74 chunk-minutes at 4 jobs and the WebDriver lane ~32, so the 20-job
-limit splits 14/6 rather than 11/9; the slowest harness chunk alone set the
-test phase. One harness process carries 600 files (the engine keeps ~5 MB per
-file alive, see `docs/upstream.md`) and journals every file, so an engine
-abort costs one ERROR instead of a chunk, and a page that stops returning is
-cut by a watchdog instead of the job timeout.
+per binary, three links in parallel), 9m47 test and 22s score. That run
+measured the harness lane at ~74 chunk-minutes at 4 jobs and the WebDriver
+lane at ~32, so the 20-job limit splits 14/6 rather than 11/9. Run 41974678252
+(14/6, 4s queue) took 11m19: 1m47 plan, 3m57 build, 6m34 test, 24s score,
+with harness chunks summing 70.6 chunk-minutes (218-393s) and WebDriver 27.8
+(202-332s). The slowest harness chunk alone set the test phase. One harness
+process carries 600 files (the engine keeps ~5 MB per file alive, see
+`docs/upstream.md`) and journals every file, so an engine abort costs one
+ERROR instead of a chunk, and a page that stops returning is cut by a
+watchdog instead of the job timeout.
 
 CI 2026-10-23 run 39980734258 (wpt.yml, 20 chunks), --exclude=worker
 testharness+crashtest+reftest+test262
