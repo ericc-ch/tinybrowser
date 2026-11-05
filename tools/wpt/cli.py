@@ -1276,12 +1276,17 @@ def patch_wpt(wpt_root: Path, lane: str | None = None) -> None:
                     if not tests:
                         continue
                 elif lane == "in-process-complement":
-                    # Everything `fast-harness` does not run: testdriver files,
-                    # plus generated wrappers it cannot render (service worker,
-                    # shared worker, module, shadow realm) instead of files.
+                    # Everything `fast-harness` does not run: testdriver files
+                    # (except crashtests, which the in-process lane judges by
+                    # whether they survive, no driver needed), plus generated
+                    # wrappers it cannot render (service worker, shared worker,
+                    # module, shadow realm) instead of files.
                     selected = set()
                     for test in tests:
-                        if getattr(test, "testdriver", None) is True:
+                        if (
+                            getattr(test, "testdriver", None) is True
+                            and test_type != "crashtest"
+                        ):
                             selected.add(test)
                             continue
                         url = test.url.split("?", 1)[0]

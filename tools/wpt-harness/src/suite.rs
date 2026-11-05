@@ -387,10 +387,23 @@ fn collect_reftest(
         if !matches_requested(paths, path, path) || !root.join(path).is_file() {
             continue;
         }
+        // A reftest that drives the browser through `testdriver.js` reaches
+        // its comparison only under a `WebDriver` session; without one it is a
+        // file that waits for input that never comes. The flag routes it to
+        // the `WebDriver` lane, which owns every testdriver file.
+        let kind = if extras
+            .and_then(|extras| extras.get("testdriver"))
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            Kind::Testdriver
+        } else {
+            Kind::Reftest
+        };
         selected.push(Item {
             relative: path.to_owned(),
             source: path.to_owned(),
-            kind: Kind::Reftest,
+            kind,
             long_timeout,
             wrapper: None,
             refs,
@@ -671,6 +684,43 @@ mod tests {
         .expect("manifest written");
         let cases = select(&root, &["t.html".into()], &types(), &all()).expect("selection");
         assert_eq!(cases[0].kind, Kind::Testdriver);
+        fs::remove_dir_all(&root).expect("checkout removed");
+    }
+
+    #[test]
+    fn a_testdriver_reftest_belongs_to_the_webdriver_lane() {
+        let root = checkout("driver-reftest");
+        let manifest = serde_json::json!({
+            "items": {"reftest": {"r.html": ["x", [null, [
+                ["/r-ref.html", "=="]
+            ], {"testdriver": true}]]}}
+        });
+        fs::write(root.join("r.html"), "<p>test</p>").expect("test");
+        fs::write(root.join("r-ref.html"), "<p>ref</p>").expect("ref");
+        fs::write(
+            root.join("MANIFEST.json"),
+            serde_json::to_vec(&manifest).expect("manifest"),
+        )
+        .expect("manifest written");
+        // Selected as a testdriver test, not a reftest: `WebDriver` owns the
+        // file because the comparison only happens after driver input.
+        let cases = select(&root, &["r.html".into()], &types(), &all()).expect("selection");
+        assert_eq!(cases[0].kind, Kind::Testdriver);
+        let without = select(
+            &root,
+            &["r.html".into()],
+            &types(),
+            &Selection {
+                offset: 0,
+                limit: usize::MAX,
+                shard: None,
+                exclude_testdriver: true,
+            },
+        );
+        assert!(
+            without.is_err(),
+            "the in-process lane must leave a testdriver reftest out"
+        );
         fs::remove_dir_all(&root).expect("checkout removed");
     }
 
