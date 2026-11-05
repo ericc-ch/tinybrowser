@@ -44,10 +44,11 @@ permissions:
   contents: read
 
 concurrency:
-  # A new push supersedes the previous push's run; a dispatched run is never
-  # cancelled by one (a cancelled run uploads no artifacts).
+  # Newest run wins: a push supersedes the previous push's run, and a manual
+  # dispatch supersedes whatever is in flight (waiting behind a run that is
+  # itself cancelling left a dispatch idle for minutes).
   group: wpt-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'push' }}
+  cancel-in-progress: true
 
 env:
   CARGO_INCREMENTAL: "0"
