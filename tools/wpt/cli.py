@@ -781,9 +781,19 @@ def group_of(test: str) -> str:
 
 
 def is_expected(entry: dict) -> bool:
-    if entry.get("expected") is None:
+    """Whether a result or subtest ended in a status the report expected.
+
+    `expected` is the status the run wanted for that case; a report that does
+    not track expectations omits it, and then the file-level status is the only
+    verdict there is. `known_intermittent` lists statuses that pass either way.
+    """
+    status = entry.get("status")
+    if status in (entry.get("known_intermittent") or []):
         return True
-    return entry.get("status") in (entry.get("known_intermittent") or [])
+    expected = entry.get("expected")
+    if expected is None:
+        return True
+    return status == expected
 
 
 def unexpected_subs(subtests: list) -> list[dict]:
@@ -2781,6 +2791,31 @@ def _selftest() -> None:
         ]
     )
     assert rows["dom"]["pass"] == 1 and attention == []
+    # A report that records an `expected` status per subtest is scored by
+    # comparing the two. The test262 lane writes `expected: PASS` on every
+    # passing subtest, and reading that as "expected something else" made all
+    # 53,640 of its files unexpected failures.
+    rows, attention = classify_results(
+        [
+            {
+                "test": "/third_party/test262/ok.test262.html",
+                "status": "OK",
+                "subtests": [{"name": "a", "status": "PASS", "expected": "PASS"}],
+                "duration": 0,
+            },
+            {
+                "test": "/third_party/test262/bad.test262.html",
+                "status": "OK",
+                "subtests": [{"name": "a", "status": "FAIL", "expected": "PASS"}],
+                "duration": 0,
+            },
+        ]
+    )
+    assert (
+        rows["third_party/test262"]["pass"] == 1
+        and rows["third_party/test262"]["unexpected"] == 1
+    )
+    assert attention == [("/third_party/test262/bad.test262.html", "a", "FAIL")]
     rows, attention = classify_results(
         [
             {
