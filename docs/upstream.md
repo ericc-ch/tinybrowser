@@ -144,18 +144,24 @@ Exotic fallthrough machinery the stock engine lacks (2afa33b, 88a9be3, 2339e92, 
   timeout (19.5 s locally). Implementing BiDi (`session.subscribe`,
   `log.entryAdded`, and a WebSocket transport) is a feature, not a fix, and is
   deferred; the in-process lane skips these files by design.
-- The engine keeps memory alive per document it creates. Measured in the
-  in-process harness at 4 jobs: 400 `css-ui/compute-kind-widget-generated`
-  reftests grow RSS by ~2.1 GB, and 400 `dom/nodes` testharness files by
-  ~0.7 GB, both linear. Valgrind's leak check sees only one engine tree per
-  run (`Engine::with_fonts` -> `Rc<RefCell<RealmRegistry>>`) and a live heap
-  that does not grow, so the growth is not a malloc-visible leak: the process
-  gains 64 MB anonymous mappings it never unmaps. The cause is not yet
-  identified. Re-measured 2026-11-05: `css/css-ui/` at one worker peaks at
-  643 MB for 100 files and 1,179 MB for 200 (same ~5.4 MB/file slope as at
-  four workers), so it is per engine, not per-thread arena retention;
-  `MALLOC_ARENA_MAX=1` changes the four-worker peak by under 7%. The browser
-  masks it by ending a renderer child with its test;
+- The in-process harness's RSS grows by ~5 MB per file. Measured at 4 jobs:
+  400 `css-ui/compute-kind-widget-generated` reftests grow RSS by ~2.1 GB, and
+  400 `dom/nodes` testharness files by ~0.7 GB, both linear; a one-worker run
+  has the same slope (`css/css-ui/`: 643 MB at 100 files, 1,179 MB at 200), so
+  it is per engine, not per worker thread.
+
+  The engine is not retaining it. Massif's live heap is flat at ~83 MB over
+  the last ten files of a 20-file run while RSS keeps climbing, and Valgrind's
+  leak check sees only one engine tree per run
+  (`Engine::with_fonts` -> `Rc<RefCell<RealmRegistry>>`). Massif with
+  `--pages-as-heap=yes` attributes the growth to glibc's own mappings: five
+  64 MB `alloc_new_heap` arena heaps plus `sysmalloc_mmap_fallback` large
+  chunks. The pages the engine frees are never returned to the OS (interior
+  fragmentation), and no glibc tunable recovers them: `MALLOC_ARENA_MAX=1`,
+  `MALLOC_TRIM_THRESHOLD_=0`, and `MALLOC_MMAP_THRESHOLD_=131072` each change
+  the peak by less than 7%. Returning them needs `malloc_trim`, which is
+  unsafe FFI, and the harness forbids unsafe. The browser masks the growth by
+  ending a renderer child with its test;
   `tools/wpt/cli.py` bounds it by running the selection in windows of
   `WINDOW_TESTS` files, each a fresh harness process, with the journal
   carrying the verdicts across them. Do not remove the windows without a
