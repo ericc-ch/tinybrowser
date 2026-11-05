@@ -134,7 +134,10 @@ jobs:
           SCCACHE_GHA_ENABLED: "true"
           RUSTC_WRAPPER: "sccache"
         run: |
-          cargo build --profile wpt --locked
+          # The tools are workspace members, not default members: a bare
+          # `cargo build` would build only the browser and the copy below
+          # would fail.
+          cargo build --profile wpt --locked -p tinybrowser -p wpt-harness -p wpt-fast
           cp "$(./tools/binary-path --profile wpt tinybrowser)" tinybrowser-wpt
           cp "$(./tools/binary-path --profile wpt wpt-harness)" wpt-harness
           cp "$(./tools/binary-path --profile wpt wpt-fast)" wpt-fast
