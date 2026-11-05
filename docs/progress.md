@@ -28,10 +28,28 @@ harness chunks summing 79.1 chunk-minutes and WebDriver 29.5 (the build is
 longer than 41974678252's 3m57 only because the blitz submodule changed and
 more of it recompiled). 108.6 chunk-minutes over 20 four-core jobs puts the
 test phase's floor at 5m26; the spread inside the harness lane (275-382s) is
-hash-partition noise, so re-splitting the lanes cannot beat it. Six of the
-eight engine aborts the harness found are fixed (the last two are inside
-dependencies, see `docs/upstream.md`); they moved five files from ERROR to
-PASS or OK without changing any other verdict.
+hash-partition noise, so re-splitting the lanes cannot beat it. All eight
+engine aborts the harness found are now fixed: the first six in the fork, and
+the last two were dependency panics with a blitz-side cause (see
+`docs/upstream.md`), so they moved five files from ERROR to PASS or OK without
+changing any other verdict.
+
+Run 42015620914 (11m27: 31s queue, 1m41 plan, 4m08 build, 6m48 test, 28s
+score) is the first scored with the corrected `is_expected` in
+`tools/wpt/cli.py` (`db0985ff`): 118,532 tests, 68,809 pass, 13,528 expfail,
+28,190 unexpected, 4,130 timeout, 1 crash, 3,874 error. Before that fix the
+same reports were mis-scored because a status was compared with itself.
+
+Run 42027403312 (11m25: 3s queue, 1m49 plan, 4m16 build, 6m44 test, 20s score)
+is the first with every known engine abort fixed:
+`css/css-borders/border-radius-greater-than-width.html` and
+`css/css-viewport/zoom/massive-zoom-viewbox-crash.html` move from ERROR to
+PASS, and the run has 0 crashes: 118,532 tests, 68,810 pass, 13,527 expfail,
+28,192 unexpected, 4,132 timeout, 0 crash, 3,871 error. The rest of the
+verdict movement against the previous run is noise, not regressions:
+timeouts flip both ways with runner load, and the `font-stretch`/`css-text`
+reftests flip with font rasterisation (repeated local runs of one binary flip
+the same files).
 
 CI 2026-10-23 run 39980734258 (wpt.yml, 20 chunks), --exclude=worker
 testharness+crashtest+reftest+test262
