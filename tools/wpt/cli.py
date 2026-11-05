@@ -1707,10 +1707,10 @@ def fast_harness_main(options: Options, argv: list[str]) -> int:
     requests are served from these files, and the paused clock jumps over
     timer waits. Use `--report` and `--baseline` like `fast`.
 
-    `--shard-size N` runs the selection in N-file chunks, each in its own
-    process, so an engine abort costs that chunk instead of the run. A chunk
-    that exits non-zero is split in half until the crashing file is found,
-    which is recorded as ERROR.
+    Each file runs in one process, so a page that aborts the engine ends the
+    attempt. The harness journals every file it starts and finishes, and this
+    restarts it until the selection is complete: a finished file is reported
+    from the journal, an unfinished one becomes its own ERROR or TIMEOUT.
     """
     wpt = resolve_wpt_root(options)
     if not (wpt / "wpt").is_file():
@@ -1740,21 +1740,9 @@ def fast_harness_main(options: Options, argv: list[str]) -> int:
             "--sidecar",
             sidecar.address,
         ]
-        shard_size, argv = take_shard_size(argv)
-        if shard_size is None:
-            command = [
-                str(binary),
-                "--wpt-root",
-                str(wpt),
-                *policy,
-                *argv,
-            ]
-            eprint("wpt: " + " ".join(command))
-            try:
-                return subprocess.run(command, cwd=str(ROOT), check=False).returncode
-            except OSError as error:
-                return die("fast-harness", f"cannot run {binary}: {error}")
-        return fast_harness_shards(binary, wpt, shard_size, argv, policy)
+        with tempfile.TemporaryDirectory(prefix="wpt-harness-journal-") as scratch:
+            journal = Path(scratch) / "journal.jsonl"
+            return run_harness_supervised(binary, wpt, policy, argv, journal)
     finally:
         sidecar.stop()
 
@@ -1886,277 +1874,89 @@ def wptserve_content_types(wpt: Path, venv: Path) -> str | None:
     return table or None
 
 
-def take_shard_size(argv: list[str]) -> tuple[int | None, list[str]]:
-    """Takes `--shard-size N` out of the arguments."""
-    rest: list[str] = []
-    size: int | None = None
-    index = 0
-    while index < len(argv):
-        if argv[index] == "--shard-size":
-            if index + 1 >= len(argv):
-                return None, argv
-            try:
-                size = int(argv[index + 1])
-            except ValueError:
-                return None, argv
-            index += 2
-            continue
-        rest.append(argv[index])
-        index += 1
-    return size, rest
-
-
-# Flags the runner takes where the value is the next argument. `--report`,
-# `--baseline`, `--offset`, and `--limit` are absent on purpose: the driver
-# owns them.
-HARNESS_VALUE_FLAGS = {
-    "--wpt-root",
-    "--jobs",
-    "--total-chunks",
-    "--this-chunk",
-}
-
-
-class HarnessArgs:
-    """A `fast-harness` command line, split between the driver and the runner."""
-
-    def __init__(self) -> None:
-        self.paths: list[str] = []
-        self.forward: list[str] = []
-        self.report: Path | None = None
-        self.baseline: Path | None = None
-        self.offset = 0
-        self.limit: int | None = None
-
-
-def split_harness_args(argv: list[str]) -> HarnessArgs:
-    """Separates paths, flags to forward, and the values the driver owns.
-
-    The driver owns `--report`, `--baseline`, and the offset/limit window: it
-    merges the shard reports itself, and it slices the selection so every
-    shard's own `--offset` is relative to that window.
-    """
-    args = HarnessArgs()
-    index = 0
-    while index < len(argv):
-        arg = argv[index]
-        value = argv[index + 1] if index + 1 < len(argv) else None
-        if arg == "--report" and value is not None:
-            args.report = Path(value)
-            index += 2
-            continue
-        if arg == "--baseline" and value is not None:
-            args.baseline = Path(value)
-            index += 2
-            continue
-        if arg in ("--offset", "--limit") and value is not None and value.isdigit():
-            if arg == "--offset":
-                args.offset = int(value)
-            else:
-                args.limit = int(value)
-            index += 2
-            continue
-        if arg in HARNESS_VALUE_FLAGS and value is not None:
-            args.forward.extend(argv[index : index + 2])
-            index += 2
-            continue
-        if arg.startswith("-"):
-            args.forward.append(arg)
-            index += 1
-            continue
-        args.paths.append(arg.removeprefix("/"))
-        index += 1
-    return args
-
-
-def harness_selection(
-    binary: Path, wpt: Path, args: HarnessArgs, policy: list[str]
-) -> list[str]:
-    """The sorted wptreport ids the same selection would run."""
-    command = [
-        str(binary),
-        "--wpt-root",
-        str(wpt),
-        *policy,
-        *args.paths,
-        "--offset",
-        str(args.offset),
-    ]
-    if args.limit is not None:
-        command.extend(["--limit", str(args.limit)])
-    command.append("--list")
-    try:
-        result = subprocess.run(
-            command, cwd=str(ROOT), check=False, capture_output=True, text=True
-        )
-    except OSError as error:
-        die("fast-harness", f"cannot run {binary}: {error}")
-        return []
-    if result.returncode != 0:
-        eprint(result.stderr.rstrip())
-        die("fast-harness", "cannot list the selection")
-        return []
-    return [
-        line.split("\t", 1)[1] for line in result.stdout.splitlines() if "\t" in line
-    ]
-
-
-def fast_harness_shards(
-    binary: Path, wpt: Path, shard_size: int, argv: list[str], policy: list[str]
+def run_harness_supervised(
+    binary: Path, wpt: Path, policy: list[str], argv: list[str], journal: Path
 ) -> int:
-    """Runs the selection in chunks and bisects any chunk that crashes."""
-    args = split_harness_args(argv)
-    if args.baseline is not None:
-        return die(
-            "fast-harness",
-            "--shard-size does not take --baseline; merge the shard reports first",
-        )
-    if not args.paths:
-        return die("fast-harness", "--shard-size needs at least one test path")
-    ids = harness_selection(binary, wpt, args, policy)
-    if not ids:
-        return die("fast-harness", "no tests selected")
-    with tempfile.TemporaryDirectory(prefix="wpt-harness-shards-") as scratch:
-        scratch_path = Path(scratch)
-        reports = run_shard_range(
-            binary,
-            wpt,
-            args,
-            ids,
-            0,
-            len(ids),
-            max(1, shard_size),
-            scratch_path,
-            1,
-            policy,
-        )
-        if not reports:
-            return die("fast-harness", "no shard produced a report")
-        loaded: list[tuple[Path, dict]] = []
-        for path in reports:
-            data, problem = load_report(path)
-            if data is None:
-                eprint(f"wpt: fast-harness: skipping {problem}")
-                continue
-            loaded.append((path, data))
-        merged, warnings, error = fold_reports(loaded)
-        for warning in warnings:
-            eprint(f"wpt: fast-harness: {warning}")
-        if error or merged is None:
-            return die("fast-harness", error or "no usable shard reports", 2)
-        if args.report is not None:
-            args.report.parent.mkdir(parents=True, exist_ok=True)
-            args.report.write_text(json.dumps(merged))
-            eprint(
-                f"wpt: fast-harness: {len(reports)} shards -> {args.report} "
-                f"({len(merged['results'])} results)"
-            )
-        return summarize_results(merged["results"])
+    """Runs the harness until every selected file has a verdict.
 
+    The engine runs in-process, so a hostile page can end the process without
+    unwinding: a layout recursion overflows the stack, a `QuickJS` assertion
+    aborts, a drain that never yields is cut by the harness watchdog. The
+    harness journals each file before it starts and again with its verdict, so
+    a restart reports the finished files from the journal, records the files
+    that were in flight as ERROR (or TIMEOUT after a watchdog cut), and runs
+    only the rest. That is what keeps one bad page from costing a chunk.
 
-def run_shard_range(
-    binary: Path,
-    wpt: Path,
-    args: HarnessArgs,
-    ids: list[str],
-    offset: int,
-    count: int,
-    shard_size: int,
-    scratch: Path,
-    depth: int,
-    policy: list[str],
-) -> list[Path]:
-    """Runs one slice; on a crash, halves it instead of losing the slice.
-
-    `offset` indexes `ids`, which is already the caller's window into the
-    selection, so the `--offset` a shard passes is `args.offset + offset`. A
-    slice of one file that still crashes records an ERROR for that file and
-    moves on, so one broken page cannot take the rest of the suite with it.
+    An attempt must finish at least one more file, or the loop stops: a harness
+    that dies before its first verdict is broken, not a bad page.
     """
-    size = min(count, shard_size)
-    reports: list[Path] = []
-    end = offset + count
-    while offset < end:
-        size = min(size, end - offset)
-        tag = f"{offset}-{size}-d{depth}"
-        out = scratch / f"shard-{tag}.json"
+    attempt = 0
+    stale = "error"
+    completed = 0
+    while True:
+        attempt += 1
         command = [
             str(binary),
             "--wpt-root",
             str(wpt),
             *policy,
-            *args.paths,
-            "--offset",
-            str(args.offset + offset),
-            "--limit",
-            str(size),
-            "--report",
-            str(out),
-            *args.forward,
+            *argv,
+            "--journal",
+            str(journal),
+            "--stale",
+            stale,
         ]
         eprint("wpt: " + " ".join(command))
         try:
             code = subprocess.run(command, cwd=str(ROOT), check=False).returncode
         except OSError as error:
-            eprint(f"wpt: fast-harness: cannot run {binary}: {error}")
-            return []
-        if code == 0 and out.exists():
-            reports.append(out)
-            offset += size
+            return die("fast-harness", f"cannot run {binary}: {error}")
+        if code == 0:
+            return 0
+        # Only a signal (the process died under a file) or exit 3 (the
+        # watchdog cut a file that stopped returning) is one file's verdict.
+        # Anything else is the driver's own failure: a bad flag, a baseline
+        # diff, an unwritable report.
+        if code > 0 and code != 3:
+            return code
+        finished, unfinished = read_journal(journal)
+        if unfinished:
+            shown = ", ".join(unfinished[:8])
+            more = f" and {len(unfinished) - 8} more" if len(unfinished) > 8 else ""
+            eprint(f"wpt: fast-harness: interrupted while running {shown}{more}")
+        if finished <= completed:
+            eprint(
+                f"wpt: fast-harness: attempt {attempt} stopped after {finished} "
+                f"files with no progress (exit {code})"
+            )
+            return code
+        # Exit 3 is the watchdog cutting a file that stopped returning; any
+        # other failure is the process dying under a file.
+        stale = "timeout" if code == 3 else "error"
+        completed = finished
+        eprint(f"wpt: fast-harness: attempt {attempt} stopped; resuming")
+
+
+def read_journal(path: Path) -> tuple[int, list[str]]:
+    """The finished count and the files an attempt left in flight.
+
+    A line that does not parse is a torn write from the abort that ended the
+    attempt, so it names nothing and its file runs again.
+    """
+    if not path.exists():
+        return 0, []
+    started: dict[str, None] = {}
+    done: set[str] = set()
+    for line in path.read_text(errors="replace").splitlines():
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
             continue
-        if size == 1:
-            broken = scratch / f"crashed-{offset}.json"
-            broken.write_text(
-                json.dumps(
-                    {
-                        "results": [
-                            {
-                                "test": "/" + ids[offset].lstrip("/"),
-                                "subsuite": "",
-                                "status": "ERROR",
-                                "message": "engine crashed in this file",
-                                "subtests": [],
-                            }
-                        ]
-                    }
-                )
-            )
-            eprint(f"wpt: fast-harness: engine crashed on /{ids[offset]}")
-            reports.append(broken)
-            offset += 1
-            continue
-        # Split and retry; keep the parent's remaining range for later.
-        half = size // 2
-        reports.extend(
-            run_shard_range(
-                binary,
-                wpt,
-                args,
-                ids,
-                offset,
-                half,
-                shard_size,
-                scratch,
-                depth + 1,
-                policy,
-            )
-        )
-        reports.extend(
-            run_shard_range(
-                binary,
-                wpt,
-                args,
-                ids,
-                offset + half,
-                size - half,
-                shard_size,
-                scratch,
-                depth + 1,
-                policy,
-            )
-        )
-        offset += size
-    return reports
+        if record.get("event") == "start":
+            started[record["id"]] = None
+        elif record.get("event") == "done":
+            done.add(record["outcome"]["id"])
+    return len(done), [test for test in started if test not in done]
 
 
 def manifest_main(options: Options, argv: list[str]) -> int:
@@ -2958,45 +2758,19 @@ def _selftest() -> None:
     assert parse_merge_argv(["a.json", "b.json", "--out"])[3] is not None
     assert parse_merge_argv(["a.json", "b.json", "--total-chunks", "2"])[3] is not None
 
-    # fast-harness sharding: the flag is ours, not the Rust runner's.
-    assert take_shard_size(["dom", "--shard-size", "50", "--jobs", "8"]) == (
-        50,
-        ["dom", "--jobs", "8"],
-    )
-    assert take_shard_size(["dom"]) == (None, ["dom"])
-    assert take_shard_size(["dom", "--shard-size"]) == (None, ["dom", "--shard-size"])
-    parsed = split_harness_args(
-        ["dom", "--jobs", "8", "--report", "r.json", "--verbose"]
-    )
-    assert (
-        parsed.paths,
-        parsed.forward,
-        parsed.report,
-        parsed.baseline,
-    ) == (
-        ["dom"],
-        ["--jobs", "8", "--verbose"],
-        Path("r.json"),
-        None,
-    )
-    # The driver owns the window and keeps every other flag's value attached:
-    # a forwarded flag whose value was read as a test path would run a
-    # different selection than the caller asked for.
-    parsed = split_harness_args(
-        [
-            "/dom/nodes",
-            "--baseline",
-            "b.json",
-            "--offset",
-            "10",
-            "--limit",
-            "5",
-            "--verbose",
-        ]
-    )
-    assert parsed.paths == ["dom/nodes"]
-    assert (parsed.offset, parsed.limit) == (10, 5)
-    assert parsed.forward == ["--verbose"]
+    # fast-harness resume: the driver reads the harness journal to tell the
+    # files that finished from the one an abort left in flight, and ignores a
+    # line a torn write cut in half.
+    with tempfile.TemporaryDirectory() as tmp:
+        journal = Path(tmp) / "journal.jsonl"
+        assert read_journal(journal) == (0, [])
+        journal.write_text(
+            '{"event":"start","id":"/a.html"}\n'
+            '{"event":"done","outcome":{"id":"/a.html","status":"PASS"}}\n'
+            '{"event":"start","id":"/b.html"}\n'
+            '{"event":"done","outcome":{"id":"/b.html","sta'
+        )
+        assert read_journal(journal) == (1, ["/b.html"])
 
     _selftest_profile()
     _selftest_failures()
@@ -3264,7 +3038,8 @@ TOP_HELP = """tinybrowser WPT harness: run | score | rerun | merge | profile | f
     Reftests compare rendered pixels; testdriver still needs a WebDriver
     session (--exclude-testdriver leaves those files to it).
     --total-chunks N --this-chunk K splits by source directory.
-    --shard-size N isolates an engine abort to one file.
+    A file that aborts the engine is one ERROR or TIMEOUT: the runner journals
+    each file and this command restarts it until the selection is complete.
   overnight [--save-report FILE] [--dry-run] [-- runner...]
     Full-suite run + score. Long; needs explicit approval per AGENTS.md.
   selftest

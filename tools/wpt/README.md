@@ -100,22 +100,17 @@ at 12 jobs. A truncated file is never mistaken for a verdict: testharness
 reports `interrupted` when the engine cuts a script short, and the runner
 gives each file one drain with its whole budget instead of a short slice.
 
-`--shard-size N` (in cli.py) runs the sorted selection in N-file processes,
-whatever mix of testharness, crashtest, and reftest the slice contains.
-Each shard is a separate `--offset`/`--limit` slice, so an engine abort costs
-one shard instead of the run; a shard that exits non-zero is bisected until
-the single crashing file is found, and that file is recorded as ERROR. The
-driver owns the window: a `--offset`/`--limit` on the command line slices the
-selection once and every shard's slice stays inside it, and the other runner
-flags (`--jobs`) pass through with their values. Use it for directories where
-layout or paint can panic (html/ currently does): a panic in-process bypasses
-the harness's per-file error framing, and unwinding a half-torn engine can
-abort outright. dom/ needs no sharding and runs 788 manifest tests in ~26 s
-at 16 jobs, with 109 testdriver skips. html/ selects 7,895 manifest tests, so
-it is sharded. The parity counts from the older tree-walking selector are
-gone with it: that selector counted support pages and references (always
-PASS) and could not see `.any.js`/`.window.js` sources at all, so its
-"matched" numbers were over an intersection rather than the suite.
+A file can end the process instead of returning a verdict: layout can recurse
+until the stack overflows, a `QuickJS` assertion aborts, and a page can spin in
+a drain that never yields. The harness writes a journal line before each file
+and another with its verdict (`--journal PATH`), so `cli.py fast-harness` runs
+it again after such an abort, reports the finished files from the journal,
+records the files that were in flight as ERROR (TIMEOUT when the watchdog cut a
+file that stopped returning) and runs only the rest. Each attempt must finish
+at least one more file, so a harness that dies before its first verdict fails
+the run instead of looping. The in-process watchdog allows every file its
+budget plus 30 s before it ends the attempt, which is far above the slowest
+real file and below a stack overflow on the deepest page.
 
 Known gap: an async listener that leaves a host object borrowed makes
 rquickjs panic with `AlreadyBorrowed` in `Class::borrow_mut`; rquickjs

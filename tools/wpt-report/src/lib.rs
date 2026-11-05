@@ -133,7 +133,11 @@ pub struct Subtest {
 }
 
 /// One file's result.
-#[derive(Clone, Debug)]
+///
+/// `Deserialize` as well as `Serialize`: the harness journals finished files so
+/// a process that aborts can resume, and a resumed verdict has to survive the
+/// round trip unchanged.
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Outcome {
     /// wptreport test identifier, such as `/dom/nodes/Node-nodeName.html`.
     pub id: String,

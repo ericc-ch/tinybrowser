@@ -10,15 +10,17 @@
 //! completion payload the host polls.
 
 mod engine;
+mod journal;
 mod services;
 mod sidecar;
 mod suite;
 mod template;
+mod watchdog;
 mod wrapper;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -44,6 +46,10 @@ struct Options {
     budgets: engine::Budgets,
     content_types: HashMap<String, String>,
     sidecar: Option<sidecar::Sidecar>,
+    /// Per-file verdict log; a restarted process resumes from it.
+    journal: Option<PathBuf>,
+    /// How a file the previous attempt left running is recorded.
+    stale: journal::Stale,
 }
 
 /// Which clock a worker's Tokio runtime uses.
@@ -80,6 +86,8 @@ impl Options {
             },
             content_types: HashMap::new(),
             sidecar: None,
+            journal: None,
+            stale: journal::Stale::Died,
         }
     }
 
@@ -158,18 +166,27 @@ fn main() {
         return;
     }
     let started = Instant::now();
-    let outcomes = run_selected(&options, &cases);
+    let (journal, resumed) = match options.journal.as_deref() {
+        Some(path) => match journal::Journal::open(path) {
+            Ok((journal, resumed)) => (Some(journal), resumed),
+            Err(error) => {
+                eprintln!("wpt-harness: cannot open {}: {error}", path.display());
+                std::process::exit(2);
+            }
+        },
+        None => (None, journal::Resumed::default()),
+    };
+    let outcomes = run_selected(&options, &cases, journal.as_ref(), &resumed);
     let wall = started.elapsed();
-    let reported: Vec<_> = outcomes.iter().map(reported).collect();
-    wpt_report::summarize(&reported, wall, options.verbose);
+    wpt_report::summarize(&outcomes, wall, options.verbose);
     if let Some(path) = &options.report
-        && let Err(error) = wpt_report::write_report(path, &reported)
+        && let Err(error) = wpt_report::write_report(path, &outcomes)
     {
         eprintln!("wpt-harness: cannot write {}: {error}", path.display());
         std::process::exit(2);
     }
     if let Some(baseline) = &options.baseline {
-        match wpt_report::compare(baseline, &reported) {
+        match wpt_report::compare(baseline, &outcomes) {
             Ok(comparison) => {
                 wpt_report::print_comparison(&comparison);
                 if comparison.failed() {
@@ -200,43 +217,126 @@ fn exit(code: i32) -> ! {
     std::process::exit(code)
 }
 
-/// Runs every case in the selection.
-fn run_selected(options: &Options, cases: &[TestCase]) -> Vec<Outcome> {
-    run_all(
-        &options.root,
-        cases,
-        options.jobs,
-        options.clock,
-        options.budgets,
-        &options.content_types,
-        options.sidecar,
-    )
+/// Runs every case in the selection, then reports what an earlier attempt left.
+fn run_selected(
+    options: &Options,
+    cases: &[TestCase],
+    journal: Option<&journal::Journal>,
+    resumed: &journal::Resumed,
+) -> Vec<wpt_report::Outcome> {
+    let mut finished = resumed.done.clone();
+    if let Some(journal) = journal {
+        // A file the previous attempt started never reached a verdict of its
+        // own, so one file's ERROR or TIMEOUT is the honest answer. Writing it
+        // down now keeps a second restart from asking again.
+        for case in cases {
+            if !resumed.stale.contains(&case.id()) {
+                continue;
+            }
+            let outcome = interrupted(case, options.stale);
+            journal.finish(&outcome);
+            finished.insert(case.id(), outcome);
+        }
+    }
+    run_all(options, cases, journal, &finished)
 }
 
-/// Runs every case, one current-thread runtime per worker.
-fn run_all(
-    root: &std::path::Path,
-    cases: &[TestCase],
-    jobs: usize,
-    clock: Clock,
-    budgets: engine::Budgets,
-    content_types: &HashMap<String, String>,
-    sidecar: Option<sidecar::Sidecar>,
-) -> Vec<Outcome> {
-    if cases.is_empty() {
-        return Vec::new();
+/// One file's verdict when the process that ran it stopped before it finished.
+fn interrupted(case: &TestCase, stale: journal::Stale) -> wpt_report::Outcome {
+    let status = match stale {
+        journal::Stale::Died => engine::Status::Error,
+        journal::Stale::TimedOut => engine::Status::Timeout,
+    };
+    wpt_report::Outcome {
+        id: case.id(),
+        status,
+        message: Some(journal::stale_message(stale).into()),
+        duration: Duration::ZERO,
+        subtests: Vec::new(),
+        testharness: matches!(case.kind, Kind::Testharness),
     }
+}
+
+/// Runs every case that has no verdict yet, one current-thread runtime per
+/// worker.
+fn run_all(
+    options: &Options,
+    cases: &[TestCase],
+    journal: Option<&journal::Journal>,
+    finished: &HashMap<String, wpt_report::Outcome>,
+) -> Vec<wpt_report::Outcome> {
+    let mut slots: Vec<Option<wpt_report::Outcome>> = cases
+        .iter()
+        .map(|case| finished.get(&case.id()).cloned())
+        .collect();
+    // A resumed file keeps the verdict it already has; only the rest runs, so
+    // a restart costs the files after the abort, not the whole chunk.
+    let pending: Vec<usize> = (0..cases.len())
+        .filter(|&index| slots[index].is_none())
+        .collect();
+    if !pending.is_empty() {
+        run_pending(options, cases, &pending, journal, &mut slots);
+    }
+    slots
+        .into_iter()
+        .zip(cases)
+        .map(|(slot, case)| {
+            slot.unwrap_or_else(|| wpt_report::Outcome {
+                id: case.id(),
+                status: engine::Status::Skip,
+                message: Some("worker stopped before this test".into()),
+                duration: Duration::ZERO,
+                subtests: Vec::new(),
+                testharness: matches!(case.kind, Kind::Testharness),
+            })
+        })
+        .collect()
+}
+
+/// Runs `pending` across the workers and fills their slots.
+fn run_pending(
+    options: &Options,
+    cases: &[TestCase],
+    pending: &[usize],
+    journal: Option<&journal::Journal>,
+    slots: &mut [Option<wpt_report::Outcome>],
+) {
     let next = AtomicUsize::new(0);
     let (sender, receiver) = mpsc::channel();
-    let workers = jobs.clamp(1, cases.len());
+    let workers = options.jobs.clamp(1, pending.len());
+    let watchdog = watchdog::Watchdog::new(workers);
+    let done = AtomicBool::new(false);
+    let done = &done;
     std::thread::scope(|scope| {
-        for _ in 0..workers {
+        // One monitor for every worker: a file that stops returning ends this
+        // process so the driver can record it and resume after it.
+        let monitor = &watchdog;
+        scope.spawn(move || {
+            while !done.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(200));
+                let Some(index) = monitor.expired() else {
+                    continue;
+                };
+                let case = &cases[index];
+                let outcome = interrupted(case, journal::Stale::TimedOut);
+                if let Some(journal) = journal {
+                    journal.finish(&outcome);
+                }
+                eprintln!(
+                    "wpt-harness: {} stopped returning; exiting for the driver to resume",
+                    outcome.id
+                );
+                std::process::exit(3);
+            }
+        });
+        for worker in 0..workers {
             let sender = sender.clone();
             let next = &next;
+            let watchdog = &watchdog;
             scope.spawn(move || {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_time()
-                    .start_paused(clock == Clock::Paused)
+                    .start_paused(options.clock == Clock::Paused)
                     .build()
                     .unwrap_or_else(|error| {
                         eprintln!("wpt-harness: cannot create runtime: {error}");
@@ -245,21 +345,27 @@ fn run_all(
                 // One font database per worker: building it scans the system
                 // fonts, and every engine this thread creates can share it.
                 let fonts = renderer::Fonts::default();
-                loop {
-                    let index = next.fetch_add(1, Ordering::Relaxed);
-                    let Some(case) = cases.get(index) else {
-                        break;
-                    };
+                while let Some(&index) = pending.get(next.fetch_add(1, Ordering::Relaxed)) {
+                    let case = &cases[index];
+                    if let Some(journal) = journal {
+                        journal.start(&case.id());
+                    }
+                    watchdog.enter(worker, index, options.budgets.for_case(case));
                     let started = Instant::now();
-                    let mut session =
-                        engine::Session::new(root, content_types.clone(), budgets, &fonts, sidecar);
+                    let mut session = engine::Session::new(
+                        &options.root,
+                        options.content_types.clone(),
+                        options.budgets,
+                        &fonts,
+                        options.sidecar,
+                    );
                     // Layout, paint, and the bindings can panic on a hostile
                     // page. A panic is this file's ERROR, not the end of the
                     // run; the engine that saw it is abandoned rather than
                     // dropped, because dropping a half-torn heap can panic
                     // again during unwinding.
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        runtime.block_on(session.run(case, clock == Clock::Paused))
+                        runtime.block_on(session.run(case, options.clock == Clock::Paused))
                     }));
                     let outcome = result.unwrap_or_else(|_| {
                         Box::leak(Box::new(session));
@@ -272,6 +378,11 @@ fn run_all(
                             duration: started.elapsed(),
                         }
                     });
+                    watchdog.leave(worker);
+                    let outcome = reported(&outcome);
+                    if let Some(journal) = journal {
+                        journal.finish(&outcome);
+                    }
                     if sender.send((index, outcome)).is_err() {
                         break;
                     }
@@ -279,25 +390,11 @@ fn run_all(
             });
         }
         drop(sender);
-        let mut slots: Vec<Option<Outcome>> = (0..cases.len()).map(|_| None).collect();
         for (index, outcome) in receiver {
             slots[index] = Some(outcome);
         }
-        slots
-            .into_iter()
-            .enumerate()
-            .map(|(index, outcome)| {
-                outcome.unwrap_or_else(|| Outcome {
-                    id: cases[index].id(),
-                    kind: cases[index].kind,
-                    status: engine::Status::Skip,
-                    message: Some("worker stopped before this test".into()),
-                    subtests: Vec::new(),
-                    duration: std::time::Duration::ZERO,
-                })
-            })
-            .collect()
-    })
+        done.store(true, Ordering::Relaxed);
+    });
 }
 
 /// The shared report shape for one engine outcome.
@@ -341,6 +438,10 @@ Runs WPT testharness and crashtest files in-process.
   --long-budget S  wall-clock seconds before a long-timeout file is TIMEOUT
   --content-types JSON  wptserve's extension-to-content-type map
   --sidecar HOST:PORT  wptserve process for `.py` handler routes
+  --journal PATH    log per-file progress; a restart resumes after it
+  --stale MODE      how a file the previous attempt left running is recorded:
+                    `error` (the process died) or `timeout` (it stopped
+                    returning and the attempt was cut)
   --real-time       use the wall clock instead of the paused clock
   --verbose         print failing tests and the ten slowest files
   --list            print the selected files and exit
@@ -436,6 +537,14 @@ fn parse_flag(
                 .parse()
                 .map_err(|_| format!("--sidecar needs HOST:PORT, got {raw}"))?;
             options.sidecar = Some(sidecar::Sidecar::new(address));
+        }
+        "--journal" => options.journal = Some(path_arg(args, "--journal")?),
+        "--stale" => {
+            options.stale = match args.next().as_deref() {
+                Some("error") => journal::Stale::Died,
+                Some("timeout") => journal::Stale::TimedOut,
+                _ => return Err("--stale needs `error` or `timeout`".into()),
+            };
         }
         "--real-time" => options.clock = Clock::Real,
         "--verbose" => options.verbose = true,

@@ -33,7 +33,7 @@ pub struct Budgets {
 
 impl Budgets {
     /// The wall-clock budget for one file.
-    fn for_case(self, case: &TestCase) -> Duration {
+    pub(crate) fn for_case(self, case: &TestCase) -> Duration {
         if case.long_timeout {
             self.long
         } else {

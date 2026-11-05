@@ -4311,6 +4311,7 @@ dependencies = [
  "net",
  "percent-encoding",
  "renderer",
+ "serde",
  "serde_json",
  "tokio",
  "url",
