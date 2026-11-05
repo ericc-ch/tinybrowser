@@ -12,10 +12,12 @@
 # report into one table. The nightly `wpt-nightly.yml` still runs the whole
 # suite through WebDriver, which is the fidelity backstop.
 #
-# Cost: the harness lane is ~4.6k CPU-seconds and the WebDriver lane ~2k, so
-# the chunk counts below split the repository's 20-job / 80-core limit to put
-# both lanes at roughly the same wall time (the WebDriver lane is ~5x slower
-# per test).
+# Cost: measured over the five-chunk and fifteen-chunk lanes, the harness lane
+# is ~34 chunk-minutes at 4 jobs and the WebDriver lane ~28 (it runs far fewer
+# files but each one costs a browser round trip). The chunk counts below split
+# the repository's 20-job limit in that ratio, so both lanes finish together.
+# Re-measure before changing them: the balance, not the file count, is what
+# sets the wall time.
 name: WPT
 
 on:
@@ -26,11 +28,11 @@ on:
       harness-chunks:
         description: In-process chunk jobs; ~4 vCPUs each.
         type: string
-        default: "15"
+        default: "11"
       webdriver-chunks:
         description: WebDriver chunk jobs; harness + WebDriver must total <= 20.
         type: string
-        default: "5"
+        default: "9"
       test-types:
         description: Space-separated wptrunner test types; stays last (nargs).
         type: string
@@ -59,8 +61,8 @@ env:
   # a vendored copy.
   OPENSSL_NO_VENDOR: "1"
   # Dispatch inputs are empty on pushes, so every use goes through these.
-  WPT_HARNESS_CHUNKS: ${{ inputs.harness-chunks || '15' }}
-  WPT_WEBDRIVER_CHUNKS: ${{ inputs.webdriver-chunks || '5' }}
+  WPT_HARNESS_CHUNKS: ${{ inputs.harness-chunks || '11' }}
+  WPT_WEBDRIVER_CHUNKS: ${{ inputs.webdriver-chunks || '9' }}
   WPT_TEST_TYPES: ${{ inputs.test-types || 'testharness crashtest reftest' }}
   WPT_EXCLUDE: ${{ inputs.exclude || 'worker' }}
 
@@ -99,8 +101,34 @@ jobs:
           retention-days: 3
 
   build:
+    name: build ${{ matrix.name }}
     runs-on: ubuntu-24.04
     timeout-minutes: 120
+    strategy:
+      # One job per binary so the three links overlap. Linking dominates the
+      # wpt profile (~155 s of the ~236 s build step on one 4-core runner), and
+      # a link cannot be split across cores, so serialising them is the cost.
+      fail-fast: false
+      matrix:
+        include:
+          # `output` is the file name the consuming job downloads;
+          # `artifact` is the upload name, which stays per binary so a chunk
+          # downloads only what it runs.
+          - name: browser
+            package: tinybrowser
+            binary: tinybrowser
+            output: tinybrowser-wpt
+            artifact: tinybrowser-wpt
+          - name: harness
+            package: wpt-harness
+            binary: wpt-harness
+            output: wpt-harness
+            artifact: wpt-harness-bin
+          - name: fast
+            package: wpt-fast
+            binary: wpt-fast
+            output: wpt-fast
+            artifact: wpt-fast-bin
     steps:
       - uses: actions/checkout@v7
       - name: System libraries
@@ -129,33 +157,31 @@ jobs:
         uses: mozilla-actions/sccache-action@v0.0.11
         with:
           version: "v0.18.0"
-      - name: Build the wpt profile
+      - name: Build
         env:
           SCCACHE_GHA_ENABLED: "true"
           RUSTC_WRAPPER: "sccache"
         run: |
-          # The tools are workspace members, not default members: a bare
-          # `cargo build` would build only the browser and the copy below
-          # would fail.
-          cargo build --profile wpt --locked -p tinybrowser -p wpt-harness -p wpt-fast
-          cp "$(./tools/binary-path --profile wpt tinybrowser)" tinybrowser-wpt
-          cp "$(./tools/binary-path --profile wpt wpt-harness)" wpt-harness
-          cp "$(./tools/binary-path --profile wpt wpt-fast)" wpt-fast
-          ls -l tinybrowser-wpt wpt-harness wpt-fast
+          # One package per job: the three links are the build's serial cost,
+          # and each job renders only its own binary.
+          cargo build --profile wpt --locked -p "${{ matrix.package }}"
+          cp "$(./tools/binary-path --profile wpt "${{ matrix.binary }}")" \
+            "${{ matrix.output }}"
+          ls -l "${{ matrix.output }}"
       - name: Check runtime libraries
+        if: ${{ matrix.name == 'harness' }}
         run: |
-          missing="$(ldd wpt-harness | grep 'not found' || true)"
+          missing="$(ldd "${{ matrix.output }}" | grep 'not found' || true)"
           if [[ -n "$missing" ]]; then
             echo "::error::missing runtime libraries in the runner image:"$'\n'"$missing"
             exit 1
           fi
+      # One artifact per binary: a harness chunk needs 228 MB, not the 1.1 GB
+      # bundle, and the WebDriver lane needs only the browser.
       - uses: actions/upload-artifact@v7
         with:
-          name: wpt-binaries
-          path: |
-            tinybrowser-wpt
-            wpt-harness
-            wpt-fast
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.output }}
           retention-days: 3
 
   harness:
@@ -172,9 +198,19 @@ jobs:
       - name: WPT checkout (pinned, shallow)
         run: git submodule update --init --depth 1 third_party/wpt
       - uses: astral-sh/setup-uv@v10.3.0
+      - name: WPT revision
+        id: wpt
+        run: echo "rev=$(git -C third_party/wpt rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      # The venv is a tool install, not a verdict: same WPT revision and
+      # Python, same install. `ensure_venv` re-checks its stamp and rebuilds a
+      # stale cache instead of trusting it.
+      - uses: actions/cache@v6
+        with:
+          path: third_party/wpt/_venv3
+          key: wpt-venv-${{ runner.os }}-${{ steps.wpt.outputs.rev }}
       - uses: actions/download-artifact@v8
         with:
-          name: wpt-binaries
+          name: wpt-harness-bin
       - uses: actions/download-artifact@v8
         with:
           name: wpt-manifest
@@ -231,9 +267,19 @@ jobs:
       - name: WPT checkout (pinned, shallow)
         run: git submodule update --init --depth 1 third_party/wpt
       - uses: astral-sh/setup-uv@v10.3.0
+      - name: WPT revision
+        id: wpt
+        run: echo "rev=$(git -C third_party/wpt rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      # The venv is a tool install, not a verdict: same WPT revision and
+      # Python, same install. `ensure_venv` re-checks its stamp and rebuilds a
+      # stale cache instead of trusting it.
+      - uses: actions/cache@v6
+        with:
+          path: third_party/wpt/_venv3
+          key: wpt-venv-${{ runner.os }}-${{ steps.wpt.outputs.rev }}
       - uses: actions/download-artifact@v8
         with:
-          name: wpt-binaries
+          name: tinybrowser-wpt
       - uses: actions/download-artifact@v8
         with:
           name: wpt-manifest
@@ -300,7 +346,7 @@ jobs:
         run: git submodule update --init --depth 1 third_party/wpt
       - uses: actions/download-artifact@v8
         with:
-          name: wpt-binaries
+          name: wpt-fast-bin
       - name: Run test262
         env:
           REPORT: ${{ github.workspace }}/wpt-report-test262.json
