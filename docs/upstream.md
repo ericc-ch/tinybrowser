@@ -6,6 +6,10 @@ Policy: upstream bugs stay upstream. Our code stays simple; these fail closed as
 
 ### blitz (third_party/blitz, master)
 
+- 87a336178 paint border edges in edge order, grouping only by colour. The per-edge fill grouped identical colours by sorting on the RGBA components, so paint order depended on the colour values: a green top border and a black left border painted black first, and along the mitre they share the later fill wins the anti-aliased pixel. The reference of `css/css-borders/border-radius-greater-than-width.html` (two neighbouring boxes, black painted last) disagreed by 100 pixels on that diagonal. Colours are now grouped in first-appearance order: the first edge of a colour fixes where the combined path is filled and later edges of that colour join it, so same-coloured sides still share one fill and different colours keep edge order. Matches Blink, which paints sides in order and draws a uniform border as one path. Upstream-able to Blitz.
+- ff37545a5 split a rounded corner when an adjacent border width is zero. `CssBox::start_angle` divided by the border width of the side the arc sweeps from, so a 10px corner between a 100px border and a zero-width one computed `0 / 0` and wrote `NaN` points into `border_edge_shape`; filling that path aborted inside tiny-skia's alpha runs (`css/css-borders/border-radius-greater-than-width.html`). The closed form is now evaluated through the limits instead of dividing: an absent `bt` side puts the split at the end of its half of the quarter arc, an absent `br` side at the start, and a corner with no border on either side halves it. The ratio is rearranged to `radii.y * br_width / (bt_width * radii.x)` so it is formed once; identical for the nonzero case. Upstream-able to Blitz.
+- 68cb96c13 saturate used lengths at the `LayoutUnit` limit. Stylo computes used lengths in `f32`, so a large enough `zoom`/`em` overflows the box model before layout sees it: `css/css-viewport/zoom/massive-zoom-viewbox-crash.html`'s huge zoom gives a fieldset a 2.47e26 px padding, Taffy's `available_width - insets` becomes `NaN`, and Parley's line breaker asserts on the non-finite advance and aborts. Blink is safe because every used length passes through `LayoutUnit`, which saturates at 2^25 px. `stylo_taffy::convert::saturating_px` applies that limit where stylo values become Taffy values (`length_percentage`, fit-content, border, resolved `calc()`, the padding percentage path) and where Blitz hands lengths to Parley directly (font size, line height, spacing, baseline shift, text indent). The same commit floors the inline content width at zero (a border-box narrower than its own padding, as Blink's `ComputeContentBoxLogicalWidth` does) and clamps a content slot's line advance into `0..=width`, because Parley asserts `line_max_advance <= layout_max_advance` and a negative slot is legal when padding exceeds the containing block. Upstream-able to Blitz; the saturation is a browser invariant, not a test-specific guard.
+
 - 7eaf40f66 refuse an `@import` whose URL does not resolve. `request_stylesheet` unwrapped `CssUrl::url()`, so an empty `url()` aborted the process (`empty-background-image.html`) and, once resolved against the base URL, would have fetched the document itself. A URL-less import now joins the refused imports (too deep, unsupported condition): no sheet, no request (`https://drafts.csswg.org/css-values-4/#url-empty`). Upstream-able to Blitz.
 - 87d86ebd4 ignore a stylesheet response whose owner node is gone. A document rebuilt in place (the `parsererror` tree for a non-well-formed XML response, `document.open`) drops nodes while their fetches are in flight; `load_resource` indexed the response's node unconditionally and aborted. Node ids are generation-checked, so a missing node can only be the request's own owner: installing nothing is what CSSOM says once the owner is out of the document (`https://drafts.csswg.org/cssom/#concept-css-style-sheet`), and a reused slot can never answer for it. The processing-instruction staleness check beside it already had that shape. Upstream-able to Blitz.
 - 06bfef615 keep table structure out of `special_data`. The table context is a layout product, but `construct_layout_tree` stored it in the element's `SpecialElementData`, the slot that holds represented content, so anything styled `display: table` lost its content: `canvas-fallback.html`'s `#canvas4` reached the replaced-element intrinsic-size switch with `TableRoot` data and hit `unreachable!()`, aborting the run (an `<img>` would have lost its image the same way). The context now lives on `ElementData::table_root` beside `layout_data`, `IS_TABLE_ROOT` still marks the box, and the intrinsic-size match answers the remaining non-replaced variants explicitly instead of `_ => unreachable!()`. `1ae401bf0` clears the field next to `take_inline_layout`, where construction flags reset, so a box that stops being a table cannot keep a stale context that paint would read. Upstream-able to Blitz.
@@ -115,27 +119,32 @@ Exotic fallthrough machinery the stock engine lacks (2afa33b, 88a9be3, 2339e92, 
 
 ## Open issues
 
-- An aborted engine process is contained, not fixed, when the panic is inside a
-  dependency. Two remain, both reached through the in-process harness
-  (`wpt-harness --jobs 1 <file>`, `RUST_BACKTRACE=1`):
-  - `tiny-skia` 0.12.0 `alpha_runs.rs:189`: `AlphaRuns::break_run` unwraps a
-    zero-length run while scanline-filling the border path of
-    `css/css-borders/border-radius-greater-than-width.html` (a 10px
-    `border-*-radius` against a 100px border on a 9px-wide box, so the inner
-    arc radius clamps to zero). 0.12.0 is the newest release. The path is
-    built by `blitz-paint`'s `CssBox::border_edge_shape`; whether it is
-    malformed there or tiny-skia is too strict is not yet decided, so no
-    workaround is built.
-  - `parley` 0.12.0 `layout/line_break.rs:1029`: `break_next` asserts that the
-    chosen line advance does not exceed the layout advance by 1px or more.
-    `css/css-viewport/zoom/massive-zoom-viewbox-crash.html` (an enormous zoom
-    factor) violates the internal invariant. Upstream assert on reachable
-    input; needs either a parley fix or a decision that the layout input is
-    unrepresentable.
-  Both are recorded rather than patched: a vendored crate or a caller-side
-  guess would hide the upstream defect. The harness's journal and per-window
-  process restart keep an abort from costing more than the file it happened
-  on.
+- An aborted engine process is contained when the panic is inside a dependency.
+  The two the in-process harness used to reach are now fixed at their call
+  sites, with the reasons recorded above:
+  - `tiny-skia` 0.12.0 `alpha_runs.rs:189` unwrapped a zero-length run while
+    scanline-filling the border path of
+    `css/css-borders/border-radius-greater-than-width.html`. The path was
+    malformed, not the rasterizer: `CssBox::start_angle` wrote `NaN` points for
+    a corner whose adjacent border width is zero. Fixed in blitz@ff37545a5; the
+    test now matches its reference (blitz@87a336178).
+  - `parley` 0.12.0 `layout/line_break.rs:1029` asserted that the line advance
+    does not exceed the layout advance by 1px or more.
+    `css/css-viewport/zoom/massive-zoom-viewbox-crash.html` supplied a `NaN`
+    advance because stylo used lengths exceeded what the box-model arithmetic
+    can carry. Fixed in blitz@68cb96c13 by saturating used lengths at Blink's
+    `LayoutUnit` limit and clamping the line advance.
+  The harness's journal and per-window process restart still contain an abort
+  from any other dependency.
+- The WebDriver lane cannot run `?feature=bidi` tests. `testdriver.js`'s
+  `subscribe` posts `bidi.session.subscribe`, which needs a BiDi session and a
+  `WebDriverBidiProtocol`; `TinyBrowserProtocol` has `enable_bidi = False` and
+  no BiDi transport, so the command is not implemented and most of those files
+  end in testharness's own 10 s timeout. `console/console-count-logging.html`
+  waits on a subscription that never resolves and reaches wptrunner's external
+  timeout (19.5 s locally). Implementing BiDi (`session.subscribe`,
+  `log.entryAdded`, and a WebSocket transport) is a feature, not a fix, and is
+  deferred; the in-process lane skips these files by design.
 - The engine keeps memory alive per document it creates. Measured in the
   in-process harness at 4 jobs: 400 `css-ui/compute-kind-widget-generated`
   reftests grow RSS by ~2.1 GB, and 400 `dom/nodes` testharness files by
