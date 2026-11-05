@@ -109,6 +109,19 @@ Exotic fallthrough machinery the stock engine lacks (2afa33b, 88a9be3, 2339e92, 
 
 ## Open issues
 
+- The engine keeps memory alive per document it creates. Measured in the
+  in-process harness at 4 jobs: 400 `css-ui/compute-kind-widget-generated`
+  reftests grow RSS by ~2.1 GB, and 400 `dom/nodes` testharness files by
+  ~0.7 GB, both linear. Valgrind's leak check sees only one engine tree per
+  run (`Engine::with_fonts` -> `Rc<RefCell<RealmRegistry>>`) and a live heap
+  that does not grow, so the growth is not a malloc-visible leak: the process
+  gains 64 MB anonymous mappings it never unmaps. The cause is not yet
+  identified. The browser masks it by ending a renderer child with its test;
+  `tools/wpt/cli.py` bounds it by running the selection in windows of
+  `WINDOW_TESTS` files, each a fresh harness process, with the journal
+  carrying the verdicts across them. Do not remove the windows without a
+  measurement: one chunk in one process reached 12 GB at file 2762 on a
+  16 GB runner.
 - Character data, titles, and attributes keep lone surrogates in a tinybrowser side table (`exact_text`, `exact_attrs`). The layout tree still stores lossy UTF-8, so style matching never sees a U+FFFD stand-in. Fixed on our side, not in the fork's storage.
 - `blitz-dom` hosts shadow roots (`NodeData::ShadowRoot`, `ElementData::shadow_root`, blitz@ca29873). `attachShadow` returns the root, closed mode makes `shadowRoot` null, and style walks the shadow host without panicking. `ShadowRootInit` members other than `mode` (`delegatesFocus`, `clonable`, `serializable`, `slotAssignment`) are not stored. Shadow-scoped cascade data is still absent, so a `<style>` inside a shadow tree does not apply, and box construction still walks light-DOM children. Composed events do not cross a shadow root: the path stops there and `event.target` is not retargeted to the host. `getComposedRanges` stays a no-op. Partially fixed in fork.
 - Reading `HTMLTemplateElement.content` copies the template contents into an inert document. `content.ownerDocument` is that document. Nested templates that have not been read stay same-document fragments inside it. Fixed on our side (fragment plumbing remains blitz@ffec5987/96443edf).

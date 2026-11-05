@@ -176,9 +176,10 @@ fn main() {
         },
         None => (None, journal::Resumed::default()),
     };
-    let outcomes = run_selected(&options, &cases, journal.as_ref(), &resumed);
+    let (attempt, outcomes) = run_selected(&options, &cases, journal.as_ref(), &resumed);
     let wall = started.elapsed();
-    wpt_report::summarize(&outcomes, wall, options.verbose);
+    // The summary is this process's work; the report carries every window.
+    wpt_report::summarize(&attempt, wall, options.verbose);
     if let Some(path) = &options.report
         && let Err(error) = wpt_report::write_report(path, &outcomes)
     {
@@ -223,7 +224,7 @@ fn run_selected(
     cases: &[TestCase],
     journal: Option<&journal::Journal>,
     resumed: &journal::Resumed,
-) -> Vec<wpt_report::Outcome> {
+) -> (Vec<wpt_report::Outcome>, Vec<wpt_report::Outcome>) {
     let mut finished = resumed.done.clone();
     if let Some(journal) = journal {
         // A file the previous attempt started never reached a verdict of its
@@ -238,7 +239,21 @@ fn run_selected(
             finished.insert(case.id(), outcome);
         }
     }
-    run_all(options, cases, journal, &finished)
+    let attempt = run_all(options, cases, journal, &finished);
+    let mut outcomes = attempt.clone();
+    if journal.is_some() {
+        // A verdict can belong to a window this process was not given; the
+        // report is still the whole run, because the driver hands one window
+        // at a time and the last window writes it.
+        let selected: std::collections::HashSet<String> = cases.iter().map(TestCase::id).collect();
+        for (id, outcome) in &finished {
+            if !selected.contains(id) {
+                outcomes.push(outcome.clone());
+            }
+        }
+        outcomes.sort_by(|left, right| left.id.cmp(&right.id));
+    }
+    (attempt, outcomes)
 }
 
 /// One file's verdict when the process that ran it stopped before it finished.

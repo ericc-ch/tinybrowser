@@ -112,6 +112,13 @@ the run instead of looping. The in-process watchdog allows every file its
 budget plus 30 s before it ends the attempt, which is far above the slowest
 real file and below a stack overflow on the deepest page.
 
+One process does not run a whole chunk. The engine keeps ~5 MB per file alive
+(`docs/upstream.md`), so `cli.py` splits the selection into windows of 600 files
+and starts a fresh harness process for each; the journal carries the verdicts
+across windows, so a window boundary re-runs nothing and loses nothing. The
+window is a memory bound, not a result cache: every file still runs exactly
+once per invocation.
+
 Known gap: an async listener that leaves a host object borrowed makes
 rquickjs panic with `AlreadyBorrowed` in `Class::borrow_mut`; rquickjs
 converts that panic into a script exception, so the run still finishes and

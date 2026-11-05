@@ -1742,7 +1742,7 @@ def fast_harness_main(options: Options, argv: list[str]) -> int:
         ]
         with tempfile.TemporaryDirectory(prefix="wpt-harness-journal-") as scratch:
             journal = Path(scratch) / "journal.jsonl"
-            return run_harness_supervised(binary, wpt, policy, argv, journal)
+            return run_harness_windows(binary, wpt, policy, argv, journal)
     finally:
         sidecar.stop()
 
@@ -1872,6 +1872,111 @@ def wptserve_content_types(wpt: Path, venv: Path) -> str | None:
         return None
     table = out.stdout.decode(errors="replace").strip()
     return table or None
+
+
+# Files one harness process runs before the driver starts a new one.
+#
+# The engine keeps roughly 5 MB per file it runs alive (docs/upstream.md), so a
+# whole chunk in one process grows past the 16 GB a GitHub runner has: chunk 2
+# of 11 reached 12 GB at file 2762. A window bounds that to a few GB, and the
+# journal carries every verdict across windows, so a window boundary is not a
+# crash and re-runs nothing.
+WINDOW_TESTS = 600
+
+
+def run_harness_windows(
+    binary: Path, wpt: Path, policy: list[str], argv: list[str], journal: Path
+) -> int:
+    """Runs the selection in windows, each in a fresh process.
+
+    The caller's own `--offset`/`--limit` window is kept: each process is
+    handed a slice inside it, so a driver-side window never runs a file the
+    caller excluded.
+    """
+    base_offset, base_limit, forward = harness_argv_window(argv)
+    total = harness_selection_count(
+        binary, wpt, policy, forward, base_offset, base_limit
+    )
+    if total is None:
+        return die("fast-harness", "cannot list the selection")
+    if total == 0:
+        return die("fast-harness", "no tests selected", 2)
+    end = total if base_limit is None else min(total, base_limit)
+    position = 0
+    while position < end:
+        size = min(WINDOW_TESTS, end - position)
+        code = run_harness_supervised(
+            binary,
+            wpt,
+            policy,
+            [
+                *forward,
+                "--offset",
+                str(base_offset + position),
+                "--limit",
+                str(size),
+            ],
+            journal,
+        )
+        if code != 0:
+            return code
+        position += size
+    return 0
+
+
+def harness_argv_window(argv: list[str]) -> tuple[int, int | None, list[str]]:
+    """Takes the caller's `--offset`/`--limit` out of the runner flags."""
+    offset = 0
+    limit: int | None = None
+    rest: list[str] = []
+    index = 0
+    while index < len(argv):
+        arg = argv[index]
+        value = argv[index + 1] if index + 1 < len(argv) else None
+        if arg in ("--offset", "--limit") and value is not None and value.isdigit():
+            if arg == "--offset":
+                offset = int(value)
+            else:
+                limit = int(value)
+            index += 2
+            continue
+        rest.append(arg)
+        index += 1
+    return offset, limit, rest
+
+
+def harness_selection_count(
+    binary: Path,
+    wpt: Path,
+    policy: list[str],
+    forward: list[str],
+    offset: int,
+    limit: int | None,
+) -> int | None:
+    """How many files the same flags select, without running one."""
+    command = [
+        str(binary),
+        "--wpt-root",
+        str(wpt),
+        *policy,
+        *forward,
+        "--offset",
+        str(offset),
+        "--list",
+    ]
+    if limit is not None:
+        command.extend(["--limit", str(limit)])
+    try:
+        result = subprocess.run(
+            command, cwd=str(ROOT), check=False, capture_output=True, text=True
+        )
+    except OSError as error:
+        die("fast-harness", f"cannot run {binary}: {error}")
+        return None
+    if result.returncode != 0:
+        eprint(result.stderr.rstrip())
+        return None
+    return len([line for line in result.stdout.splitlines() if "\t" in line])
 
 
 def run_harness_supervised(
