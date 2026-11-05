@@ -23,6 +23,16 @@ process carries 600 files (the engine keeps ~5 MB per file alive, see
 ERROR instead of a chunk, and a page that stops returning is cut by a
 watchdog instead of the job timeout.
 
+Run 42013267456 took 11m09: 1m50 plan, 4m29 build, 6m11 test, 22s score, with
+harness chunks summing 79.1 chunk-minutes and WebDriver 29.5 (the build is
+longer than 41974678252's 3m57 only because the blitz submodule changed and
+more of it recompiled). 108.6 chunk-minutes over 20 four-core jobs puts the
+test phase's floor at 5m26; the spread inside the harness lane (275-382s) is
+hash-partition noise, so re-splitting the lanes cannot beat it. Six of the
+eight engine aborts the harness found are fixed (the last two are inside
+dependencies, see `docs/upstream.md`); they moved five files from ERROR to
+PASS or OK without changing any other verdict.
+
 CI 2026-10-23 run 39980734258 (wpt.yml, 20 chunks), --exclude=worker
 testharness+crashtest+reftest+test262
 
