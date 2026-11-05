@@ -4533,10 +4533,7 @@ fn resolved_language(ctx: &Ctx<'_>, object: &Object<'_>, lang: &str) -> Option<S
                 return (!value.trim().is_empty()).then(|| value.to_owned());
             }
         }
-        let root = parsed.document.base.root_element().id;
-        return crate::dom::tree::attr(&parsed.document.base, root, "lang")
-            .filter(|value| !value.trim().is_empty())
-            .map(str::to_owned);
+        return None;
     }
     // An `OffscreenCanvas` has no element of its own; the constructor step
     // inherits the document element's language
@@ -4544,8 +4541,10 @@ fn resolved_language(ctx: &Ctx<'_>, object: &Object<'_>, lang: &str) -> Option<S
     let world = world(ctx).ok()?;
     let owner = world.borrow();
     let parsed = owner.main_document()?;
-    let root = parsed.document.base.root_element().id;
-    crate::dom::tree::attr(&parsed.document.base, root, "lang")
+    // A document with no element child (an empty or still-parsing tree) has no
+    // document element to inherit from.
+    let root = parsed.document.base.try_root_element()?;
+    crate::dom::tree::attr(&parsed.document.base, root.id, "lang")
         .filter(|value| !value.trim().is_empty())
         .map(str::to_owned)
 }
