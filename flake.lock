@@ -1,5 +1,25 @@
 {
   "nodes": {
+    "mbx": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1793941295,
+        "narHash": "sha256-JjjwbJ3cJBF3mSTpPk1V6uH9pHZlIsnJjF/V5xMdc2c=",
+        "owner": "jdx",
+        "repo": "mr-boxington",
+        "rev": "747b1538e30368dccb6fc0cb73d45833943a06b7",
+        "type": "github"
+      },
+      "original": {
+        "owner": "jdx",
+        "repo": "mr-boxington",
+        "type": "github"
+      }
+    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1787498568,
@@ -18,6 +38,7 @@
     },
     "root": {
       "inputs": {
+        "mbx": "mbx",
         "nixpkgs": "nixpkgs",
         "rust-overlay": "rust-overlay"
       }

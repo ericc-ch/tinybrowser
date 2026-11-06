@@ -17,18 +17,24 @@ Maximize web spec conformance per byte.
 
 ## Disk
 
-- `CARGO_TARGET_DIR` is `/mnt/ssd/rust-targets/<worktree>` (`flake.nix`).
-  Never override it to `$HOME`, `/tmp`, or any path on the root filesystem:
-  builds are tens of GB and home is not scratch space.
-- If `/mnt/ssd` is full, or any build says `No space left on device`, nuke
-  the target directories there before anything else:
+- Build outputs live in mbx's managed target directory: `target` is a symlink
+  into `/mnt/ssd/mbx/targets` (`flake.nix` puts mbx's cargo wrapper first).
+  mbx keeps the store and the managed targets under an 80 GiB budget and
+  collects the least recently used.
+- Never point builds at `$HOME`, `/tmp`, or any path on the root filesystem:
+  builds are tens of GB and home is not scratch space. Do not set
+  `CARGO_TARGET_DIR` either; that turns managed targets off and puts the
+  outputs back in a directory nothing collects.
+- If `/mnt/ssd` is full, or any build says `No space left on device`, let mbx
+  reclaim before anything else:
 
-      rm -rf /mnt/ssd/rust-targets/*
+      mbx gc --dry-run   # preview
+      mbx gc             # collect to the budget, and past it when the disk is low
 
-  `cargo clean` is not enough. Rerun the build; a cold rebuild is cheaper
+  `cargo clean` only removes this checkout's target. A cold rebuild is cheaper
   than a full disk. Do not "fix" it by moving the target directory to home.
 - Check `df -h /mnt/ssd` before a long build, test, or WPT run. Below ~10G
-  free, clean first.
+  free, run `mbx gc` first.
 
 ## Size and release
 
