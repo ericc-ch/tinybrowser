@@ -6,9 +6,11 @@
 
 Since 2026-11-05 the push gate in `wpt.yml` runs in-process (`fast-harness`,
 plus WebDriver only for testdriver and worker/module wrappers, plus native
-test262); `wpt-nightly.yml` keeps the full WebDriver run below as the
-fidelity backstop. A 2,195-test same-build comparison of the two executors
-agreed on 94.9% of verdicts and passed 1,148 vs 1,150.
+test262), and it is the only suite run: the nightly WebDriver duplicate was
+removed on 2026-11-07. It fires on pushes to `main` that touch code, the
+harness, the WPT pin, or the build environment; a docs-only push does not
+spend the 20-job matrix. A 2,195-test same-build comparison of the two
+executors agreed on 94.9% of verdicts and passed 1,148 vs 1,150.
 
 The gate first passed in run 41972597140 at the 11/9 split: 15m03 wall for
 the 119k-test suite, of which 1m34 was queue, 1m42 plan, 3m17 build (one job

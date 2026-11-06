@@ -1,4 +1,4 @@
-# The full WPT suite on every push, in the engine process.
+# The full WPT suite on code pushes, in the engine process.
 #
 # Two lanes partition the manifest exactly:
 #
@@ -9,8 +9,9 @@
 #               generated worker/module wrappers, driven through the browser.
 #
 # `test262` runs natively in QuickJS in one job. The score job folds every
-# report into one table. The nightly `wpt-nightly.yml` still runs the whole
-# suite through WebDriver, which is the fidelity backstop.
+# report into one table. There is no nightly duplicate: this is the suite of
+# record, and the WebDriver lane covers only the files the in-process lane
+# cannot execute.
 #
 # Cost: measured in run 41974678252 (14/6), the harness lane is ~71
 # chunk-minutes at 4 jobs and the WebDriver lane ~28 (it runs far fewer files
@@ -23,6 +24,29 @@ name: WPT
 on:
   push:
     branches: [main]
+    # Only a change to the browser, the harness, the WPT pin, or the build
+    # environment can move a WPT verdict. Docs and repo plumbing do not spend
+    # 20 runner jobs; the `!` pattern keeps Markdown inside code trees inert.
+    paths:
+      - "crates/**"
+      - "src/**"
+      - "tests/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "build.rs"
+      - ".gitmodules"
+      - ".cargo/**"
+      - "rust-toolchain.toml"
+      - "third_party/**"
+      - "tools/wpt/**"
+      - "tools/wpt-fast/**"
+      - "tools/wpt-harness/**"
+      - "tools/wpt-report/**"
+      - "tools/binary-path"
+      - "flake.nix"
+      - "flake.lock"
+      - ".github/workflows/wpt.yml"
+      - "!**/*.md"
   workflow_dispatch:
     inputs:
       harness-chunks:
