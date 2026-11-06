@@ -53,8 +53,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 [[package]]
 name = "anyrender"
 version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1755d0ef8e00e87b6b825dfbe5a35d34d3b302e97e80a48e93f9cd361fbada06"
+source = "git+https://github.com/DioxusLabs/anyrender?branch=main#d71b65e5e40ddabf70134cfd5ff27df729b3270a"
 dependencies = [
  "kurbo",
  "peniko",
@@ -65,8 +64,7 @@ dependencies = [
 [[package]]
 name = "anyrender_svg"
 version = "0.15.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "39327debd1bdca190d086c107825a5dc4c665be31e99e5c0854345a050d08cad"
+source = "git+https://github.com/DioxusLabs/anyrender?branch=main#d71b65e5e40ddabf70134cfd5ff27df729b3270a"
 dependencies = [
  "anyrender",
  "image",
@@ -2918,8 +2916,8 @@ dependencies = [
 
 [[package]]
 name = "selectors"
-version = "0.41.0"
-source = "git+https://github.com/nicoburns/stylo?rev=78734bf554bb40af9dc11c0eedbe724f6055697c#78734bf554bb40af9dc11c0eedbe724f6055697c"
+version = "0.42.0"
+source = "git+https://github.com/servo/stylo?rev=2dca34592ced37c6aa01733e94206a767194cf9d#2dca34592ced37c6aa01733e94206a767194cf9d"
 dependencies = [
  "bitflags",
  "cssparser",
@@ -3014,8 +3012,8 @@ dependencies = [
 
 [[package]]
 name = "servo_arc"
-version = "0.5.0"
-source = "git+https://github.com/nicoburns/stylo?rev=78734bf554bb40af9dc11c0eedbe724f6055697c#78734bf554bb40af9dc11c0eedbe724f6055697c"
+version = "0.6.0"
+source = "git+https://github.com/servo/stylo?rev=2dca34592ced37c6aa01733e94206a767194cf9d#2dca34592ced37c6aa01733e94206a767194cf9d"
 dependencies = [
  "serde",
  "stable_deref_trait",
@@ -3219,8 +3217,8 @@ dependencies = [
 
 [[package]]
 name = "stylo"
-version = "0.22.0"
-source = "git+https://github.com/nicoburns/stylo?rev=78734bf554bb40af9dc11c0eedbe724f6055697c#78734bf554bb40af9dc11c0eedbe724f6055697c"
+version = "0.23.0"
+source = "git+https://github.com/servo/stylo?rev=2dca34592ced37c6aa01733e94206a767194cf9d#2dca34592ced37c6aa01733e94206a767194cf9d"
 dependencies = [
  "app_units",
  "arrayvec",
@@ -3277,8 +3275,8 @@ dependencies = [
 
 [[package]]
 name = "stylo_atoms"
-version = "0.22.0"
-source = "git+https://github.com/nicoburns/stylo?rev=78734bf554bb40af9dc11c0eedbe724f6055697c#78734bf554bb40af9dc11c0eedbe724f6055697c"
+version = "0.23.0"
+source = "git+https://github.com/servo/stylo?rev=2dca34592ced37c6aa01733e94206a767194cf9d#2dca34592ced37c6aa01733e94206a767194cf9d"
 dependencies = [
  "string_cache",
  "string_cache_codegen",
@@ -3286,8 +3284,8 @@ dependencies = [
 
 [[package]]
 name = "stylo_derive"
-version = "0.22.0"
-source = "git+https://github.com/nicoburns/stylo?rev=78734bf554bb40af9dc11c0eedbe724f6055697c#78734bf554bb40af9dc11c0eedbe724f6055697c"
+version = "0.23.0"
+source = "git+https://github.com/servo/stylo?rev=2dca34592ced37c6aa01733e94206a767194cf9d#2dca34592ced37c6aa01733e94206a767194cf9d"
 dependencies = [
  "darling",
  "proc-macro2",
@@ -3298,8 +3296,8 @@ dependencies = [
 
 [[package]]
 name = "stylo_dom"
-version = "0.22.0"
-source = "git+https://github.com/nicoburns/stylo?rev=78734bf554bb40af9dc11c0eedbe724f6055697c#78734bf554bb40af9dc11c0eedbe724f6055697c"
+version = "0.23.0"
+source = "git+https://github.com/servo/stylo?rev=2dca34592ced37c6aa01733e94206a767194cf9d#2dca34592ced37c6aa01733e94206a767194cf9d"
 dependencies = [
  "bitflags",
  "stylo_malloc_size_of",
@@ -3307,8 +3305,8 @@ dependencies = [
 
 [[package]]
 name = "stylo_malloc_size_of"
-version = "0.22.0"
-source = "git+https://github.com/nicoburns/stylo?rev=78734bf554bb40af9dc11c0eedbe724f6055697c#78734bf554bb40af9dc11c0eedbe724f6055697c"
+version = "0.23.0"
+source = "git+https://github.com/servo/stylo?rev=2dca34592ced37c6aa01733e94206a767194cf9d#2dca34592ced37c6aa01733e94206a767194cf9d"
 dependencies = [
  "app_units",
  "cssparser",
@@ -3326,8 +3324,8 @@ dependencies = [
 
 [[package]]
 name = "stylo_static_prefs"
-version = "0.22.0"
-source = "git+https://github.com/nicoburns/stylo?rev=78734bf554bb40af9dc11c0eedbe724f6055697c#78734bf554bb40af9dc11c0eedbe724f6055697c"
+version = "0.23.0"
+source = "git+https://github.com/servo/stylo?rev=2dca34592ced37c6aa01733e94206a767194cf9d#2dca34592ced37c6aa01733e94206a767194cf9d"
 dependencies = [
  "toml",
 ]
@@ -3344,8 +3342,8 @@ dependencies = [
 
 [[package]]
 name = "stylo_traits"
-version = "0.22.0"
-source = "git+https://github.com/nicoburns/stylo?rev=78734bf554bb40af9dc11c0eedbe724f6055697c#78734bf554bb40af9dc11c0eedbe724f6055697c"
+version = "0.23.0"
+source = "git+https://github.com/servo/stylo?rev=2dca34592ced37c6aa01733e94206a767194cf9d#2dca34592ced37c6aa01733e94206a767194cf9d"
 dependencies = [
  "app_units",
  "bitflags",
@@ -3420,7 +3418,7 @@ dependencies = [
 [[package]]
 name = "taffy"
 version = "0.15.0"
-source = "git+https://github.com/DioxusLabs/taffy?rev=c25605620351786eb6a742b74ea4d289f59ebd84#c25605620351786eb6a742b74ea4d289f59ebd84"
+source = "git+https://github.com/DioxusLabs/taffy?rev=fca167cf659b8bf48019d0dea90624109a78103f#fca167cf659b8bf48019d0dea90624109a78103f"
 dependencies = [
  "serde",
  "slotmap",
@@ -3571,8 +3569,8 @@ checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
 
 [[package]]
 name = "to_shmem"
-version = "0.6.0"
-source = "git+https://github.com/nicoburns/stylo?rev=78734bf554bb40af9dc11c0eedbe724f6055697c#78734bf554bb40af9dc11c0eedbe724f6055697c"
+version = "0.7.0"
+source = "git+https://github.com/servo/stylo?rev=2dca34592ced37c6aa01733e94206a767194cf9d#2dca34592ced37c6aa01733e94206a767194cf9d"
 dependencies = [
  "cssparser",
  "hashbrown",
@@ -3585,8 +3583,8 @@ dependencies = [
 
 [[package]]
 name = "to_shmem_derive"
-version = "0.2.0"
-source = "git+https://github.com/nicoburns/stylo?rev=78734bf554bb40af9dc11c0eedbe724f6055697c#78734bf554bb40af9dc11c0eedbe724f6055697c"
+version = "0.3.0"
+source = "git+https://github.com/servo/stylo?rev=2dca34592ced37c6aa01733e94206a767194cf9d#2dca34592ced37c6aa01733e94206a767194cf9d"
 dependencies = [
  "darling",
  "proc-macro2",

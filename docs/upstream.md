@@ -6,6 +6,7 @@ Policy: upstream bugs stay upstream. Our code stays simple; these fail closed as
 
 ### blitz (third_party/blitz, master)
 
+- 6e5c1c807 merged upstream main (2ee31e656). Upstream brings the CDP server and style-sheet editing, the parley code editor, float-placement and shrink-to-fit fixes, decoding of external style sheets from bytes (BOM and `@charset`), Stylo 0.23, Taffy with `FloatInsets`, anyrender main, and devtools mutation records. The fork's deltas re-apply on upstream's shape: the config keeps `image_settle`/`quirks_mode` beside `devtools_provider`; `plan_form_submission` stays the one plan (upstream's unresolvable-action guard is its `resolve_url(...)?`); `resolve_url` stays public for the renderer and the stylesheet reload keeps `fetch_stylesheet`, which also covers xml-stylesheet owners; the nested stylesheet loader keeps `sheet_url` over `from_bytes`; the line-advance clamp moves into upstream's `set_line_slot`; and checkbox state keeps the checkedness slot, with `process_button_input` marking a boxless control instead of storing a second copy.
 - 87a336178 paint border edges in edge order, grouping only by colour. The per-edge fill grouped identical colours by sorting on the RGBA components, so paint order depended on the colour values: a green top border and a black left border painted black first, and along the mitre they share the later fill wins the anti-aliased pixel. The reference of `css/css-borders/border-radius-greater-than-width.html` (two neighbouring boxes, black painted last) disagreed by 100 pixels on that diagonal. Colours are now grouped in first-appearance order: the first edge of a colour fixes where the combined path is filled and later edges of that colour join it, so same-coloured sides still share one fill and different colours keep edge order. Matches Blink, which paints sides in order and draws a uniform border as one path. Upstream-able to Blitz.
 - ff37545a5 split a rounded corner when an adjacent border width is zero. `CssBox::start_angle` divided by the border width of the side the arc sweeps from, so a 10px corner between a 100px border and a zero-width one computed `0 / 0` and wrote `NaN` points into `border_edge_shape`; filling that path aborted inside tiny-skia's alpha runs (`css/css-borders/border-radius-greater-than-width.html`). The closed form is now evaluated through the limits instead of dividing: an absent `bt` side puts the split at the end of its half of the quarter arc, an absent `br` side at the start, and a corner with no border on either side halves it. The ratio is rearranged to `radii.y * br_width / (bt_width * radii.x)` so it is formed once; identical for the nonzero case. Upstream-able to Blitz.
 - 68cb96c13 saturate used lengths at the `LayoutUnit` limit. Stylo computes used lengths in `f32`, so a large enough `zoom`/`em` overflows the box model before layout sees it: `css/css-viewport/zoom/massive-zoom-viewbox-crash.html`'s huge zoom gives a fieldset a 2.47e26 px padding, Taffy's `available_width - insets` becomes `NaN`, and Parley's line breaker asserts on the non-finite advance and aborts. Blink is safe because every used length passes through `LayoutUnit`, which saturates at 2^25 px. `stylo_taffy::convert::saturating_px` applies that limit where stylo values become Taffy values (`length_percentage`, fit-content, border, resolved `calc()`, the padding percentage path) and where Blitz hands lengths to Parley directly (font size, line height, spacing, baseline shift, text indent). The same commit floors the inline content width at zero (a border-box narrower than its own padding, as Blink's `ComputeContentBoxLogicalWidth` does) and clamps a content slot's line advance into `0..=width`, because Parley asserts `line_max_advance <= layout_max_advance` and a negative slot is legal when padding exceeds the containing block. Upstream-able to Blitz; the saturation is a browser invariant, not a test-specific guard.
@@ -68,9 +69,22 @@ The BMP decode feature is not a fork change: which formats an engine carries is 
 - ae2057f fail closed on budget exhaustion and keep literals intact. Oversized replacements were half-copied, and expanded text containing the attribute delimiter could re-delimit the value or start a new reference.
 - 08c7e33 drop the unused TreeSink import. Warning cleanup.
 - merged upstream main at 7760920 (0.40.1).
+- merged upstream main at a027c28 (nesting limit, table-body tag list, MathML local
+  names, vendored WPT tree-construction tests). The xml5lib tokenizer runner now
+  skips corpus cases that bake the XML5 draft's character rules (windows-1252
+  C1 remapping, `#xD`, the noncharacters inside XML 1.0's `Char` ranges); the
+  `Invalid numeric entity character U+...` cases are decided by `names::is_char`,
+  so a code point the production rejects still runs.
 
 ### rquickjs (third_party/rquickjs, master)
 
+- merged upstream master at b462d97. `sys/quickjs` tracks e2472d7, which merges
+  quickjs-ng e22ce4d: the 0.18.0 version bump, asynchronous `import()`, the
+  `Array.find` ownership release, the RegExp deletion/BJSON lifetime fixes, the
+  `Array.fromAsync` internal-call lookup, and the WeakMap symbol UAF fix. The
+  two conflicts were both additions at the same end of a file: `quickjs.h` keeps
+  the fork's `JSStackFrameLocation` beside upstream's `JS_LoadModule` note, and
+  `api-test.c` keeps the exotic-hook tests beside the dynamic-import tests.
 - Nested realms under a live `Ctx`. `Context::full` and `Context::with` took
   the runtime's `RefCell`/`Mutex` unconditionally, so an embedder that already
   held the lock (the normal case inside `outer.with(...)`) could not create or
@@ -99,6 +113,9 @@ Exotic hooks for WebIDL legacy platform objects (dcd8edd, 9bcc543, 42688aa, 31e1
 - Tracking (11c770e, 7ca6024, 38c4d87, a86ed40, 3587d7e, 50b403e, c161d25): pull quickjs engine fixes and regenerate bindings; wasm OOM/atom-table/inline mirrors.
 
 ### quickjs (third_party/rquickjs/sys/quickjs, fork branch)
+
+- merged upstream master at e22ce4d (quickjs-ng 0.18.0). Verified with the
+  engine's own `api-test` and `run-test262 -c tests.conf` (0/123 errors).
 
 Exotic fallthrough machinery the stock engine lacks (2afa33b, 88a9be3, 2339e92, 0ef07c2, 2c3319f, bd5bd06, cca3414, 68de392, c3297d6, 3c186c9). WebIDL collections must intercept indexed/named writes yet decline ordinary properties, inherited setters, and expandos back to the normal path, with strict-mode rejection and no duplicate keys. Each carries an rquickjs binding proof plus api-test coverage (f3b23e9).
 
