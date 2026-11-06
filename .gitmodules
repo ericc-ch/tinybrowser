@@ -3,12 +3,12 @@
 	url = https://github.com/web-platform-tests/wpt.git
 [submodule "third_party/rquickjs"]
 	path = third_party/rquickjs
-	url = https://github.com/ericc-ch/rquickjs.git
+	url = https://github.com/tinybrowser-dev/rquickjs.git
 [submodule "third_party/blitz"]
 	path = third_party/blitz
-	url = https://github.com/ericc-ch/blitz.git
+	url = https://github.com/tinybrowser-dev/blitz.git
 	branch = master
 [submodule "third_party/html5ever"]
 	path = third_party/html5ever
-	url = https://github.com/ericc-ch/html5ever.git
+	url = https://github.com/tinybrowser-dev/html5ever.git
 	branch = master

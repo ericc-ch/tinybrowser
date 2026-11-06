@@ -289,7 +289,7 @@ struct Timer {
 /// document hands Blitz today is an image a style sheet named. The guess lives
 /// here, in one exhaustive match, instead of in a default arm somewhere else.
 /// Blitz classifying what it fetches would delete it
-/// (<https://github.com/ericc-ch/tinybrowser/blob/main/docs/upstream.md>).
+/// (<https://github.com/tinybrowser-dev/tinybrowser/blob/main/docs/upstream.md>).
 fn subresource_request(
     kind: blitz_traits::net::RequestKind,
     crossorigin: Option<CrossOrigin>,
