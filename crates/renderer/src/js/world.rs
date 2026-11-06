@@ -2960,8 +2960,7 @@ impl World {
                 .attributes
                 .entries
                 .get(&id)
-                .map(|entry| entry.listeners.clone())
-                .unwrap_or_default();
+                .map_or_default(|entry| entry.listeners.clone());
         }
         self.events
             .listeners

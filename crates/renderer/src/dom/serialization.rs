@@ -157,21 +157,18 @@ fn serialize_html_element(
     // A template element serializes its template contents, not its (empty)
     // children
     // (<https://html.spec.whatwg.org/multipage/parsing.html#serialising-html-fragments>).
-    let children: Vec<BlitzId> = base
-        .get_node(id)
-        .map(|node| {
-            if crate::dom::tree::is_template_tag(name) {
-                crate::dom::tree::template_contents(base, id)
-                    .and_then(|fragment| {
-                        base.get_node(fragment)
-                            .map(|node| node.children.iter().copied().collect())
-                    })
-                    .unwrap_or_default()
-            } else {
-                node.children.iter().copied().collect()
-            }
-        })
-        .unwrap_or_default();
+    let children: Vec<BlitzId> = base.get_node(id).map_or_default(|node| {
+        if crate::dom::tree::is_template_tag(name) {
+            crate::dom::tree::template_contents(base, id)
+                .and_then(|fragment| {
+                    base.get_node(fragment)
+                        .map(|node| node.children.iter().copied().collect())
+                })
+                .unwrap_or_default()
+        } else {
+            node.children.iter().copied().collect()
+        }
+    });
     for child in &children {
         serialize_html_node(doc, *child, Some(name), output);
     }
@@ -356,21 +353,18 @@ pub(crate) fn serialize_xml_element(
         push_escaped_xml_attribute(output, &attribute.value);
         output.push_str("\"");
     }
-    let children: Vec<BlitzId> = base
-        .get_node(id)
-        .map(|node| {
-            if crate::dom::tree::is_template_tag(name) {
-                crate::dom::tree::template_contents(base, id)
-                    .and_then(|fragment| {
-                        base.get_node(fragment)
-                            .map(|node| node.children.iter().copied().collect())
-                    })
-                    .unwrap_or_default()
-            } else {
-                node.children.iter().copied().collect()
-            }
-        })
-        .unwrap_or_default();
+    let children: Vec<BlitzId> = base.get_node(id).map_or_default(|node| {
+        if crate::dom::tree::is_template_tag(name) {
+            crate::dom::tree::template_contents(base, id)
+                .and_then(|fragment| {
+                    base.get_node(fragment)
+                        .map(|node| node.children.iter().copied().collect())
+                })
+                .unwrap_or_default()
+        } else {
+            node.children.iter().copied().collect()
+        }
+    });
     if children.is_empty() {
         output.push_str("/>");
         return;

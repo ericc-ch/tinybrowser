@@ -97,8 +97,7 @@ pub(super) fn load_module<'js>(ctx: &Ctx<'js>, name: &str) -> Result<Module<'js,
             .state
             .module_fetch_root
             .or(world.state.current_script)
-            .map(|element| world.subresource_options(element))
-            .unwrap_or_default();
+            .map_or_default(|element| world.subresource_options(element));
         (
             world.runtime.services.clone(),
             world.origin.clone(),

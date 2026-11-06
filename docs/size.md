@@ -18,8 +18,10 @@ pass/unexp/timeout/crash counts, and a release smoke via
 | `force-unwind-tables=no`, `tools/release` deleted (interim, immediate-abort) | 9.79 MiB |
 | panic = "abort" + synchronous panic hook for diagnostics | 10.61 MiB |
 | postcard renderer IPC control payloads | 10.47 MiB |
-| current: shared interface installer funnel | **10.43 MiB** |
+| shared interface installer funnel | 10.43 MiB |
 | `publicsuffix` replaces the hand-rolled matcher, list refreshed (12,138,648 B) | 11.58 MiB |
+| fork sync (blitz, html5ever, rquickjs upstream) at a6eab97b | 11.84 MiB |
+| current: nightly 2026-11-06 + cargo update; `sha2` 0.11 dedupes `digest` | **11.76 MiB** |
 
 The generated bindings emitted the same six-line installer for all 90
 interfaces — look up the constructor the web shims created, take its prototype,

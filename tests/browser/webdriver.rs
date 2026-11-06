@@ -600,16 +600,13 @@ fn wait_for_handles(addr: &str, id: &str, count: usize) -> Vec<String> {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let reply = request(addr, "GET", &format!("/session/{id}/window/handles"), None);
-        let handles: Vec<String> = reply["value"]
-            .as_array()
-            .map(|values| {
-                values
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default();
+        let handles: Vec<String> = reply["value"].as_array().map_or_default(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        });
         if handles.len() == count {
             return handles;
         }

@@ -30,7 +30,7 @@ base64 = "0.23"
 # an sfnt, so both loaders decode through the same crate Blitz uses.
 wuff = { workspace = true }
 # CSP hash-source checks (`'sha256-'`, `'sha384-'`, `'sha512-'`).
-sha2 = "0.10"
+sha2 = "0.11"
 # Web Crypto entropy must come from the operating system, never the JS PRNG.
 getrandom = "0.4"
 # ECMA-402 formatting uses a locale-filtered ICU4X blob generated for the

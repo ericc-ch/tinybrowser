@@ -423,8 +423,7 @@ pub(crate) fn select_options(base: &BaseDocument, document: u32, select: BlitzId
     let mut options = Vec::new();
     let mut stack: Vec<BlitzId> = base
         .get_node(select)
-        .map(|node| node.children.iter().rev().copied().collect())
-        .unwrap_or_default();
+        .map_or_default(|node| node.children.iter().rev().copied().collect());
     while let Some(current) = stack.pop() {
         let Some(node) = base.get_node(current) else {
             continue;
@@ -669,8 +668,7 @@ pub(crate) fn option_text(base: &BaseDocument, option: BlitzId) -> String {
     let mut text = String::new();
     let mut stack: Vec<BlitzId> = base
         .get_node(option)
-        .map(|node| node.children.iter().rev().copied().collect())
-        .unwrap_or_default();
+        .map_or_default(|node| node.children.iter().rev().copied().collect());
     while let Some(current) = stack.pop() {
         let Some(node) = base.get_node(current) else {
             continue;

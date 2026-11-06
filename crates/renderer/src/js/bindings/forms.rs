@@ -539,15 +539,12 @@ fn push_file_entries<'js>(
 ) -> Result<()> {
     let files: Vec<Value<'js>> = {
         let world = world.borrow();
-        world
-            .input_files(node)
-            .map(|saved| {
-                saved
-                    .iter()
-                    .filter_map(|saved| saved.clone().restore(ctx).ok())
-                    .collect()
-            })
-            .unwrap_or_default()
+        world.input_files(node).map_or_default(|saved| {
+            saved
+                .iter()
+                .filter_map(|saved| saved.clone().restore(ctx).ok())
+                .collect()
+        })
     };
     let no_files = files.is_empty();
     for file in files {

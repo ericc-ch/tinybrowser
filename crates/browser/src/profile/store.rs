@@ -342,8 +342,7 @@ fn millis_to_time(millis: i64) -> SystemTime {
 }
 
 fn optional_millis(time: Option<SystemTime>) -> String {
-    time.map(|expiry| unix_millis(expiry).to_string())
-        .unwrap_or_default()
+    time.map_or_default(|expiry| unix_millis(expiry).to_string())
 }
 
 fn parse_optional_millis(raw: &str) -> io::Result<Option<SystemTime>> {

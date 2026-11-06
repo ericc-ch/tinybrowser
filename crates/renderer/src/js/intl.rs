@@ -167,8 +167,7 @@ fn resolve_locale(tag: &str) -> String {
     // matches itself. Structurally invalid tags match nothing (the wrapper
     // falls back to the default locale).
     tag.parse::<Locale>()
-        .map(|locale| locale.to_string())
-        .unwrap_or_default()
+        .map_or_default(|locale| locale.to_string())
 }
 
 fn canonicalize_locale(canonicalizer: &LocaleCanonicalizer, tag: &str) -> String {

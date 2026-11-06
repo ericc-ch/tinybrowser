@@ -267,8 +267,7 @@ impl BlitzDocument {
         let mut stack = self
             .base
             .get_node(id)
-            .map(|node| node.children.iter().rev().copied().collect::<Vec<_>>())
-            .unwrap_or_default();
+            .map_or_default(|node| node.children.iter().rev().copied().collect::<Vec<_>>());
         while let Some(current) = stack.pop() {
             let Some(node) = self.base.get_node(current) else {
                 continue;

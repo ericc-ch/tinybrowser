@@ -1334,8 +1334,7 @@ impl JsNode {
                 .document
                 .base
                 .get_node(container)
-                .map(|node| node.children.iter().copied().collect())
-                .unwrap_or_default();
+                .map_or_default(|node| node.children.iter().copied().collect());
             // In tree order: drop empty Text nodes, merge contiguous runs
             // into the first non-empty one
             // (<https://dom.spec.whatwg.org/#dom-node-normalize>).

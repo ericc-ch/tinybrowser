@@ -74,8 +74,7 @@ impl SessionStorage {
             .unwrap_or_else(PoisonError::into_inner)
             .get(&tab)
             .and_then(|namespace| namespace.get(origin))
-            .map(StorageArea::keys)
-            .unwrap_or_default()
+            .map_or_default(StorageArea::keys)
     }
 
     pub(crate) fn set(
@@ -136,8 +135,7 @@ impl LocalStorage {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get(origin)
-            .map(StorageArea::keys)
-            .unwrap_or_default()
+            .map_or_default(StorageArea::keys)
     }
 
     /// `Storage.setItem(key, value)`

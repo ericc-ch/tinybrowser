@@ -338,16 +338,14 @@ pub(crate) fn sanitize(
                 String::new()
             }
         }
-        InputType::Time => valid_time(raw).map(|_| raw.to_owned()).unwrap_or_default(),
-        InputType::DatetimeLocal => valid_local_datetime(raw)
-            .map(|(date, time)| {
-                format!(
-                    "{date}T{}",
-                    crate::dom::microsyntaxes::normalized_time(time)
-                )
-            })
-            .unwrap_or_default(),
-        InputType::Number => valid_float(raw).map(|_| raw.to_owned()).unwrap_or_default(),
+        InputType::Time => valid_time(raw).map_or_default(|_| raw.to_owned()),
+        InputType::DatetimeLocal => valid_local_datetime(raw).map_or_default(|(date, time)| {
+            format!(
+                "{date}T{}",
+                crate::dom::microsyntaxes::normalized_time(time)
+            )
+        }),
+        InputType::Number => valid_float(raw).map_or_default(|_| raw.to_owned()),
         InputType::Range => sanitize_range(base, node, raw),
         InputType::Color => sanitize_color(base, device, node, raw),
         InputType::Hidden

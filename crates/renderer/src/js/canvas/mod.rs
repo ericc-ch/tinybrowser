@@ -4275,12 +4275,7 @@ fn document_font_context(ctx: &Ctx<'_>, object: &Object<'_>) -> Result<parley::F
     };
     font_ctx.map_or_else(
         || Ok(world.borrow().runtime.font_ctx.clone()),
-        |font_ctx| {
-            Ok(font_ctx
-                .lock()
-                .map(|font_ctx| font_ctx.clone())
-                .unwrap_or_default())
-        },
+        |font_ctx| Ok(font_ctx.lock().map_or_default(|font_ctx| font_ctx.clone())),
     )
 }
 

@@ -223,8 +223,7 @@ mod tests {
                 let body = response
                     .windows(4)
                     .position(|window| window == b"\r\n\r\n")
-                    .map(|index| response[index + 4..].to_vec())
-                    .unwrap_or_default();
+                    .map_or_default(|index| response[index + 4..].to_vec());
                 Box::new(handler).bytes(
                     fetch.request.url.as_str().to_owned(),
                     blitz_traits::net::Bytes::from(body),

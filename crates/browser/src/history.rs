@@ -189,9 +189,7 @@ impl SessionHistory {
             current_step: 0,
             next_document: 1,
             next_entry: 1,
-            names: name
-                .map(|name| HashMap::from([(0, name)]))
-                .unwrap_or_default(),
+            names: name.map_or_default(|name| HashMap::from([(0, name)])),
         };
         history.entries.push(Entry {
             id: EntryId(0),

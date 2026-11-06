@@ -2125,9 +2125,8 @@ impl Document {
     /// document against the new response's endpoints, so this is also set
     /// before the check.
     fn set_reporting_endpoints(&mut self, endpoints: Option<&str>) {
-        self.reporting_endpoints = endpoints
-            .map(crate::csp::parse_reporting_endpoints_value)
-            .unwrap_or_default();
+        self.reporting_endpoints =
+            endpoints.map_or_default(crate::csp::parse_reporting_endpoints_value);
     }
 
     /// Feeds response bytes. The decoder holds them until the encoding is
@@ -3975,7 +3974,7 @@ impl Document {
         // loop sees no queued work and sleeps with the fetch parked.
         self.drain_blitz_fetches();
         if !self.world.borrow().parser_active {
-            self.tasks.extend(self.deferred_image_events.drain(..));
+            self.tasks.append(&mut self.deferred_image_events);
         }
         if self.load_fired {
             return false;

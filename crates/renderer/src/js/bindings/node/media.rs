@@ -537,15 +537,13 @@ impl JsNode {
         Ok(world
             .borrow()
             .image_request(self.handle.0)
-            .map(|request| {
+            .map_or_default(|request| {
                 request
                     .final_url
                     .as_ref()
                     .or(request.key.as_ref().map(|key| &key.url))
-                    .map(ToString::to_string)
-                    .unwrap_or_default()
-            })
-            .unwrap_or_default())
+                    .map_or_default(ToString::to_string)
+            }))
     }
 }
 pub(super) fn img_size(ctx: &Ctx<'_>, id: NodeId) -> Result<Option<(u32, u32)>> {

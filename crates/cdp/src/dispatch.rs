@@ -890,87 +890,6 @@ fn capture_side(extent: f64) -> u32 {
     return extent.min(MAX_SCREENSHOT_DIM) as u32;
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{ROUTES, arguments_expression, capture_side, get_properties_script};
-    use crate::params::{self, CallArgument, GetProperties, SetDeviceMetrics};
-    use serde_json::json;
-
-    #[test]
-    fn device_metrics_require_integers_in_range() {
-        let params: SetDeviceMetrics =
-            params::parse(&json!({"width": 1024, "height": 768})).expect("integer metrics");
-        assert_eq!(params.width, 1024);
-        assert_eq!(params.height, 768);
-        assert!(params::parse::<SetDeviceMetrics>(&json!({"height": 768})).is_err());
-        assert!(params::parse::<SetDeviceMetrics>(&json!({"width": 10.5, "height": 1})).is_err());
-        assert!(params::parse::<SetDeviceMetrics>(&json!({"width": -1, "height": 1})).is_err());
-        assert!(params::parse::<SetDeviceMetrics>(&json!({"width": 1, "height": 1})).is_ok());
-    }
-
-    /// The page helper reads six keys with fixed types; a `null` where it
-    /// expects `false` changes how it walks the chain.
-    #[test]
-    fn get_properties_arguments_keep_the_helper_shape() {
-        let params: GetProperties = params::parse(&json!({"objectId": "h1"})).expect("params");
-        let script = get_properties_script(&params);
-        for expected in [
-            r#""objectId":"h1""#,
-            r#""objectGroup":"""#,
-            r#""ownProperties":false"#,
-            r#""nonIndexedPropertiesOnly":false"#,
-            r#""accessorPropertiesOnly":false"#,
-            r#""generatePreview":false"#,
-        ] {
-            assert!(
-                script.contains(expected),
-                "{expected} missing from {script}"
-            );
-        }
-    }
-
-    /// Each `CallArgument` variant becomes the JS expression the protocol
-    /// names, and an unserializable primitive is not silently lost.
-    #[test]
-    fn call_arguments_translate_each_variant() {
-        let arguments: Vec<CallArgument> = serde_json::from_value(json!([
-            {"objectId": "h1"},
-            {"value": {"a": 1}},
-            {"value": null},
-            {"unserializableValue": "NaN"},
-            {"unserializableValue": "-0"},
-            {"unserializableValue": "123n"},
-            {},
-        ]))
-        .expect("arguments");
-        assert_eq!(
-            arguments_expression(&arguments),
-            r#"[host.__tb_handles["h1"], {"a":1}, null, NaN, -0, 123n, undefined]"#
-        );
-    }
-
-    #[test]
-    fn capture_sides_are_bounded() {
-        assert_eq!(capture_side(f64::NAN), 1);
-        assert_eq!(capture_side(0.0), 1);
-        assert_eq!(capture_side(1500.0), 1500);
-        assert_eq!(capture_side(10_000.0), 4096);
-    }
-
-    #[test]
-    fn every_registered_pair_has_one_handler() {
-        for (index, route) in ROUTES.iter().enumerate() {
-            for other in &ROUTES[index + 1..] {
-                assert!(
-                    route.method != other.method || !route.target.overlaps(other.target),
-                    "{} has overlapping handlers for the same target kind",
-                    route.method
-                );
-            }
-        }
-    }
-}
-
 /// `Storage.getStorageKey`: the tab's origin.
 async fn storage_key(tab: &TabHandle) -> Result<Value, DispatchError> {
     let value = tab
@@ -1883,4 +1802,85 @@ pub(crate) fn ws_io(err: tungstenite::Error) -> io::Error {
 
 pub(crate) fn json_io(err: serde_json::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, err)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ROUTES, arguments_expression, capture_side, get_properties_script};
+    use crate::params::{self, CallArgument, GetProperties, SetDeviceMetrics};
+    use serde_json::json;
+
+    #[test]
+    fn device_metrics_require_integers_in_range() {
+        let params: SetDeviceMetrics =
+            params::parse(&json!({"width": 1024, "height": 768})).expect("integer metrics");
+        assert_eq!(params.width, 1024);
+        assert_eq!(params.height, 768);
+        assert!(params::parse::<SetDeviceMetrics>(&json!({"height": 768})).is_err());
+        assert!(params::parse::<SetDeviceMetrics>(&json!({"width": 10.5, "height": 1})).is_err());
+        assert!(params::parse::<SetDeviceMetrics>(&json!({"width": -1, "height": 1})).is_err());
+        assert!(params::parse::<SetDeviceMetrics>(&json!({"width": 1, "height": 1})).is_ok());
+    }
+
+    /// The page helper reads six keys with fixed types; a `null` where it
+    /// expects `false` changes how it walks the chain.
+    #[test]
+    fn get_properties_arguments_keep_the_helper_shape() {
+        let params: GetProperties = params::parse(&json!({"objectId": "h1"})).expect("params");
+        let script = get_properties_script(&params);
+        for expected in [
+            r#""objectId":"h1""#,
+            r#""objectGroup":"""#,
+            r#""ownProperties":false"#,
+            r#""nonIndexedPropertiesOnly":false"#,
+            r#""accessorPropertiesOnly":false"#,
+            r#""generatePreview":false"#,
+        ] {
+            assert!(
+                script.contains(expected),
+                "{expected} missing from {script}"
+            );
+        }
+    }
+
+    /// Each `CallArgument` variant becomes the JS expression the protocol
+    /// names, and an unserializable primitive is not silently lost.
+    #[test]
+    fn call_arguments_translate_each_variant() {
+        let arguments: Vec<CallArgument> = serde_json::from_value(json!([
+            {"objectId": "h1"},
+            {"value": {"a": 1}},
+            {"value": null},
+            {"unserializableValue": "NaN"},
+            {"unserializableValue": "-0"},
+            {"unserializableValue": "123n"},
+            {},
+        ]))
+        .expect("arguments");
+        assert_eq!(
+            arguments_expression(&arguments),
+            r#"[host.__tb_handles["h1"], {"a":1}, null, NaN, -0, 123n, undefined]"#
+        );
+    }
+
+    #[test]
+    fn capture_sides_are_bounded() {
+        assert_eq!(capture_side(f64::NAN), 1);
+        assert_eq!(capture_side(0.0), 1);
+        assert_eq!(capture_side(1500.0), 1500);
+        assert_eq!(capture_side(10_000.0), 4096);
+    }
+
+    #[test]
+    fn every_registered_pair_has_one_handler() {
+        for (index, route) in ROUTES.iter().enumerate() {
+            for other in &ROUTES[index + 1..] {
+                assert!(
+                    route.method != other.method || !route.target.overlaps(other.target),
+                    "{} has overlapping handlers for the same target kind",
+                    route.method
+                );
+            }
+        }
+    }
 }

@@ -333,12 +333,9 @@ impl Engine {
                     if let Some(src) = src {
                         let navigation =
                             FrameNavigation::get(NavigationTarget::Container(container), src)
-                                .with_referrer_policy(
-                                    self.frames
-                                        .get(&parent)
-                                        .map(|document| document.frame_referrer_policy(container))
-                                        .unwrap_or_default(),
-                                )
+                                .with_referrer_policy(self.frames.get(&parent).map_or_default(
+                                    |document| document.frame_referrer_policy(container),
+                                ))
                                 .with_sandbox(sandbox);
                         self.navigate_frame(frame, parent, &navigation);
                         self.record_navigation(frame, parent, &navigation, true);
@@ -1566,8 +1563,7 @@ impl Engine {
     fn inherited_policy(&self, parent: FrameId) -> PolicyContainer {
         self.frames
             .get(&parent)
-            .map(|document| document.world().borrow().policy.clone())
-            .unwrap_or_default()
+            .map_or_default(|document| document.world().borrow().policy.clone())
     }
 
     /// Gives a frame's freshly installed local-scheme document the
@@ -1834,8 +1830,7 @@ impl Engine {
         let policy = self
             .frames
             .get(&initiator)
-            .map(|document| document.world().borrow().policy.csp.clone())
-            .unwrap_or_default();
+            .map_or_default(|document| document.world().borrow().policy.csp.clone());
         if let Some(document) = self.frames.get_mut(&child) {
             if initial {
                 // The script runs in the document the browser already created;

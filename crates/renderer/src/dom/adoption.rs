@@ -86,15 +86,11 @@ pub(crate) fn import_snapshot(
                         .and_then(|node| node.data.downcast_element())
                         .and_then(|element| element.template_contents)
                         .map(|fragment| {
-                            doc.base
-                                .get_node(fragment)
-                                .map(|contents| {
-                                    contents.children.iter().copied().collect::<Vec<_>>()
-                                })
-                                .unwrap_or_default()
+                            doc.base.get_node(fragment).map_or_default(|contents| {
+                                contents.children.iter().copied().collect::<Vec<_>>()
+                            })
                         })
-                        .map(|child_ids| snapshot_children(doc, id.document, child_ids))
-                        .unwrap_or_default()
+                        .map_or_default(|child_ids| snapshot_children(doc, id.document, child_ids))
                 } else {
                     snapshot_children(doc, id.document, node.children.iter().copied())
                 }
@@ -290,12 +286,10 @@ fn children_for_walk(
     match template_contents {
         Some(fragment) => base
             .get_node(fragment)
-            .map(|node| node.children.to_vec())
-            .unwrap_or_default(),
+            .map_or_default(|node| node.children.to_vec()),
         None => base
             .get_node(id)
-            .map(|node| node.children.to_vec())
-            .unwrap_or_default(),
+            .map_or_default(|node| node.children.to_vec()),
     }
 }
 

@@ -398,7 +398,7 @@ pub(crate) fn splice_parsed(
         .document
         .base
         .get_node(fragment.node)
-        .map(|node| {
+        .map_or_default(|node| {
             node.children
                 .iter()
                 .map(|child| NodeId {
@@ -406,8 +406,7 @@ pub(crate) fn splice_parsed(
                     node: *child,
                 })
                 .collect()
-        })
-        .unwrap_or_default();
+        });
     if moved.is_empty() {
         return;
     }
@@ -536,7 +535,7 @@ pub(crate) fn replace_all_journaled(
         .document
         .base
         .get_node(parent.node)
-        .map(|node| {
+        .map_or_default(|node| {
             node.children
                 .iter()
                 .map(|child| NodeId {
@@ -544,8 +543,7 @@ pub(crate) fn replace_all_journaled(
                     node: *child,
                 })
                 .collect()
-        })
-        .unwrap_or_default();
+        });
     let iframes = iframe_containers_in_subtrees(parsed, &removed);
     // Adjust live ranges while the tree links are intact: after `remove_node`
     // the detached children report no parent, so the descendant check would
@@ -606,8 +604,7 @@ pub(crate) fn collect_nonce_elements(
     }
     let children: Vec<BlitzId> = base
         .get_node(id.node)
-        .map(|node| node.children.iter().copied().collect())
-        .unwrap_or_default();
+        .map_or_default(|node| node.children.iter().copied().collect());
     for child in children {
         collect_nonce_elements(
             base,
@@ -642,8 +639,7 @@ pub(crate) fn collect_html_insertion_steps(
     }
     let children: Vec<BlitzId> = base
         .get_node(id.node)
-        .map(|node| node.children.iter().copied().collect())
-        .unwrap_or_default();
+        .map_or_default(|node| node.children.iter().copied().collect());
     for child in children {
         collect_html_insertion_steps(
             base,

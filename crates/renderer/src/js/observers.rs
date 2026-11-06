@@ -96,8 +96,7 @@ impl MutationObservers {
         self.drain(documents);
         self.observers
             .get_mut(&id)
-            .map(|observer| std::mem::take(&mut observer.queue))
-            .unwrap_or_default()
+            .map_or_default(|observer| std::mem::take(&mut observer.queue))
     }
 
     pub(crate) fn forget_frame(&mut self, owner: FrameId, documents: &mut DocumentStore) {

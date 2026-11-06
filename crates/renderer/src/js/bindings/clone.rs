@@ -224,14 +224,12 @@ pub(crate) fn copy_nonce_subtree(
                 .document
                 .base
                 .get_node(from_node)
-                .map(|tree| tree.children.to_vec())
-                .unwrap_or_default();
+                .map_or_default(|tree| tree.children.to_vec());
             let to_children = to_parsed
                 .document
                 .base
                 .get_node(to_node)
-                .map(|tree| tree.children.to_vec())
-                .unwrap_or_default();
+                .map_or_default(|tree| tree.children.to_vec());
             if from_children.len() == to_children.len() {
                 stack.extend(from_children.into_iter().zip(to_children));
             }
@@ -258,26 +256,21 @@ pub(crate) fn clone_document<'js>(ctx: &Ctx<'js>, id: NodeId, deep: bool) -> Res
         };
         let snapshots = if deep {
             let root = parsed.document.base.root_node().id;
-            parsed
-                .document
-                .base
-                .get_node(root)
-                .map(|node| {
-                    node.children
-                        .iter()
-                        .filter_map(|kid| {
-                            import_snapshot(
-                                &parsed.document,
-                                NodeId {
-                                    document: id.document,
-                                    node: *kid,
-                                },
-                                true,
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default()
+            parsed.document.base.get_node(root).map_or_default(|node| {
+                node.children
+                    .iter()
+                    .filter_map(|kid| {
+                        import_snapshot(
+                            &parsed.document,
+                            NodeId {
+                                document: id.document,
+                                node: *kid,
+                            },
+                            true,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
         } else {
             Vec::new()
         };

@@ -324,11 +324,7 @@ fn start_hop(owner: u64, chain: Chain, completion: DialCompletion) {
             DialKind::CspReport => unreachable!("report-uri has no transport hop"),
         },
         url: chain.url.to_string(),
-        initiator: chain
-            .initiator
-            .as_ref()
-            .map(Url::to_string)
-            .unwrap_or_default(),
+        initiator: chain.initiator.as_ref().map_or_default(Url::to_string),
         mode: host_mode(chain.cors.mode),
         credentials: host_credentials(chain.cors.credentials),
         redirect: host_redirect(chain.cors.redirect),
@@ -659,13 +655,11 @@ impl StorageHost for WasmServices {
         match kind {
             StorageKind::Local => lock(local_storage())
                 .get(origin)
-                .map(StorageArea::keys)
-                .unwrap_or_default(),
+                .map_or_default(StorageArea::keys),
             StorageKind::Session => lock(session_storage())
                 .get(&self.owner)
                 .and_then(|namespace| namespace.get(origin))
-                .map(StorageArea::keys)
-                .unwrap_or_default(),
+                .map_or_default(StorageArea::keys),
         }
     }
 

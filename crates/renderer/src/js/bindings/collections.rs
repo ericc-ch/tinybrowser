@@ -186,8 +186,7 @@ fn collect_html_scripts(
     let mut stack: Vec<BlitzId> = doc
         .base
         .get_node(scope)
-        .map(|node| node.children.iter().rev().copied().collect())
-        .unwrap_or_default();
+        .map_or_default(|node| node.children.iter().rev().copied().collect());
     while let Some(id) = stack.pop() {
         if crate::dom::tree::is_html_element(&doc.base, id, "script")
             && script_is_in_document(doc, id)
@@ -234,8 +233,7 @@ fn descendants(base: &blitz_dom::BaseDocument, scope: BlitzId) -> Vec<BlitzId> {
     let mut order = Vec::new();
     let mut stack: Vec<BlitzId> = base
         .get_node(scope)
-        .map(|node| node.children.iter().rev().copied().collect())
-        .unwrap_or_default();
+        .map_or_default(|node| node.children.iter().rev().copied().collect());
     while let Some(id) = stack.pop() {
         order.push(id);
         if let Some(node) = base.get_node(id) {

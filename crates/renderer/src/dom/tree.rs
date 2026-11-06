@@ -462,18 +462,15 @@ pub(crate) fn tree_order(
     };
     let child_a = chain_a[chain_a.len() - 1 - common];
     let child_b = chain_b[chain_b.len() - 1 - common];
-    let kids: Vec<NodeId> = base
-        .get_node(parent.node)
-        .map(|node| {
-            node.children
-                .iter()
-                .map(|child| NodeId {
-                    document,
-                    node: *child,
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let kids: Vec<NodeId> = base.get_node(parent.node).map_or_default(|node| {
+        node.children
+            .iter()
+            .map(|child| NodeId {
+                document,
+                node: *child,
+            })
+            .collect()
+    });
     let position_a = kids.iter().position(|&kid| kid == child_a);
     let position_b = kids.iter().position(|&kid| kid == child_b);
     position_a.cmp(&position_b)

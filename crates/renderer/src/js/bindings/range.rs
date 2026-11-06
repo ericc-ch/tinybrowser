@@ -362,8 +362,7 @@ fn xml_contextual_fragment<'js>(
         let top = scratch
             .base
             .get_node(root)
-            .map(|node| node.children.clone())
-            .unwrap_or_default();
+            .map_or_default(|node| node.children.clone());
         if top.len() != 1 {
             return Err(throw_dom(
                 ctx,
@@ -378,8 +377,7 @@ fn xml_contextual_fragment<'js>(
         scratch
             .base
             .get_node(wrapper.node)
-            .map(|node| node.children.clone())
-            .unwrap_or_default()
+            .map_or_default(|node| node.children.clone())
             .into_iter()
             .map(|child| NodeId {
                 document: start.document,

@@ -549,8 +549,7 @@ impl<'js> html_template_element_generated::HTMLTemplateElement<'js> for JsNode {
                 .document
                 .base
                 .get_node(fragment)
-                .map(|node| node.children.iter().copied().collect::<Vec<_>>())
-                .unwrap_or_default();
+                .map_or_default(|node| node.children.iter().copied().collect::<Vec<_>>());
             let snapshots = crate::dom::adoption::snapshot_children(
                 &parsed.document,
                 self.handle.0.document,
@@ -1122,8 +1121,7 @@ impl JsNode {
                     .document
                     .base
                     .get_node(root)
-                    .map(|root| root.children.iter().copied().collect())
-                    .unwrap_or_default();
+                    .map_or_default(|root| root.children.iter().copied().collect());
                 children
                     .into_iter()
                     .find(|child| {
@@ -1756,26 +1754,26 @@ pub(in crate::js::bindings) fn parse_html_fragment_snapshots(
     let scratch = crate::documents::BlitzDocument::from_base(base);
     // Fragment parsing into a template context fills the context's
     // template contents, not its children: snapshot from the contents.
-    let children: Vec<BlitzId> = scratch
-        .base
-        .get_node(context_id)
-        .map(|node| match &node.data {
-            blitz_dom::NodeData::Element(element)
-                if crate::dom::tree::is_template_tag(&element.name) =>
-            {
-                element
-                    .template_contents
-                    .and_then(|fragment| {
-                        scratch
-                            .base
-                            .get_node(fragment)
-                            .map(|node| node.children.iter().copied().collect())
-                    })
-                    .unwrap_or_default()
-            }
-            _ => node.children.iter().copied().collect(),
-        })
-        .unwrap_or_default();
+    let children: Vec<BlitzId> =
+        scratch
+            .base
+            .get_node(context_id)
+            .map_or_default(|node| match &node.data {
+                blitz_dom::NodeData::Element(element)
+                    if crate::dom::tree::is_template_tag(&element.name) =>
+                {
+                    element
+                        .template_contents
+                        .and_then(|fragment| {
+                            scratch
+                                .base
+                                .get_node(fragment)
+                                .map(|node| node.children.iter().copied().collect())
+                        })
+                        .unwrap_or_default()
+                }
+                _ => node.children.iter().copied().collect(),
+            });
     children
         .into_iter()
         .filter_map(|child| {

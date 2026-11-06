@@ -68,7 +68,7 @@ use super::events::{self, JsEvent, JsEventTarget};
 use super::world::{Handle, RealmRegistry, WeakReferences, World};
 
 thread_local! {
-    /// JS world per live realm, keyed by its QuickJS context pointer.
+    /// JS world per live realm, keyed by its `JSContext` pointer.
     ///
     /// Runtime userdata would be one slot per renderer process, and the second
     /// frame would overwrite the first; each realm needs its own. One renderer
@@ -622,10 +622,11 @@ fn resolved_style<'js>(
 /// The active document's viewport size in CSS pixels, for the live `window`
 /// metrics (<https://drafts.csswg.org/cssom-view/#dom-window-innerwidth>).
 fn viewport_size(ctx: Ctx<'_>) -> Vec<f64> {
-    let (width, height) = world(&ctx).ok().map_or_else(
-        || crate::engine::DEFAULT_VIEWPORT,
-        |world| world.borrow().viewport_size.get(),
-    );
+    let (width, height) = world(&ctx)
+        .ok()
+        .map_or(crate::engine::DEFAULT_VIEWPORT, |world| {
+            world.borrow().viewport_size.get()
+        });
     vec![f64::from(width), f64::from(height)]
 }
 

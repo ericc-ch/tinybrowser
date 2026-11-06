@@ -1021,20 +1021,18 @@ impl<'js> named_node_map_generated::NamedNodeMap<'js> for JsNamedNodeMap {
         let mut seen = HashSet::new();
         Ok(world
             .document(element)
-            .map(|parsed| {
+            .map_or_default(|parsed| {
                 let base = &parsed.document.base;
                 base.get_node(element.node)
                     .and_then(|node| node.data.downcast_element())
-                    .map(|element| {
+                    .map_or_default(|element| {
                         element
                             .attrs
                             .iter()
                             .map(|attribute| qualified_name(&attribute.name))
                             .collect::<Vec<_>>()
                     })
-                    .unwrap_or_default()
             })
-            .unwrap_or_default()
             .into_iter()
             .filter(|name| !html || !name.bytes().any(|byte| byte.is_ascii_uppercase()))
             .filter(|name| seen.insert(name.clone()))

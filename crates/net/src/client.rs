@@ -1258,8 +1258,7 @@ fn apply_url_credentials(headers: &mut HeaderMap, url: &Url) -> Result<(), NetEr
     let username = percent_decode_str(url.username()).decode_utf8_lossy();
     let password = url
         .password()
-        .map(|password| percent_decode_str(password).decode_utf8_lossy())
-        .unwrap_or_default();
+        .map_or_default(|password| percent_decode_str(password).decode_utf8_lossy());
     let value = basic_authorization(&username, &password);
     let value = HeaderValue::from_str(&value).map_err(|_| NetError::RejectedRequest)?;
     headers.set(header::AUTHORIZATION, value);
