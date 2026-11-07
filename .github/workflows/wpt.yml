@@ -440,10 +440,24 @@ jobs:
             summary.txt
           if-no-files-found: warn
           retention-days: 7
-      - name: Publish run record
+      # A GitHub App installation token, scoped to the one repo that holds the
+      # record. The app is `tinybrowser wpt publisher` with Contents: write on
+      # tinybrowser-wpt-results and nothing else; the token lives for one job.
+      # A broken credential must not turn the conformance gate red, so the step
+      # may fail and the publish below then skips with a warning.
+      - uses: actions/create-github-app-token@v3
+        id: app-token
         if: ${{ !cancelled() && github.ref == 'refs/heads/main' && github.event_name == 'push' }}
+        continue-on-error: true
+        with:
+          app-id: ${{ vars.WPT_APP_ID }}
+          private-key: ${{ secrets.WPT_APP_PRIVATE_KEY }}
+          owner: tinybrowser-dev
+          repositories: tinybrowser-wpt-results
+      - name: Publish run record
+        if: ${{ steps.app-token.outcome == 'success' }}
         env:
-          TOKEN: ${{ secrets.WPT_RESULTS_TOKEN }}
+          TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           set -euo pipefail
           if [[ ! -f run.json ]]; then
@@ -451,7 +465,7 @@ jobs:
             exit 0
           fi
           if [[ -z "${TOKEN}" ]]; then
-            echo "::warning::WPT_RESULTS_TOKEN is not set; skipping the history publish"
+            echo "::warning::the GitHub App returned no token; skipping the history publish"
             exit 0
           fi
           git clone --depth 1 \
