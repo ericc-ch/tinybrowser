@@ -84,6 +84,12 @@ const timedOutFiles = regression ? groupByFile(regression.new_timeouts) : []
           </span>
         </div>
 
+        <p class="text-xs text-muted-foreground">
+          One run against the previous one, so a test that flips with runner
+          load lands here too — the same file can appear as a regression in one
+          run and a fix in the next.
+        </p>
+
         {regressedFiles.length > 0 && (
           <div>
             <h3 class="text-xs font-medium text-muted-foreground">Regressed</h3>
