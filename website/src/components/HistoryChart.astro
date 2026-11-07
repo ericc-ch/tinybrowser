@@ -43,9 +43,9 @@ const last = points[points.length - 1]?.date.slice(0, 10)
   {
     points.length < 2 ? (
       <p class="py-16 text-center text-sm text-muted-foreground">
-        History starts with the next WPT run. {points.length === 1
-          ? `One point so far: ${points[0].pct.toFixed(1)}%.`
-          : ""}
+        {points.length === 0
+          ? "History starts with the next WPT run."
+          : `One run recorded: ${points[0].pct.toFixed(1)}%. The chart draws a line from the second run on.`}
       </p>
     ) : (
       <svg
