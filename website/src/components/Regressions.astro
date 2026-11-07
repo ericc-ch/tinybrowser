@@ -26,6 +26,11 @@ function link(test: string): string {
   {
     regression === null ? (
       <p class="mt-2 text-sm text-muted-foreground">No diff published yet.</p>
+    ) : regression.previous_sha === null ? (
+      <p class="mt-2 text-sm text-muted-foreground">
+        First published run: there is nothing to compare with yet. The next run
+        gets a failure-list diff.
+      </p>
     ) : !regression.comparable ? (
       <p class="mt-2 text-sm text-muted-foreground">
         The WPT revision changed, so this run is not comparable with the
