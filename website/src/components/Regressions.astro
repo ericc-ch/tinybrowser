@@ -14,11 +14,38 @@ const statusClass = (status: string) =>
       ? "text-crash"
       : "text-fail"
 
-const MAX_LISTED = 20
+const MAX_FILES = 15
 
 function link(test: string): string {
   return `https://wpt.fyi/results${test}`
 }
+
+type FileGroup = {
+  test: string
+  status: string
+  subtests: Failure[]
+}
+
+/**
+ * One row per test file. A single flaky timeout turns every subtest in that
+ * file into a new failure, so an ungrouped list is mostly one file repeated;
+ * the count next to the path says how much of the file moved.
+ */
+function groupByFile(rows: Failure[]): FileGroup[] {
+  const groups = new Map<string, FileGroup>()
+  for (const row of rows) {
+    const group = groups.get(row.test) ?? { test: row.test, status: row.status, subtests: [] }
+    // A hard status (timeout, error, crash) describes the file, not a subtest.
+    if (row.subtest === "") group.status = row.status
+    group.subtests.push(row)
+    groups.set(row.test, group)
+  }
+  return [...groups.values()].sort((a, b) => b.subtests.length - a.subtests.length)
+}
+
+const regressedFiles = regression ? groupByFile(regression.regressions) : []
+const fixedFiles = regression ? groupByFile(regression.fixes) : []
+const timedOutFiles = regression ? groupByFile(regression.new_timeouts) : []
 ---
 
 <div class="rounded-lg border border-border bg-card p-4">
@@ -38,54 +65,66 @@ function link(test: string): string {
       </p>
     ) : (
       <div class="mt-3 space-y-4">
-        <div class="flex flex-wrap gap-4 text-sm tabular">
-          <span>
-            <span class={regression.regressions.length ? "text-fail" : "text-muted-foreground"}>
-              {plural(regression.regressions.length, "new failure")}
-            </span>
+        <div class="flex flex-wrap gap-x-5 gap-y-1 text-sm tabular">
+          <span class={regressedFiles.length ? "text-fail" : "text-muted-foreground"}>
+            {plural(regressedFiles.length, "file")} regressed
+            {regression.regressions.length > regressedFiles.length && (
+              <span class="text-muted-foreground">
+                {" "}
+                ({plural(regression.regressions.length, "subtest")})
+              </span>
+            )}
           </span>
-          <span class={regression.fixes.length ? "text-pass" : "text-muted-foreground"}>
-            {plural(regression.fixes.length, "fix", "fixes")}
+          <span class={fixedFiles.length ? "text-pass" : "text-muted-foreground"}>
+            {plural(fixedFiles.length, "file")} fixed
           </span>
-          <span>
-            <span class="text-warn">
-              {plural(regression.new_timeouts.length, "new timeout")}
-            </span>
+          <span class="text-warn">
+            {plural(timedOutFiles.length, "file")} newly timing out
             <span class="text-muted-foreground"> (watched, not counted)</span>
           </span>
         </div>
 
-        {regression.regressions.length > 0 && (
+        {regressedFiles.length > 0 && (
           <div>
-            <h3 class="text-xs font-medium text-muted-foreground">New failures</h3>
+            <h3 class="text-xs font-medium text-muted-foreground">Regressed</h3>
             <ul class="mt-1 space-y-0.5 font-mono text-xs">
-              {regression.regressions.slice(0, MAX_LISTED).map((failure: Failure) => (
-                <li class="truncate">
-                  <span class={statusClass(failure.status)}>{failure.status}</span>{" "}
-                  <a class="hover:underline" href={link(failure.test)} rel="noreferrer">
-                    {failure.test}
+              {regressedFiles.slice(0, MAX_FILES).map((group: FileGroup) => (
+                <li class="flex items-baseline gap-2">
+                  <span class={statusClass(group.status)}>{group.status}</span>
+                  <a class="truncate hover:underline" href={link(group.test)} rel="noreferrer">
+                    {group.test}
                   </a>
-                  {failure.subtest && <span class="text-muted-foreground"> :: {failure.subtest}</span>}
+                  {group.subtests.length > 1 && (
+                    <span class="ml-auto shrink-0 text-muted-foreground">
+                      {group.subtests.length} subtests
+                    </span>
+                  )}
                 </li>
               ))}
             </ul>
-            {regression.regressions.length > MAX_LISTED && (
-              <a class="mt-1 inline-block text-xs text-muted-foreground hover:text-foreground" href="/wpt/data/regressions.json">
-                … and {regression.regressions.length - MAX_LISTED} more
+            {regressedFiles.length > MAX_FILES && (
+              <a
+                class="mt-1 inline-block text-xs text-muted-foreground hover:text-foreground"
+                href="/wpt/data/regressions.json"
+              >
+                … and {regressedFiles.length - MAX_FILES} more files
               </a>
             )}
           </div>
         )}
 
-        {regression.fixes.length > 0 && (
+        {fixedFiles.length > 0 && (
           <div>
             <h3 class="text-xs font-medium text-muted-foreground">Fixed</h3>
             <ul class="mt-1 space-y-0.5 font-mono text-xs">
-              {regression.fixes.slice(0, MAX_LISTED).map((failure: Failure) => (
-                <li class="truncate text-muted-foreground">
-                  <a class="hover:underline" href={link(failure.test)} rel="noreferrer">
-                    {failure.test}
+              {fixedFiles.slice(0, MAX_FILES).map((group: FileGroup) => (
+                <li class="flex items-baseline gap-2 text-muted-foreground">
+                  <a class="truncate hover:underline" href={link(group.test)} rel="noreferrer">
+                    {group.test}
                   </a>
+                  {group.subtests.length > 1 && (
+                    <span class="ml-auto shrink-0">{group.subtests.length} subtests</span>
+                  )}
                 </li>
               ))}
             </ul>
