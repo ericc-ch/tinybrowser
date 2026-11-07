@@ -1,0 +1,19 @@
+/* light-dark(light, dark) resolves from color-scheme; :root follows the OS until the toggle pins it. */
+
+:root {
+  color-scheme: light dark;
+  --bg-0: light-dark(#fcfcfc, #111111);
+  --bg-1: light-dark(#f2f2f2, #1a1a1a);
+  --bg-2: light-dark(#e8e8e8, #242424);
+  --fg-0: light-dark(#111111, #ededed);
+  --fg-1: light-dark(#575757, #a3a3a3);
+  --fg-2: light-dark(#cfcfcf, #333333);
+}
+
+[data-theme="light"] {
+  color-scheme: light;
+}
+
+[data-theme="dark"] {
+  color-scheme: dark;
+}

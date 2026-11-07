@@ -1,0 +1,175 @@
+:root {
+  --font-sans: "Plus Jakarta Sans Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono Variable", ui-monospace, "SFMono-Regular", Menlo, monospace;
+  --text-sm: 0.875rem; /* captions, table cells, code */
+  --text-base: clamp(0.95rem, 0.9326rem + 0.087vw, 1rem);
+  --text-lg: clamp(1.30625rem, 1.2823rem + 0.1196vw, 1.375rem);
+  --text-xl: clamp(1.425rem, 1.3989rem + 0.1304vw, 1.5rem);
+  --text-2xl: clamp(1.6625rem, 1.6321rem + 0.1522vw, 1.75rem);
+  --measure: 50ch;
+  --wrap: 68rem;
+
+  /* A 4px grid for boxes. Text rhythm stays in em. */
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.25rem;
+  --space-6: 1.5rem;
+  --space-12: 3rem;
+  --gutter: var(--space-5);
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+  scrollbar-gutter: stable;
+}
+
+body {
+  display: flex;
+  flex-direction: column;
+  min-height: 100dvh;
+  margin: 0;
+  background: var(--bg-0);
+  color: var(--fg-0);
+  font-family: var(--font-sans);
+  font-size: var(--text-base);
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+  font-weight: 600;
+  letter-spacing: -0.011em;
+  text-wrap: balance;
+  margin: 0;
+}
+
+h1 {
+  font-size: var(--text-2xl);
+  margin-bottom: var(--space-3);
+}
+
+h2 {
+  font-size: var(--text-xl);
+}
+
+h3 {
+  font-size: var(--text-lg);
+}
+
+h4,
+h5,
+h6 {
+  font-size: var(--text-base);
+}
+
+p,
+figure,
+blockquote {
+  margin: 0;
+  text-wrap: pretty;
+}
+
+img,
+svg {
+  display: block;
+  max-width: 100%;
+}
+
+a,
+button {
+  color: var(--fg-0);
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 0.18em;
+  text-decoration-color: color-mix(in oklab, currentcolor 40%, transparent);
+}
+
+a:hover,
+button:hover {
+  text-decoration-color: currentcolor;
+}
+
+code,
+pre {
+  font-family: var(--font-mono);
+  font-size: 0.92em;
+}
+
+button {
+  font: inherit;
+  padding: 0;
+  background: none;
+  border: 0;
+  cursor: pointer;
+}
+
+:focus-visible {
+  outline: 2px solid var(--fg-0);
+  outline-offset: 2px;
+}
+
+::selection {
+  background: var(--bg-2);
+  color: var(--fg-0);
+}
+
+.wrap {
+  width: min(100% - (var(--gutter) * 2), var(--wrap));
+  margin-inline: auto;
+}
+
+.measure {
+  max-width: var(--measure);
+}
+
+main {
+  display: block;
+  flex: 1;
+  padding-block: clamp(2rem, 1rem + 4vw, 3.5rem) clamp(3rem, 2rem + 4vw, 5rem);
+}
+
+main:focus {
+  outline: none;
+}
+
+.skip {
+  position: absolute;
+  left: -9999px;
+  top: 0;
+}
+
+.skip:focus {
+  position: fixed;
+  left: var(--space-4);
+  top: var(--space-4);
+  z-index: 100;
+  padding: var(--space-2) var(--space-3);
+  background: var(--bg-0);
+  color: var(--fg-0);
+  border: 1px solid var(--fg-0);
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}

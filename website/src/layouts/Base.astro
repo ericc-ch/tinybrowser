@@ -1,17 +1,16 @@
 ---
-import "@fontsource-variable/plus-jakarta-sans"
-import "@fontsource-variable/jetbrains-mono"
-import "@/styles/global.css"
+import "@fontsource-variable/plus-jakarta-sans/wght.css"
+import "@fontsource-variable/jetbrains-mono/wght.css"
+import sans from "@fontsource-variable/plus-jakarta-sans/files/plus-jakarta-sans-latin-wght-normal.woff2"
+import "@/styles/main.css"
 
 interface Props {
   title: string
   description?: string
 }
 
-const {
-  title,
-  description = "A small, fast, spec-first headless browser for AI agents.",
-} = Astro.props
+const { title, description = "A small, fast, spec-first headless browser for AI agents." } =
+  Astro.props
 
 const canonical = new URL(Astro.url.pathname, Astro.site)
 ---
@@ -24,73 +23,89 @@ const canonical = new URL(Astro.url.pathname, Astro.site)
     <title>{title}</title>
     <meta name="description" content={description} />
     <link rel="canonical" href={canonical} />
+
+    <link rel="preload" href={sans} as="font" type="font/woff2" crossorigin />
+
+    <meta property="og:type" content="website" />
     <meta property="og:title" content={title} />
     <meta property="og:description" content={description} />
-    <meta property="og:type" content="website" />
+    <meta property="og:url" content={canonical} />
+
     <script is:inline>
-      // Follow the OS until the reader pins a theme; the pin survives a visit.
-      const stored = localStorage.getItem("theme")
-      if (stored === "light" || stored === "dark") {
-        document.documentElement.dataset.theme = stored
-      }
+      ;(() => {
+        const root = document.documentElement
+        root.dataset.js = "1"
+
+        let stored = null
+        try {
+          stored = localStorage.getItem("theme")
+        } catch {
+          stored = null
+        }
+
+        if (stored === "light" || stored === "dark") root.dataset.theme = stored
+      })()
     </script>
   </head>
-  <body class="min-h-dvh flex flex-col">
-    <header class="border-b border-border">
-      <nav
-        class="mx-auto flex max-w-5xl items-center gap-4 px-5 py-3 text-sm"
-        aria-label="Main"
-      >
-        <a class="font-semibold tracking-tight" href="/">tinybrowser</a>
-        <a class="text-muted-foreground hover:text-foreground" href="/wpt">WPT</a>
-        <a
-          class="text-muted-foreground hover:text-foreground"
-          href="https://github.com/tinybrowser-dev/tinybrowser"
-          rel="noreferrer">GitHub</a
-        >
-        <button
-          id="theme-toggle"
-          class="ml-auto rounded-md border border-border px-2 py-1 text-xs text-muted-foreground hover:text-foreground"
-          type="button"
-          aria-label="Toggle theme"
-        >
-          theme
-        </button>
+  <body>
+    <a class="skip" href="#main">Skip to content</a>
+
+    <header class="site-header">
+      <nav class="wrap site-nav" aria-label="Main">
+        <a href="/">tinybrowser</a>
+        <a href="/wpt">WPT</a>
+        <a href="https://github.com/tinybrowser-dev/tinybrowser" rel="noreferrer">GitHub</a>
+        <button id="theme-toggle" type="button">theme</button>
       </nav>
     </header>
 
-    <main class="mx-auto w-full max-w-5xl flex-1 px-5 py-10">
-      <slot />
+    <main id="main" tabindex="-1">
+      <div class="wrap">
+        <slot />
+      </div>
     </main>
 
-    <footer class="border-t border-border">
-      <div
-        class="mx-auto flex max-w-5xl flex-wrap gap-x-4 gap-y-1 px-5 py-4 text-xs text-muted-foreground"
-      >
+    <footer class="site-footer">
+      <div class="wrap">
         <span>MIT licensed</span>
-        <a class="hover:text-foreground" href="/wpt/data/latest.json">raw data</a>
-        <a
-          class="hover:text-foreground"
-          href="https://github.com/tinybrowser-dev/tinybrowser-wpt-results"
-          rel="noreferrer">history repo</a
-        >
+        <a href="/wpt/data/latest.json">raw data</a>
+        <a href="https://github.com/tinybrowser-dev/tinybrowser-wpt-results" rel="noreferrer">
+          history repo
+        </a>
       </div>
     </footer>
 
-    <script>
-      const button = document.getElementById("theme-toggle")
-      button?.addEventListener("click", () => {
-        const current = document.documentElement.dataset.theme
-        const next =
-          current === "light" ? "dark" : current === "dark" ? "" : "light"
-        if (next) {
-          document.documentElement.dataset.theme = next
-          localStorage.setItem("theme", next)
-        } else {
-          delete document.documentElement.dataset.theme
-          localStorage.removeItem("theme")
+    <script is:inline>
+      ;(() => {
+        const root = document.documentElement
+        const button = document.getElementById("theme-toggle")
+        const query = window.matchMedia("(prefers-color-scheme: dark)")
+        const current = () => root.dataset.theme ?? (query.matches ? "dark" : "light")
+
+        const render = () => {
+          if (!button) return
+          const dark = current() === "dark"
+          button.textContent = dark ? "Light" : "Dark"
+          button.setAttribute("aria-label", dark ? "Switch to light theme" : "Switch to dark theme")
         }
-      })
+
+        render()
+
+        button?.addEventListener("click", () => {
+          const next = current() === "dark" ? "light" : "dark"
+          root.dataset.theme = next
+          try {
+            localStorage.setItem("theme", next)
+          } catch {
+            /* storage is optional */
+          }
+          render()
+        })
+
+        query.addEventListener("change", () => {
+          if (!root.dataset.theme) render()
+        })
+      })()
     </script>
   </body>
 </html>

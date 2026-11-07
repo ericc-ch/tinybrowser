@@ -18,7 +18,7 @@ function read<T>(name: string): T | null {
 export function loadSnapshot(): Snapshot {
   return {
     latest: read<RunRecord>("latest.json"),
-    index: read<IndexEntry[]>("index.json") ?? [],
+    index: read<Array<IndexEntry>>("index.json") ?? [],
     regressions: read<Regression>("regressions.json"),
   }
 }

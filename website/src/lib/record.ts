@@ -39,7 +39,7 @@ export type RunRecord = {
    * Only `merge` output carries the list; `publish` moves it into the gzipped
    * sidecar so the committed record stays small.
    */
-  failures?: Failure[]
+  failures?: Array<Failure>
 }
 
 export type IndexEntry = {
@@ -54,14 +54,14 @@ export type Regression = {
   previous_sha: string | null
   wpt_revision: string | null
   comparable: boolean
-  regressions: Failure[]
-  new_timeouts: Failure[]
-  fixes: Failure[]
+  regressions: Array<Failure>
+  new_timeouts: Array<Failure>
+  fixes: Array<Failure>
 }
 
 export type Snapshot = {
   latest: RunRecord | null
-  index: IndexEntry[]
+  index: Array<IndexEntry>
   regressions: Regression | null
 }
 
@@ -93,11 +93,7 @@ export function formatCount(value: number): string {
 }
 
 /** `1 failure`, `2 failures`, `0 failures`. */
-export function plural(
-  count: number,
-  singular: string,
-  pluralForm = `${singular}s`,
-): string {
+export function plural(count: number, singular: string, pluralForm = `${singular}s`): string {
   return `${formatCount(count)} ${count === 1 ? singular : pluralForm}`
 }
 
@@ -111,13 +107,3 @@ export function formatDate(epoch: number | null): string {
 export function shortSha(sha: string | null): string {
   return sha ? sha.slice(0, 8) : "—"
 }
-
-/** Ordered outcome buckets for the stacked bar, most specific first. */
-export const OUTCOMES = [
-  { key: "subtest_pass", label: "pass", className: "bg-pass" },
-  { key: "subtest_fail", label: "fail", className: "bg-fail" },
-  { key: "subtest_timeout", label: "timeout", className: "bg-warn" },
-  { key: "subtest_error", label: "error", className: "bg-crash" },
-  { key: "subtest_notrun", label: "not run", className: "bg-muted-foreground" },
-  { key: "subtest_skip", label: "skip", className: "bg-border" },
-] as const

@@ -1,0 +1,9 @@
+{
+  "$schema": "./node_modules/oxfmt/configuration_schema.json",
+  "ignorePatterns": ["dist/**", "public/**", "src/content/**", "bun.lock"],
+  "semi": false,
+  "sortPackageJson": true,
+  "astro": {
+    "compressHTML": "html"
+  }
+}

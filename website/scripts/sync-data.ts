@@ -36,9 +36,7 @@ const readme = join(source, "README.md")
 if (existsSync(readme)) copyFileSync(readme, join(target, "README.md"))
 
 if (copied === 0) {
-  console.warn(
-    `sync-data: no record in ${source}; the dashboard will render its empty state`,
-  )
+  console.warn(`sync-data: no record in ${source}; the dashboard will render its empty state`)
 } else {
   console.log(`sync-data: ${copied} files from ${source}`)
 }
