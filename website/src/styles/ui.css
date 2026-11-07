@@ -323,10 +323,16 @@ th h2 {
   font-size: var(--text-sm);
 }
 
+.diff-lead {
+  font-size: var(--text-lg);
+  font-variant-numeric: tabular-nums;
+}
+
 .diff-counts {
   display: flex;
   flex-wrap: wrap;
   gap: 0 var(--space-5);
+  margin-top: var(--space-2);
   font-size: var(--text-sm);
   font-variant-numeric: tabular-nums;
 }
@@ -335,59 +341,6 @@ th h2 {
   margin-top: var(--space-3);
   color: var(--fg-1);
   font-size: var(--text-sm);
-}
-
-.diff-group {
-  margin-top: var(--space-4);
-}
-
-.diff-group h3 {
-  font-size: var(--text-sm);
-  font-weight: 500;
-  color: var(--fg-1);
-}
-
-.diff-list {
-  list-style: none;
-  margin: var(--space-1) 0 0;
-  padding: 0;
-  font-family: var(--font-mono);
-  font-size: var(--text-sm);
-}
-
-.diff-list li {
-  display: flex;
-  align-items: baseline;
-  gap: var(--space-2);
-}
-
-.diff-list .path {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.diff-list .status {
-  color: var(--fg-0);
-}
-
-.diff-list .count {
-  margin-inline-start: auto;
-  flex-shrink: 0;
-  color: var(--fg-1);
-}
-
-.diff-list .path,
-.diff-list .status {
-  flex-shrink: 0;
-}
-
-.diff-list .path {
-  flex-shrink: 1;
-}
-
-.diff-group.fixed .diff-list {
-  color: var(--fg-1);
 }
 
 .empty {

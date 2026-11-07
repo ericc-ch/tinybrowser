@@ -27,6 +27,12 @@ const commitHref = latest?.product_revision
   ? `https://github.com/tinybrowser-dev/tinybrowser/commit/${latest.product_revision}`
   : null
 
+// The denominator moves with the run: a file that fails before it reports any
+// subtests adds tests but no subtests, so the delta is raw passing count.
+const passNow = latest ? counter(latest.totals, "subtest_pass") : null
+const passPrevious = index.length > 1 ? counter(index[1].totals, "subtest_pass") : null
+const passDelta = passNow !== null && passPrevious !== null ? passNow - passPrevious : null
+
 const raw = [
   ["latest.json", "the newest full record"],
   ["index.json", "one entry per run"],
@@ -44,7 +50,8 @@ const raw = [
       <h1 class="page-title">Web Platform Tests</h1>
       <p class="lede">
         How much of the pinned WPT corpus tinybrowser passes, by folder and by run. One point per
-        code push.
+        code push. The percentage counts the subtests the run reported; a file that fails before it
+        reports any adds none.
       </p>
     </div>
     {latest && <p class="run-meta">
@@ -75,7 +82,7 @@ const raw = [
           <p class="stat-value">{formatPercent(score)}</p>
           <p class="stat-detail">
             {formatCount(counter(latest.totals, "subtest_pass"))} of{" "}
-            {formatCount(counter(latest.totals, "subtests"))}
+            {formatCount(counter(latest.totals, "subtests"))} reported
             {delta !== null && Math.abs(delta) >= 0.05 && <span class="delta">
               {delta >= 0 ? "+" : ""}
               {delta.toFixed(1)} pts
@@ -111,7 +118,7 @@ const raw = [
       </div>
 
       <div class="section">
-        <Regressions regression={regressions} />
+        <Regressions regression={regressions} passDelta={passDelta} />
       </div>
 
       <div class="section">

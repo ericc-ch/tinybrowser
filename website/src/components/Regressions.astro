@@ -1,56 +1,35 @@
 ---
-import { plural, type Failure, type Regression } from "@/lib/record"
+import { plural, type Regression } from "@/lib/record"
 
 interface Props {
   regression: Regression | null
+  /** Change in passing subtests against the previous index entry. */
+  passDelta: number | null
 }
 
-const { regression } = Astro.props
+const { regression, passDelta } = Astro.props
 
-const MAX_FILES = 15
-
-function link(test: string): string {
-  return `https://wpt.fyi/results${test}`
+/** A flaky file puts every subtest in the diff; the count is the files, not the rows. */
+function fileCount(rows: Array<{ test: string }>): number {
+  return new Set(rows.map((row) => row.test)).size
 }
 
-type FileGroup = {
-  test: string
-  status: string
-  subtests: Array<Failure>
-}
-
-/**
- * One row per test file. A single flaky timeout turns every subtest in that
- * file into a new failure, so an ungrouped list is mostly one file repeated;
- * the count next to the path says how much of the file moved.
- */
-function groupByFile(rows: Array<Failure>): Array<FileGroup> {
-  const groups = new Map<string, FileGroup>()
-  for (const row of rows) {
-    const group = groups.get(row.test) ?? { test: row.test, status: row.status, subtests: [] }
-    // A hard status (timeout, error, crash) describes the file, not a subtest.
-    if (row.subtest === "") group.status = row.status
-    group.subtests.push(row)
-    groups.set(row.test, group)
-  }
-  return [...groups.values()].sort((a, b) => b.subtests.length - a.subtests.length)
-}
-
-const regressedFiles = regression ? groupByFile(regression.regressions) : []
-const fixedFiles = regression ? groupByFile(regression.fixes) : []
-const timedOutFiles = regression ? groupByFile(regression.new_timeouts) : []
+const regressed = regression ? fileCount(regression.regressions) : 0
+const fixed = regression ? fileCount(regression.fixes) : 0
+const timedOut = regression ? fileCount(regression.new_timeouts) : 0
+const comparable = regression !== null && regression.previous_sha !== null && regression.comparable
 ---
 
 <div class="card">
   <div class="section-head">
     <h2>What changed</h2>
+    {comparable && <span class="note">one run against the previous one</span>}
   </div>
   {regression === null ? (
     <p class="diff-note">No diff published yet.</p>
   ) : regression.previous_sha === null ? (
     <p class="diff-note">
-      First published run: there is nothing to compare with yet. The next run gets a failure-list
-      diff.
+      First published run: there is nothing to compare with yet. The next run gets a diff.
     </p>
   ) : !regression.comparable ? (
     <p class="diff-note">
@@ -58,54 +37,21 @@ const timedOutFiles = regression ? groupByFile(regression.new_timeouts) : []
     </p>
   ) : (
     <div>
-      <div class="diff-counts">
-        <span class={regressedFiles.length ? "strong" : "muted"}>
-          {plural(regressedFiles.length, "file")} regressed
-          {regression.regressions.length > regressedFiles.length && <span class="muted">
-            ({plural(regression.regressions.length, "subtest")})</span>}
-        </span>
-        <span class="muted">{plural(fixedFiles.length, "file")} fixed</span>
-        <span class="muted">{plural(timedOutFiles.length, "file")} newly timing out</span>
-      </div>
-
-      <p class="diff-note">
-        One run against the previous one, so a test that flips with runner load lands here too — the
-        same file can appear as a regression in one run and a fix in the next.
+      {passDelta !== null && <p class="diff-lead">
+        <span class="strong">
+          {(passDelta >= 0 ? "+" : "−") + Math.abs(passDelta).toLocaleString("en-US")}
+        </span
+        >{" "} subtests passing since the previous run
+      </p>}
+      <p class="diff-counts">
+        <span class={regressed ? "strong" : "muted"}>{plural(regressed, "file")} regressed</span>
+        <span class="muted">{plural(fixed, "file")} fixed</span>
+        <span class="muted">{plural(timedOut, "file")} newly timing out</span>
       </p>
-
-      {regressedFiles.length > 0 && <div class="diff-group">
-        <h3>Regressed</h3>
-        <ul class="diff-list">
-          {regressedFiles.slice(0, MAX_FILES).map((group: FileGroup) => <li>
-            <span class="status">{group.status}</span>
-            <a class="path" href={link(group.test)} rel="noreferrer">
-              {group.test}
-            </a>
-            {group.subtests.length > 1 && <span class="count"
-              >{group.subtests.length} subtests</span
-            >}
-          </li>)}
-        </ul>
-        {regressedFiles.length > MAX_FILES && <p class="diff-note">
-          <a href="/wpt/data/regressions.json">
-            … and {regressedFiles.length - MAX_FILES} more files
-          </a>
-        </p>}
-      </div>}
-
-      {fixedFiles.length > 0 && <div class="diff-group fixed">
-        <h3>Fixed</h3>
-        <ul class="diff-list">
-          {fixedFiles.slice(0, MAX_FILES).map((group: FileGroup) => <li>
-            <a class="path" href={link(group.test)} rel="noreferrer">
-              {group.test}
-            </a>
-            {group.subtests.length > 1 && <span class="count"
-              >{group.subtests.length} subtests</span
-            >}
-          </li>)}
-        </ul>
-      </div>}
+      <p class="diff-note">
+        A test that flips with runner load lands here too.{" "}
+        <a href="/wpt/data/regressions.json">The raw diff</a> has every file and subtest.
+      </p>
     </div>
   )}
 </div>
