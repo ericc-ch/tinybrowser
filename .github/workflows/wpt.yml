@@ -468,5 +468,9 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
-          git commit -m "wpt: ${GITHUB_SHA:0:8}"
-          git push
+          # The repo is a snapshot, not a log: failures.jsonl.gz is ~4 MB for a
+          # full run and a new blob on every push would grow the repo without
+          # bound, while the history a reader wants is index.json. Amending
+          # keeps one commit and force-pushing it costs nothing anyone reads.
+          git commit --amend -m "wpt: ${GITHUB_SHA:0:8}"
+          git push --force origin HEAD:main
