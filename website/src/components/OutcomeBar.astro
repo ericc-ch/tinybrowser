@@ -7,11 +7,24 @@ interface Props {
 }
 
 const { counters, compact = false } = Astro.props
-const total = Math.max(counter(counters, "subtests"), 1)
-const parts = OUTCOMES.map((outcome) => ({
-  ...outcome,
-  count: counter(counters, outcome.key),
-})).filter((part) => part.count > 0)
+const subtests = counter(counters, "subtests")
+const total = Math.max(subtests, 1)
+const parts: { label: string; className: string; count: number }[] = OUTCOMES.map(
+  (outcome) => ({
+    label: outcome.label,
+    className: outcome.className,
+    count: counter(counters, outcome.key),
+  }),
+).filter((part) => part.count > 0)
+
+// A lane may report a status this list does not name (precondition-failed,
+// for one). Those subtests still count in the denominator, so show the
+// remainder rather than letting the bar silently under-report.
+const known = parts.reduce((sum, part) => sum + part.count, 0)
+const other = subtests - known
+if (other > 0) {
+  parts.push({ label: "other", className: "bg-foreground/30", count: other })
+}
 ---
 
 <div
