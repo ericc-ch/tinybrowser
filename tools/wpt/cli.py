@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import gzip
 import hashlib
 import io
 import json
@@ -1130,6 +1131,18 @@ def record_row(row: dict[str, int]) -> dict[str, int]:
     }
 
 
+def epoch_seconds(value: Any) -> float | None:
+    """A wptreport timestamp as unix seconds.
+
+    wptreport writes `time_start`/`time_end` in milliseconds; the record stores
+    seconds, the unit every date formatter and chart wants. The conversion
+    happens once here, at the parser boundary, so no consumer has to guess.
+    """
+    if not isinstance(value, (int, float)) or value <= 0:
+        return None
+    return value / 1000 if value > 1e11 else float(value)
+
+
 def build_record(merged: dict, product_revision: str | None) -> dict:
     """The compact record of one merged run.
 
@@ -1148,8 +1161,8 @@ def build_record(merged: dict, product_revision: str | None) -> dict:
         "schema": RECORD_SCHEMA,
         "product_revision": product_revision,
         "wpt_revision": run_info.get("revision"),
-        "time_start": merged.get("time_start"),
-        "time_end": merged.get("time_end"),
+        "time_start": epoch_seconds(merged.get("time_start")),
+        "time_end": epoch_seconds(merged.get("time_end")),
         "totals": record_row(totals),
         "areas": {name: record_row(row) for name, row in sorted(rows.items())},
         "failures": [
@@ -1201,6 +1214,221 @@ def merge_main(argv: list[str]) -> int:
         eprint(f"wpt: merge: {skipped} of {len(reports)} chunk reports were unusable")
         return code or 2
     return code
+
+
+# --- `publish` (one record into the history repo's data dir) ---
+
+
+PUBLISH_USAGE = """publish --record FILE --data DIR [--sha SHA]
+
+Add one compact run record (from `merge --summary-out`) to the data directory
+that the results repo publishes: latest.json, regressions.json, index.json, and
+failures.jsonl.gz. The record's failure list moves into the gzipped sidecar,
+so latest.json stays small (a full run has ~100k failures) and the next run
+still has every entry to diff against.
+
+The diff is advisory: it lists new failures and fixes, and new TIMEOUTs
+separately because they flip with runner load. Two runs from different WPT
+revisions are not comparable, so the diff is empty and says so.
+
+The command only touches the data directory; the caller owns git."""
+
+
+def failure_key(entry: dict) -> tuple[str, str]:
+    return (entry.get("test") or "", entry.get("subtest") or "")
+
+
+def diff_failures(previous: list[dict], current: list[dict], comparable: bool) -> dict:
+    """What changed between two failure lists, as set operations.
+
+    Both lists come from `merge --summary-out`, so each entry is a status, a
+    test, and an optional subtest. `comparable` is false across a WPT pin bump:
+    the denominator moved, so "new" and "fixed" would describe the pin, not
+    the engine.
+    """
+    before = {failure_key(entry): entry for entry in previous}
+    after = {failure_key(entry): entry for entry in current}
+    new = [after[key] for key in after.keys() - before.keys()]
+    fixed = [before[key] for key in before.keys() - after.keys()]
+    # A TIMEOUT flips with runner load; it is watched, not counted as a
+    # regression. Only a hard or ordinary failure counts.
+    new_timeouts = [entry for entry in new if entry.get("status") == "TIMEOUT"]
+    regressions = [entry for entry in new if entry.get("status") != "TIMEOUT"]
+    return {
+        "regressions": regressions if comparable else [],
+        "new_timeouts": new_timeouts if comparable else [],
+        "fixes": fixed if comparable else [],
+    }
+
+
+# The failure list is ~100k rows in a full run, so it stays a gzipped sidecar
+# instead of a JSON member of latest.json: the committed record stays small
+# while the next run still gets every entry to diff against. JSON rather than
+# TSV because a subtest name may contain a tab, a CR, or a newline (a WPT test
+# that asserts on those characters names them), and no escaping rule of ours
+# should be needed to read back what we wrote.
+FAILURES_FILE = "failures.jsonl.gz"
+
+
+def read_failures(path: Path) -> list[dict]:
+    """The failure sidecar: one JSON object per line, gzipped."""
+    if not path.is_file():
+        return []
+    try:
+        with gzip.open(path, "rt", encoding="utf-8") as handle:
+            lines = handle.read().splitlines()
+    except (OSError, EOFError) as error:
+        eprint(f"publish: ignoring unreadable {path}: {error}")
+        return []
+    out: list[dict] = []
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            # A torn write is the only way here; keep the lines that read.
+            continue
+        if isinstance(entry, dict) and entry.get("test"):
+            out.append(
+                {
+                    "test": entry["test"],
+                    "subtest": entry.get("subtest") or "",
+                    "status": entry.get("status") or "FAIL",
+                }
+            )
+    return out
+
+
+def write_failures(path: Path, failures: list[dict]) -> None:
+    with gzip.open(path, "wt", encoding="utf-8") as handle:
+        for entry in failures:
+            handle.write(
+                json.dumps(
+                    {
+                        "test": entry.get("test") or "",
+                        "subtest": entry.get("subtest") or "",
+                        "status": entry.get("status") or "FAIL",
+                    },
+                    separators=(",", ":"),
+                )
+                + "\n"
+            )
+
+
+def record_date(record: dict) -> str:
+    end = record.get("time_end")
+    if isinstance(end, (int, float)) and end > 0:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(end))
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def index_entry(record: dict) -> dict:
+    return {
+        "sha": record.get("product_revision"),
+        "date": record_date(record),
+        "wpt_revision": record.get("wpt_revision"),
+        "totals": record.get("totals") or {},
+    }
+
+
+def publish_main(argv: list[str]) -> int:
+    record_path: Path | None = None
+    data_dir: Path | None = None
+    sha: str | None = None
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        name = arg.split("=", 1)[0]
+        if name in ("--record", "--data", "--sha"):
+            if "=" in arg:
+                value = arg.split("=", 1)[1]
+            elif i + 1 < len(argv) and not argv[i + 1].startswith("-"):
+                value = argv[i + 1]
+                i += 1
+            else:
+                value = ""
+            if not value and name != "--sha":
+                return die("publish", f"{name} needs a value", 2)
+            if name == "--record":
+                record_path = Path(value)
+            elif name == "--data":
+                data_dir = Path(value)
+            else:
+                sha = value or None
+        elif arg in ("-h", "--help"):
+            print(PUBLISH_USAGE)
+            return 0
+        else:
+            return die("publish", f"unexpected argument {arg}\n{PUBLISH_USAGE}", 2)
+        i += 1
+    if record_path is None or data_dir is None:
+        return die("publish", f"need --record and --data\n{PUBLISH_USAGE}", 2)
+    try:
+        record = json.loads(record_path.read_text())
+    except OSError as error:
+        return die("publish", f"cannot read {record_path}: {error}", 2)
+    except json.JSONDecodeError as error:
+        return die("publish", f"{record_path} is not valid JSON ({error})", 2)
+    if sha is not None:
+        record["product_revision"] = sha
+    if not record.get("product_revision"):
+        return die("publish", "the record has no product revision; pass --sha", 2)
+
+    data_dir.mkdir(parents=True, exist_ok=True)
+    latest_path = data_dir / "latest.json"
+    failures_path = data_dir / FAILURES_FILE
+
+    # The failure list leaves the committed JSON here and is re-read from the
+    # sidecar, so `latest.json` is the same shape whether or not a run had any
+    # failures to record.
+    current_failures = record.pop("failures", None) or []
+    previous_failures = read_failures(failures_path)
+    previous: dict | None = None
+    if latest_path.is_file():
+        try:
+            previous = json.loads(latest_path.read_text())
+        except (OSError, json.JSONDecodeError) as error:
+            eprint(f"publish: ignoring unreadable latest.json: {error}")
+
+    # A rerun of the same commit replaces its point in the index instead of
+    # adding one; the diff is against whatever the sidecar last held.
+    comparable = previous is not None and (
+        previous.get("wpt_revision") == record.get("wpt_revision")
+    )
+    diff = diff_failures(previous_failures, current_failures, comparable)
+    diff.update(
+        {
+            "sha": record.get("product_revision"),
+            "previous_sha": None
+            if previous is None
+            else previous.get("product_revision"),
+            "wpt_revision": record.get("wpt_revision"),
+            "comparable": comparable,
+        }
+    )
+
+    (data_dir / "latest.json").write_text(json.dumps(record))
+    write_failures(failures_path, current_failures)
+    (data_dir / "regressions.json").write_text(json.dumps(diff))
+
+    index_path = data_dir / "index.json"
+    index: list[dict] = []
+    if index_path.is_file():
+        try:
+            loaded = json.loads(index_path.read_text())
+            if isinstance(loaded, list):
+                index = loaded
+        except (OSError, json.JSONDecodeError) as error:
+            eprint(f"publish: ignoring unreadable index.json: {error}")
+    entry = index_entry(record)
+    index = [item for item in index if item.get("sha") != entry["sha"]]
+    index.insert(0, entry)
+    index_path.write_text(json.dumps(index, separators=(",", ":")))
+    eprint(
+        f"publish: {entry['sha'][:8]} at {entry['date']} "
+        f"({len(diff['regressions'])} regressions, {len(diff['fixes'])} fixes, "
+        f"{len(diff['new_timeouts'])} new timeouts)"
+    )
+    return 0
 
 
 # --- `profile` (wall-time census over a report or a live run) ---
@@ -3127,6 +3355,7 @@ def _selftest() -> None:
     _selftest_failures()
     _selftest_baseline()
     _selftest_merge()
+    _selftest_publish()
 
 
 def _selftest_profile() -> None:
@@ -3392,6 +3621,114 @@ def _selftest_merge() -> None:
             assert merge_main([str(empty)]) == 1
 
 
+def _selftest_publish() -> None:
+    """Two records: one point, then a diff, then a pin change kills the diff.
+
+    The failure list lives in a gzipped sidecar, so the assertions read it
+    back through `read_failures` — the same path the next publish uses.
+    """
+    record = {
+        "schema": 1,
+        "product_revision": "aaa",
+        "wpt_revision": "w1",
+        "time_end": 1_800_000_000,
+        "totals": {"tests": 3},
+        "areas": {},
+        "failures": [
+            {"test": "/dom/a.html", "subtest": "", "status": "TIMEOUT"},
+            {"test": "/dom/b.html", "subtest": "", "status": "FAIL"},
+        ],
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        data = tmp / "data"
+        first = tmp / "first.json"
+        first.write_text(json.dumps(record))
+        with (
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            assert publish_main(["--record", str(first), "--data", str(data)]) == 0
+
+        latest = json.loads((data / "latest.json").read_text())
+        assert latest["product_revision"] == "aaa"
+        # The sidecar is the failure list now; the record is small.
+        assert "failures" not in latest
+        assert read_failures(data / "failures.jsonl.gz") == [
+            {"status": "TIMEOUT", "test": "/dom/a.html", "subtest": ""},
+            {"status": "FAIL", "test": "/dom/b.html", "subtest": ""},
+        ]
+        assert not (data / "previous.json").exists()
+        index = json.loads((data / "index.json").read_text())
+        assert index[0]["sha"] == "aaa" and index[0]["date"].endswith("Z")
+        diff = json.loads((data / "regressions.json").read_text())
+        assert diff["previous_sha"] is None and not diff["comparable"]
+        assert diff["regressions"] == [] and diff["fixes"] == []
+
+        second = tmp / "second.json"
+        updated = json.loads(json.dumps(record))
+        updated.update(product_revision="bbb", time_end=1_800_000_100)
+        updated["failures"] = [
+            {"test": "/dom/b.html", "subtest": "", "status": "TIMEOUT"},
+            {"test": "/dom/c.html", "subtest": "s", "status": "FAIL"},
+        ]
+        second.write_text(json.dumps(updated))
+        with (
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            assert publish_main(["--record", str(second), "--data", str(data)]) == 0
+        diff = json.loads((data / "regressions.json").read_text())
+        assert diff["previous_sha"] == "aaa" and diff["comparable"]
+        # /dom/c.html is the only genuinely new failure; /dom/b.html changed
+        # from FAIL to TIMEOUT, which is a flipped failure, not a new one.
+        assert [(e["test"], e["status"]) for e in diff["regressions"]] == [
+            ("/dom/c.html", "FAIL")
+        ]
+        assert [e["test"] for e in diff["new_timeouts"]] == []
+        assert [e["test"] for e in diff["fixes"]] == ["/dom/a.html"]
+        assert not (data / "previous.json").exists()
+        assert [
+            item["sha"] for item in json.loads((data / "index.json").read_text())
+        ] == ["bbb", "aaa"]
+
+        # Same commit: the point is replaced, not added.
+        rerun = json.loads(json.dumps(updated))
+        rerun["time_end"] = 1_800_000_200
+        path = tmp / "rerun.json"
+        path.write_text(json.dumps(rerun))
+        with (
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            assert publish_main(["--record", str(path), "--data", str(data)]) == 0
+        assert [
+            item["sha"] for item in json.loads((data / "index.json").read_text())
+        ] == ["bbb", "aaa"]
+        assert [item["date"] for item in json.loads((data / "index.json").read_text())][
+            0
+        ].startswith("2027-01-15")
+
+        # A new WPT pin moves the denominator: no claims across it.
+        third = json.loads(json.dumps(updated))
+        third.update(product_revision="ccc", wpt_revision="w2")
+        path = tmp / "third.json"
+        path.write_text(json.dumps(third))
+        with (
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            assert publish_main(["--record", str(path), "--data", str(data)]) == 0
+        diff = json.loads((data / "regressions.json").read_text())
+        assert not diff["comparable"]
+        assert diff["regressions"] == [] and diff["fixes"] == []
+
+        # A truncated sidecar is ignored, not fatal: the diff restarts.
+        (data / "failures.jsonl.gz").write_bytes(b"\x1f\x8b\x08truncated")
+        with contextlib.redirect_stderr(io.StringIO()):
+            assert read_failures(data / "failures.jsonl.gz") == []
+
+
 TOP_HELP = """tinybrowser WPT harness: run | score | rerun | merge | profile | failures | baseline | manifest | overnight | selftest
 
 Lanes — `run <lane>`, required, one executor each:
@@ -3435,6 +3772,11 @@ Reports and diffs:
     the history and the site read; --product-revision stamps it with the
     commit under test. --strict-skips exits 2 after printing the table when
     any report was unusable, so a dead chunk still fails CI.
+  publish --record FILE --data DIR [--sha SHA]
+    Add one record to the data directory the results repo publishes:
+    latest.json, regressions.json, index.json, and the gzipped failure
+    sidecar the next run diffs against. The diff is advisory and empty when
+    the WPT revision changed.
   failures [LOG...]
     Print the canonical failure list of a `--score` log, one
     `STATUS PATH :: SUBTEST` line per failing result, sorted and deduplicated.
@@ -3507,6 +3849,8 @@ def main(argv: list[str] | None = None) -> int:
         return rerun_main(options, args)
     if command == "merge":
         return merge_main(args)
+    if command == "publish":
+        return publish_main(args)
     if command == "profile":
         return profile_main(options, args)
     if command == "failures":

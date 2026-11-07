@@ -162,6 +162,16 @@ table, so the two cannot disagree. The 335 MB merged wptreport is a debug
 artifact; the record is the hand-off, and `tools/wpt/verdict-cases.json`
 pins its verdict rule against `tools/wpt-report`.
 
+`publish --record run.json --data DIR` turns that record into the files the
+public dashboard reads: `latest.json` (the record without its failure list),
+`index.json` (one entry per run, which is the history chart),
+`regressions.json` (failure-list set difference against the previous run), and
+`failures.jsonl.gz` (the list itself, since a full run has ~100k rows and a
+JSON member that size would make every commit huge). A WPT pin bump makes the
+diff incomparable and it says so instead of reporting phantom fixes. The
+`WPT` workflow runs this after a push to `main` and commits the result to
+`tinybrowser-dev/tinybrowser-wpt-results`.
+
 A test file whose own timers outlast DEFAULT_TIMEOUT cannot be sped up
 from the engine: `referrer-policy/css-integration/svg/` sleeps 800 ms
 per subtest (nine serially) before it checks anything. SLOW_TEST_PREFIXES

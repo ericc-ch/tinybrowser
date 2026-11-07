@@ -440,3 +440,33 @@ jobs:
             summary.txt
           if-no-files-found: warn
           retention-days: 7
+      - name: Publish run record
+        if: ${{ !cancelled() && github.ref == 'refs/heads/main' && github.event_name == 'push' }}
+        env:
+          TOKEN: ${{ secrets.WPT_RESULTS_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ ! -f run.json ]]; then
+            echo "::warning::no run.json (the merge did not finish); skipping the history publish"
+            exit 0
+          fi
+          if [[ -z "${TOKEN}" ]]; then
+            echo "::warning::WPT_RESULTS_TOKEN is not set; skipping the history publish"
+            exit 0
+          fi
+          git clone --depth 1 \
+            "https://x-access-token:${TOKEN}@github.com/tinybrowser-dev/tinybrowser-wpt-results.git" \
+            results
+          python3 tools/wpt/cli.py publish \
+            --record run.json --data results --sha "$GITHUB_SHA"
+          cd results
+          # Untracked files count too: the first publish creates every file.
+          if [[ -z "$(git status --porcelain)" ]]; then
+            echo "no change to publish"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "wpt: ${GITHUB_SHA:0:8}"
+          git push
