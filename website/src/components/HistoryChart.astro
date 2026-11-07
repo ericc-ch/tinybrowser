@@ -1,0 +1,100 @@
+---
+import { subtestPercent, type IndexEntry } from "@/lib/record"
+
+interface Props {
+  index: IndexEntry[]
+}
+
+const { index } = Astro.props
+
+// Oldest to newest: the chart reads left to right in time.
+const points = [...index].reverse().flatMap((entry) => {
+  const pct = subtestPercent(entry.totals)
+  if (pct === null) return []
+  return [{ pct, date: entry.date, sha: entry.sha ?? "" }]
+})
+
+const width = 760
+const height = 220
+const pad = { top: 12, right: 12, bottom: 26, left: 44 }
+const plotW = width - pad.left - pad.right
+const plotH = height - pad.top - pad.bottom
+
+const values = points.map((point) => point.pct)
+const low = values.length ? Math.max(0, Math.floor(Math.min(...values) / 5) * 5 - 5) : 0
+const high = values.length ? Math.min(100, Math.ceil(Math.max(...values) / 5) * 5 + 5) : 100
+const span = Math.max(high - low, 5)
+
+const x = (i: number) =>
+  pad.left + (points.length <= 1 ? plotW / 2 : (i / (points.length - 1)) * plotW)
+const y = (pct: number) => pad.top + (1 - (pct - low) / span) * plotH
+
+const line = points.map((point, i) => `${x(i)},${y(point.pct)}`).join(" ")
+const grid = [low, low + span / 2, high]
+const first = points[0]?.date.slice(0, 10)
+const last = points[points.length - 1]?.date.slice(0, 10)
+---
+
+<div class="rounded-lg border border-border bg-card p-4">
+  <div class="mb-2 flex items-baseline justify-between">
+    <h2 class="text-sm font-medium">Subtests passing over time</h2>
+    <span class="text-xs text-muted-foreground">one point per code push</span>
+  </div>
+  {
+    points.length < 2 ? (
+      <p class="py-16 text-center text-sm text-muted-foreground">
+        History starts with the next WPT run. {points.length === 1
+          ? `One point so far: ${points[0].pct.toFixed(1)}%.`
+          : ""}
+      </p>
+    ) : (
+      <svg
+        viewBox={`0 0 ${width} ${height}`}
+        class="h-auto w-full"
+        role="img"
+        aria-label="Subtests passing over time"
+      >
+        {grid.map((value) => (
+          <g>
+            <line
+              x1={pad.left}
+              x2={width - pad.right}
+              y1={y(value)}
+              y2={y(value)}
+              class="stroke-border"
+              stroke-width="1"
+            />
+            <text
+              x={pad.left - 8}
+              y={y(value) + 4}
+              text-anchor="end"
+              class="fill-muted-foreground text-[10px]"
+            >
+              {value.toFixed(0)}%
+            </text>
+          </g>
+        ))}
+        <polyline points={line} fill="none" class="stroke-foreground" stroke-width="1.5" />
+        {points.map((point, i) => (
+          <circle cx={x(i)} cy={y(point.pct)} r="3" class="fill-foreground">
+            <title>
+              {point.date.slice(0, 16).replace("T", " ")} UTC —{" "}
+              {point.pct.toFixed(1)}% — {point.sha.slice(0, 8)}
+            </title>
+          </circle>
+        ))}
+        <text
+          x={pad.left}
+          y={height - 8}
+          class="fill-muted-foreground text-[10px]">{first}</text
+        >
+        <text
+          x={width - pad.right}
+          y={height - 8}
+          text-anchor="end"
+          class="fill-muted-foreground text-[10px]">{last}</text
+        >
+      </svg>
+    )
+  }
+</div>

@@ -1,0 +1,92 @@
+---
+import { plural, type Failure, type Regression } from "@/lib/record"
+
+interface Props {
+  regression: Regression | null
+}
+
+const { regression } = Astro.props
+
+const statusClass = (status: string) =>
+  status === "TIMEOUT"
+    ? "text-warn"
+    : status === "ERROR" || status === "CRASH"
+      ? "text-crash"
+      : "text-fail"
+
+const MAX_LISTED = 20
+
+function link(test: string): string {
+  return `https://wpt.fyi/results${test}`
+}
+---
+
+<div class="rounded-lg border border-border bg-card p-4">
+  <h2 class="text-sm font-medium">What changed</h2>
+  {
+    regression === null ? (
+      <p class="mt-2 text-sm text-muted-foreground">No diff published yet.</p>
+    ) : !regression.comparable ? (
+      <p class="mt-2 text-sm text-muted-foreground">
+        The WPT revision changed, so this run is not comparable with the
+        previous one.
+      </p>
+    ) : (
+      <div class="mt-3 space-y-4">
+        <div class="flex flex-wrap gap-4 text-sm tabular">
+          <span>
+            <span class={regression.regressions.length ? "text-fail" : "text-muted-foreground"}>
+              {plural(regression.regressions.length, "new failure")}
+            </span>
+          </span>
+          <span class={regression.fixes.length ? "text-pass" : "text-muted-foreground"}>
+            {plural(regression.fixes.length, "fix", "fixes")}
+          </span>
+          <span>
+            <span class="text-warn">
+              {plural(regression.new_timeouts.length, "new timeout")}
+            </span>
+            <span class="text-muted-foreground"> (watched, not counted)</span>
+          </span>
+        </div>
+
+        {regression.regressions.length > 0 && (
+          <div>
+            <h3 class="text-xs font-medium text-muted-foreground">New failures</h3>
+            <ul class="mt-1 space-y-0.5 font-mono text-xs">
+              {regression.regressions.slice(0, MAX_LISTED).map((failure: Failure) => (
+                <li class="truncate">
+                  <span class={statusClass(failure.status)}>{failure.status}</span>{" "}
+                  <a class="hover:underline" href={link(failure.test)} rel="noreferrer">
+                    {failure.test}
+                  </a>
+                  {failure.subtest && <span class="text-muted-foreground"> :: {failure.subtest}</span>}
+                </li>
+              ))}
+            </ul>
+            {regression.regressions.length > MAX_LISTED && (
+              <a class="mt-1 inline-block text-xs text-muted-foreground hover:text-foreground" href="/wpt/data/regressions.json">
+                … and {regression.regressions.length - MAX_LISTED} more
+              </a>
+            )}
+          </div>
+        )}
+
+        {regression.fixes.length > 0 && (
+          <div>
+            <h3 class="text-xs font-medium text-muted-foreground">Fixed</h3>
+            <ul class="mt-1 space-y-0.5 font-mono text-xs">
+              {regression.fixes.slice(0, MAX_LISTED).map((failure: Failure) => (
+                <li class="truncate text-muted-foreground">
+                  <a class="hover:underline" href={link(failure.test)} rel="noreferrer">
+                    {failure.test}
+                  </a>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+      </div>
+    )
+  }
+</div>

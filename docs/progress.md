@@ -53,6 +53,15 @@ timeouts flip both ways with runner load, and the `font-stretch`/`css-text`
 reftests flip with font rasterisation (repeated local runs of one binary flip
 the same files).
 
+Every push to `main` now publishes the record to
+`tinybrowser-dev/tinybrowser-wpt-results` and the site at
+`tinybrowser.ericc.ch/wpt` rebuilds from it: subtests passing, files passing,
+skipped, the history chart, the diff against the previous run, and the
+per-folder table. `latest.json` has no failure list; the ~100k rows live in
+`failures.jsonl.gz` and are what the next run diffs against. There is no
+backfill: the history starts with the first push after the publish step
+landed.
+
 CI 2026-10-23 run 39980734258 (wpt.yml, 20 chunks), --exclude=worker
 testharness+crashtest+reftest+test262
 

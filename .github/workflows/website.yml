@@ -1,0 +1,78 @@
+# The public site: the home page and the WPT dashboard at /wpt.
+#
+# Two triggers, because the two inputs are independent:
+#
+#   push          the page changed; rebuild with whatever data is published.
+#   workflow_run  a WPT run finished and may have pushed a new record to the
+#                 results repo, so the page must be rebuilt with it.
+#
+# The dashboard reads the results repo at build time and copies the record into
+# the site, so the deployed pages are a static snapshot; every file the page
+# reads stays fetchable under /wpt/data.
+
+name: Website
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "website/**"
+      - ".github/workflows/website.yml"
+  workflow_run:
+    workflows: [WPT]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deployment at a time; a queued run waits rather than racing the upload.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # The published history. A missing record is not an error: the site
+      # renders its empty state and the first WPT run fills it in.
+      - uses: actions/checkout@v7
+        with:
+          repository: tinybrowser-dev/tinybrowser-wpt-results
+          path: data
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install
+        working-directory: website
+        run: bun install --frozen-lockfile
+
+      - name: Build
+        working-directory: website
+        env:
+          WPT_DATA_DIR: ${{ github.workspace }}/data
+        run: bun run build
+
+      - uses: actions/configure-pages@v6
+
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: website/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5

@@ -1,0 +1,24 @@
+{
+  "name": "tinybrowser-website",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "astro dev",
+    "build": "bun run sync-data && astro build",
+    "preview": "astro preview",
+    "sync-data": "bun run scripts/sync-data.ts",
+    "check": "astro check && bun run build"
+  },
+  "dependencies": {
+    "@astrojs/check": "^0.9.4",
+    "@fontsource-variable/jetbrains-mono": "^5.2.5",
+    "@fontsource-variable/plus-jakarta-sans": "^5.2.5",
+    "@tailwindcss/vite": "^4.1.12",
+    "astro": "^7.4.2",
+    "tailwindcss": "^4.1.12"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "typescript": "^5.9.2"
+  }
+}

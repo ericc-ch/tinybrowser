@@ -1,0 +1,41 @@
+---
+import Base from "@/layouts/Base.astro"
+import { loadSnapshot } from "@/lib/data"
+import { formatPercent, subtestPercent } from "@/lib/record"
+
+const { latest } = loadSnapshot()
+const score = latest ? subtestPercent(latest.totals) : null
+---
+
+<Base title="tinybrowser" description="A small, fast, spec-first headless browser for AI agents.">
+  <section class="max-w-2xl">
+    <h1 class="text-2xl font-semibold tracking-tight">tinybrowser</h1>
+    <p class="mt-3 text-lg text-muted-foreground">
+      A small, fast, spec-first headless browser for AI agents. Conformance is
+      the product, so the Web Platform Tests run on every code push and the
+      result is published in the open.
+    </p>
+    <div class="mt-6 flex flex-wrap gap-3 text-sm">
+      <a
+        class="rounded-md bg-primary px-3 py-2 font-medium text-primary-foreground"
+        href="/wpt">Conformance dashboard</a
+      >
+      <a
+        class="rounded-md border border-border px-3 py-2"
+        href="https://github.com/tinybrowser-dev/tinybrowser"
+        rel="noreferrer">Source</a
+      >
+      <a class="rounded-md border border-border px-3 py-2" href="/wpt/data/latest.json"
+        >Raw record</a
+      >
+    </div>
+    {
+      latest && (
+        <p class="mt-8 text-sm text-muted-foreground">
+          Latest run: {formatPercent(score)} of subtests passing across{" "}
+          {latest.totals.tests.toLocaleString("en-US")} files.
+        </p>
+      )
+    }
+  </section>
+</Base>

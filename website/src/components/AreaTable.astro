@@ -1,0 +1,86 @@
+---
+import OutcomeBar from "@/components/OutcomeBar.astro"
+import { counter, formatCount, formatPercent, subtestPercent, type Counters } from "@/lib/record"
+
+interface Props {
+  areas: Record<string, Counters>
+}
+
+const { areas } = Astro.props
+
+const rows = Object.entries(areas)
+  .map(([name, counters]) => ({
+    name,
+    counters,
+    percent: subtestPercent(counters),
+    subtests: counter(counters, "subtests"),
+  }))
+  .sort((a, b) => b.subtests - a.subtests)
+---
+
+<div class="rounded-lg border border-border bg-card">
+  <div class="flex flex-wrap items-center gap-3 border-b border-border p-4">
+    <h2 class="text-sm font-medium">By folder</h2>
+    <input
+      id="area-filter"
+      type="search"
+      placeholder="filter folders"
+      class="ml-auto w-48 rounded-md border border-border bg-background px-2 py-1 text-sm placeholder:text-muted-foreground"
+      aria-label="Filter folders"
+    />
+  </div>
+  <div class="overflow-x-auto">
+    <table class="w-full text-sm tabular">
+      <thead class="text-xs text-muted-foreground">
+        <tr class="border-b border-border">
+          <th class="px-4 py-2 text-left font-medium">Folder</th>
+          <th class="px-2 py-2 text-right font-medium">Subtests</th>
+          <th class="px-2 py-2 text-left font-medium">Outcomes</th>
+          <th class="px-2 py-2 text-right font-medium">Pass</th>
+          <th class="px-4 py-2 text-right font-medium">Unexpected</th>
+        </tr>
+      </thead>
+      <tbody id="area-rows">
+        {
+          rows.map((row) => (
+            <tr class="border-b border-border/60 last:border-0 hover:bg-muted/40" data-area={row.name}>
+              <td class="px-4 py-1.5">
+                <a class="hover:underline" href={`https://wpt.fyi/results/${row.name}`} rel="noreferrer">
+                  {row.name}
+                </a>
+              </td>
+              <td class="px-2 py-1.5 text-right">{formatPercent(row.percent)}</td>
+              <td class="px-2 py-1.5">
+                <div class="min-w-32">
+                  <OutcomeBar counters={row.counters} compact />
+                </div>
+              </td>
+              <td class="px-2 py-1.5 text-right text-muted-foreground">
+                {formatCount(counter(row.counters, "pass"))}
+              </td>
+              <td class="px-4 py-1.5 text-right">
+                {counter(row.counters, "unexpected") > 0 ? (
+                  <span class="text-fail">{formatCount(counter(row.counters, "unexpected"))}</span>
+                ) : (
+                  <span class="text-muted-foreground">0</span>
+                )}
+              </td>
+            </tr>
+          ))
+        }
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+  const filter = document.getElementById("area-filter") as HTMLInputElement | null
+  const rows = Array.from(document.querySelectorAll<HTMLTableRowElement>("#area-rows tr"))
+  filter?.addEventListener("input", () => {
+    const needle = filter.value.trim().toLowerCase()
+    for (const row of rows) {
+      const name = row.dataset.area?.toLowerCase() ?? ""
+      row.hidden = needle !== "" && !name.includes(needle)
+    }
+  })
+</script>

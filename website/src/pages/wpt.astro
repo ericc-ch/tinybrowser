@@ -1,0 +1,149 @@
+---
+import AreaTable from "@/components/AreaTable.astro"
+import HistoryChart from "@/components/HistoryChart.astro"
+import Regressions from "@/components/Regressions.astro"
+import Base from "@/layouts/Base.astro"
+import { loadSnapshot } from "@/lib/data"
+import {
+  counter,
+  formatCount,
+  formatDate,
+  formatPercent,
+  shortSha,
+  subtestPercent,
+  testPercent,
+} from "@/lib/record"
+
+const { latest, index, regressions } = loadSnapshot()
+
+const score = latest ? subtestPercent(latest.totals) : null
+const files = latest ? testPercent(latest.totals) : null
+
+// The newest index entry repeats `latest`; the delta is against the one before.
+const previousScore = index.length > 1 ? subtestPercent(index[1].totals) : null
+const delta =
+  score !== null && previousScore !== null ? score - previousScore : null
+
+const commitHref = latest?.product_revision
+  ? `https://github.com/tinybrowser-dev/tinybrowser/commit/${latest.product_revision}`
+  : null
+
+const raw = [
+  ["latest.json", "the newest full record"],
+  ["index.json", "one entry per run"],
+  ["regressions.json", "diff against the previous run"],
+  ["failures.jsonl.gz", "every failing test and subtest, gzipped JSON lines"],
+]
+---
+
+<Base
+  title="Web Platform Tests — tinybrowser"
+  description="tinybrowser's Web Platform Tests score, history, and regressions."
+>
+  <div class="flex flex-wrap items-end justify-between gap-3">
+    <div>
+      <h1 class="text-2xl font-semibold tracking-tight">Web Platform Tests</h1>
+      <p class="mt-1 text-sm text-muted-foreground">
+        How much of the pinned WPT corpus tinybrowser passes, by folder and by
+        run. One point per code push.
+      </p>
+    </div>
+    {
+      latest && (
+        <p class="text-xs text-muted-foreground">
+          Latest run {formatDate(latest.time_end)} ·{" "}
+          {commitHref ? (
+            <a class="font-mono hover:text-foreground" href={commitHref} rel="noreferrer">
+              {shortSha(latest.product_revision)}
+            </a>
+          ) : (
+            "—"
+          )}{" "}
+          · WPT <span class="font-mono">{shortSha(latest.wpt_revision)}</span>
+        </p>
+      )
+    }
+  </div>
+
+  {
+    latest === null ? (
+      <div class="mt-10 rounded-lg border border-border bg-card p-8 text-center">
+        <p class="text-sm text-muted-foreground">
+          No run has been published yet. The first push to <code>main</code>{" "}
+          that touches the engine writes it.
+        </p>
+      </div>
+    ) : (
+      <div class="mt-6 space-y-4">
+        <div class="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+          <div class="rounded-lg border border-border bg-card p-4">
+            <p class="text-xs text-muted-foreground">Subtests passing</p>
+            <p class="mt-1 text-3xl font-semibold tabular">{formatPercent(score)}</p>
+            <p class="mt-1 text-xs text-muted-foreground tabular">
+              {formatCount(counter(latest.totals, "subtest_pass"))} of{" "}
+              {formatCount(counter(latest.totals, "subtests"))}
+              {delta !== null && Math.abs(delta) >= 0.05 && (
+                <span class={delta >= 0 ? "ml-2 text-pass" : "ml-2 text-fail"}>
+                  {delta >= 0 ? "+" : ""}
+                  {delta.toFixed(1)} pts
+                </span>
+              )}
+            </p>
+          </div>
+          <div class="rounded-lg border border-border bg-card p-4">
+            <p class="text-xs text-muted-foreground">Files passing</p>
+            <p class="mt-1 text-3xl font-semibold tabular">{formatPercent(files)}</p>
+            <p class="mt-1 text-xs text-muted-foreground tabular">
+              {formatCount(counter(latest.totals, "pass"))} of{" "}
+              {formatCount(counter(latest.totals, "tests"))}
+            </p>
+          </div>
+          <div class="rounded-lg border border-border bg-card p-4">
+            <p class="text-xs text-muted-foreground">Skipped</p>
+            <p class="mt-1 text-3xl font-semibold tabular">
+              {formatCount(counter(latest.totals, "skip"))}
+            </p>
+            <p class="mt-1 text-xs text-muted-foreground tabular">
+              files the corpus or the lane marks as skipped
+            </p>
+          </div>
+          <div class="rounded-lg border border-border bg-card p-4">
+            <p class="text-xs text-muted-foreground">Unexpected failures</p>
+            <p class="mt-1 text-3xl font-semibold tabular">
+              {formatCount(counter(latest.totals, "unexpected"))}
+            </p>
+            <p class="mt-1 text-xs text-muted-foreground tabular">
+              {formatCount(counter(latest.totals, "timeout"))} timeouts ·{" "}
+              {formatCount(counter(latest.totals, "error"))} errors ·{" "}
+              {formatCount(counter(latest.totals, "crash"))} crashes
+            </p>
+          </div>
+        </div>
+
+        <HistoryChart index={index} />
+
+        <Regressions regression={regressions} />
+
+        <AreaTable areas={latest.areas} />
+
+        <div class="rounded-lg border border-border bg-card p-4">
+          <h2 class="text-sm font-medium">Raw data</h2>
+          <p class="mt-1 text-xs text-muted-foreground">
+            These are the files the page reads. No API key, no shape promise
+            beyond what the page consumes.
+          </p>
+          <ul class="mt-2 grid gap-1 text-xs sm:grid-cols-2">
+            {raw.map(([name, description]) => (
+              <li>
+                <a class="font-mono hover:underline" href={`/wpt/data/${name}`}>
+                  /wpt/data/{name}
+                </a>
+                <span class="text-muted-foreground"> — {description}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      </div>
+    )
+  }
+</Base>

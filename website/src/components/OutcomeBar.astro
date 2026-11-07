@@ -1,0 +1,31 @@
+---
+import { counter, OUTCOMES, type Counters } from "@/lib/record"
+
+interface Props {
+  counters: Counters
+  compact?: boolean
+}
+
+const { counters, compact = false } = Astro.props
+const total = Math.max(counter(counters, "subtests"), 1)
+const parts = OUTCOMES.map((outcome) => ({
+  ...outcome,
+  count: counter(counters, outcome.key),
+})).filter((part) => part.count > 0)
+---
+
+<div
+  class:list={["flex w-full overflow-hidden rounded-sm bg-border", compact ? "h-2" : "h-3"]}
+  role="img"
+  aria-label={parts.map((part) => `${part.count} ${part.label}`).join(", ")}
+>
+  {
+    parts.map((part) => (
+      <div
+        class={part.className}
+        style={`width:${(part.count / total) * 100}%`}
+        title={`${part.label}: ${part.count.toLocaleString("en-US")}`}
+      />
+    ))
+  }
+</div>
