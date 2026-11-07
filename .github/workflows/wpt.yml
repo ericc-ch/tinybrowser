@@ -443,6 +443,8 @@ jobs:
       # A GitHub App installation token, scoped to the one repo that holds the
       # record. The app is `tinybrowser wpt publisher` with Contents: write on
       # tinybrowser-wpt-results and nothing else; the token lives for one job.
+      # `client-id` is the app's public identifier; the App ID input is
+      # deprecated in this action's v3.
       # A broken credential must not turn the conformance gate red, so the step
       # may fail and the publish below then skips with a warning.
       - uses: actions/create-github-app-token@v3
@@ -450,7 +452,7 @@ jobs:
         if: ${{ !cancelled() && github.ref == 'refs/heads/main' && github.event_name == 'push' }}
         continue-on-error: true
         with:
-          app-id: ${{ vars.WPT_APP_ID }}
+          client-id: ${{ vars.WPT_APP_CLIENT_ID }}
           private-key: ${{ secrets.WPT_APP_PRIVATE_KEY }}
           owner: tinybrowser-dev
           repositories: tinybrowser-wpt-results
