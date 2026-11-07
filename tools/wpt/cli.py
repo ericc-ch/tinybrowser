@@ -3,7 +3,9 @@
 
 Upstream WPT (`third_party/wpt`, pristine submodule) owns serving,
 scheduling, driving, and reporting. This file owns the phases around it:
-* `run`    — build the binary, ready the shared venv + manifest, exec wpt.
+* `run webdriver`  — build the binary, ready the shared venv + manifest, exec wpt.
+* `run in-process` — mount testharness/crashtest/reftest in the engine process.
+* `run test262`    — the ECMAScript suite natively in QuickJS.
 * `score`  — run a set, then print one row per directory + attention list.
 * `rerun`  — re-run only the attention set from a saved wptreport.
 * `merge`  — fold the chunk reports of a CI run into one score.
@@ -11,9 +13,12 @@ scheduling, driving, and reporting. This file owns the phases around it:
 * `failures` — print the canonical failure list from a `--score` log.
 * `baseline` — run a slice at two revisions, diff the failure lists.
 * `manifest` — one manifest walk for a chunked CI run (build job).
-* `fast`    — native test262 lane: no HTML, testharness, or wptserve.
-* `fast-harness` — in-process testharness/crashtest/reftest lane: no WebDriver.
 * `overnight` — full-suite run + score (needs explicit approval per AGENTS.md).
+
+A lane names the executor, and the executor decides what a result means: the
+same file can differ between the WebDriver and in-process lanes, so every
+report records the lane it came from. `run` requires the lane; there is no
+default, because the slowest executor must never be the accidental one.
 
 `tinybrowser_wpt.py` stays separate: upstream imports it as the
 `wptrunner.products` entry-point, so it must remain a tiny importable module.
@@ -1150,6 +1155,7 @@ def profile_run(options: Options, paths: list[str], extra: list[str], top: int) 
         sys.executable,
         str(CLI),
         "run",
+        "webdriver",
         *paths,
         *profiled.flags(),
         "--log-wptreport",
@@ -1286,7 +1292,7 @@ def patch_wpt(wpt_root: Path, lane: str | None = None) -> None:
                     if not tests:
                         continue
                 elif lane == "in-process-complement":
-                    # Everything `fast-harness` does not run: testdriver files
+                    # Everything `run in-process` does not run: testdriver files
                     # (except crashtests, which the in-process lane judges by
                     # whether they survive, no driver needed), plus generated
                     # wrappers it cannot render (service worker, shared worker,
@@ -1345,8 +1351,8 @@ def patch_wpt(wpt_root: Path, lane: str | None = None) -> None:
 
 def inner_main(options: Options, argv: list[str]) -> int:
     """Runs under the venv python: patch upstream, then `wpt run`."""
-    lane = run_lane(argv)
-    if lane is not None:
+    selection = selection_lane(argv)
+    if selection is not None:
         argv = [
             arg
             for arg in argv
@@ -1355,7 +1361,7 @@ def inner_main(options: Options, argv: list[str]) -> int:
     if argv[:1] == ["--"]:
         argv = argv[1:]
     wpt_root = resolve_wpt_root(options)
-    patch_wpt(wpt_root, lane=lane)
+    patch_wpt(wpt_root, lane=selection)
     from tools.wpt import wpt
 
     code = wpt.main(prog=str(wpt_root / "wpt"), argv=["run", *argv])
@@ -1490,7 +1496,7 @@ def run_wpt(
     manifest: Path,
     record: int,
     options: Options,
-    lane: str | None = None,
+    selection: str | None = None,
 ) -> int:
     # wpt's `--binary-arg` is the only channel that carries an argument into
     # the product's command line, and the browser owns both of these.
@@ -1504,8 +1510,8 @@ def run_wpt(
     # Everything for the harness goes before `--`; wpt's own `--binary` and the
     # user's upstream flags stay after it, untouched.
     inner_argv = [*inner_flags(wpt, options)]
-    if lane is not None:
-        inner_argv.append(lane_flag(lane))
+    if selection is not None:
+        inner_argv.append(selection_flag(selection))
     inner_argv.extend(
         [
             "--",
@@ -1548,7 +1554,7 @@ def run_wpt(
         try:
             os.execv(str(exe), [str(exe), str(CLI), "_inner", *inner_argv])
         except OSError as error:
-            return die("run", f"cannot exec {exe}: {error}")
+            return die("run webdriver", f"cannot exec {exe}: {error}")
         raise AssertionError("unreachable")
 
     # Slow path: a manifest walk and/or venv writes happen under us, so stay
@@ -1564,7 +1570,7 @@ def run_wpt(
     except OSError as error:
         release_lock(venv_lock)
         release_lock(manifest_lock)
-        return die("run", f"could not start the runner: {error}")
+        return die("run webdriver", f"could not start the runner: {error}")
 
     def forward(signum, _frame):
         try:
@@ -1587,12 +1593,38 @@ def run_wpt(
     return status
 
 
+LANES = ("in-process", "webdriver", "test262")
+
+
 def run_main(options: Options, argv: list[str]) -> int:
+    """`run <lane>` — pick the executor, then hand it the rest of argv.
+
+    The lane is required. The executors disagree on some verdicts (a file can
+    pass in-process and time out under WebDriver), so every result must name
+    the executor that produced it, and no lane may be the accidental default.
+    """
+    if not argv:
+        return die("run", "give a lane: in-process | webdriver | test262", 2)
+    lane, rest = argv[0], argv[1:]
+    if lane == "in-process":
+        return in_process_main(options, rest)
+    if lane == "webdriver":
+        return webdriver_main(options, rest)
+    if lane == "test262":
+        return test262_main(options, rest)
+    return die(
+        "run",
+        f"unknown lane {lane}; expected in-process | webdriver | test262",
+        2,
+    )
+
+
+def webdriver_main(options: Options, argv: list[str]) -> int:
     # Our flags, not upstream's: remove them before the split so a following
     # literal `--` keeps its meaning, and let `inner_main` consume the copy
     # that travels to the venv child.
-    lane = run_lane(argv)
-    if lane is not None:
+    selection = selection_lane(argv)
+    if selection is not None:
         argv = [
             arg
             for arg in argv
@@ -1600,19 +1632,19 @@ def run_main(options: Options, argv: list[str]) -> int:
         ]
     paths, score, dry_run, extras, error = split_run_argv(argv)
     if error:
-        return die("run", error, 2)
+        return die("run webdriver", error, 2)
     if score:
         if dry_run:
             extras = ["--dry-run", *extras]
-        if lane is not None:
-            extras = [lane_flag(lane), *extras]
+        if selection is not None:
+            extras = [selection_flag(selection), *extras]
         return score_main(options, [*paths, *extras])
     if dry_run:
         wpt = resolve_wpt_root(options)
         final = finalize_run_args(wpt, extras)
         paths, final, error = hoist_paths_after_test_types(paths, final)
         if error:
-            return die("run", error, 2)
+            return die("run webdriver", error, 2)
         print(
             f"$ {wpt}/wpt run --binary <tinybrowser> tinybrowser {shlex.join([*paths, *final])}"
         )
@@ -1631,7 +1663,7 @@ def run_main(options: Options, argv: list[str]) -> int:
     os.chdir(ROOT)
     binary = build_binary(options)
     if not (binary.is_file() and os.access(binary, os.X_OK)):
-        return die("run", f"tinybrowser binary not found at {binary}")
+        return die("run webdriver", f"tinybrowser binary not found at {binary}")
     binary = Path(os.path.realpath(binary))
     os.chdir(wpt)
 
@@ -1652,7 +1684,7 @@ def run_main(options: Options, argv: list[str]) -> int:
     record = 0 if has_option_exact("--no-manifest-update", final) else 1
     paths, final, error = hoist_paths_after_test_types(paths, final)
     if error:
-        return die("run", error, 2)
+        return die("run webdriver", error, 2)
     return run_wpt(
         wpt,
         venv,
@@ -1662,12 +1694,12 @@ def run_main(options: Options, argv: list[str]) -> int:
         manifest,
         record,
         options,
-        lane,
+        selection,
     )
 
 
-def run_lane(argv: list[str]) -> str | None:
-    """The selection lane a `run` command asked for, or `None` for all tests."""
+def selection_lane(argv: list[str]) -> str | None:
+    """The selection a `run webdriver` asked for, or `None` for every file."""
     if "--testdriver-only" in argv:
         return "testdriver"
     if "--exclude-in-process" in argv:
@@ -1675,22 +1707,28 @@ def run_lane(argv: list[str]) -> str | None:
     return None
 
 
-def lane_flag(lane: str) -> str:
-    """The flag that selects `lane`, for a child `run` command."""
-    return "--testdriver-only" if lane == "testdriver" else "--exclude-in-process"
+def selection_flag(selection: str) -> str:
+    """The flag that selects `selection`, for a child `run webdriver` command."""
+    return "--testdriver-only" if selection == "testdriver" else "--exclude-in-process"
 
 
-# --- `fast` (native test262 lane) ---
+# --- `run test262` (native ECMAScript lane) ---
 
 
-def fast_main(options: Options, argv: list[str]) -> int:
-    """`fast` — run test262 natively, without HTML, testharness, or wptserve.
+def test262_main(options: Options, argv: list[str]) -> int:
+    """`run test262` — run the ECMAScript suite natively, no HTML or wptserve.
 
     The runner reads `third_party/wpt/third_party/test262` and never writes
     into it. It emits a wptreport with `--report`, and `--baseline` diffs the
     next run against that report. Strict variants are a prefix added in
     memory, so the checkout stays exactly at the pinned submodule revision.
     """
+    if "--score" in argv:
+        return die(
+            "run test262",
+            "--score summarizes a webdriver run; use `score --report FILE`",
+            2,
+        )
     wpt = resolve_wpt_root(options)
     if not (wpt / "wpt").is_file():
         eprint(f"WPT checkout not found at {wpt}")
@@ -1702,31 +1740,43 @@ def fast_main(options: Options, argv: list[str]) -> int:
         return 1
     test262 = wpt / "third_party" / "test262"
     if not test262.is_dir():
-        return die("fast", f"no test262 suite at {test262}", 1)
+        return die("run test262", f"no test262 suite at {test262}", 1)
     binary = fast_binary(options, "wpt-fast")
     command = [str(binary), "--test262-root", str(test262), *argv]
     eprint("wpt: " + " ".join(command))
     try:
         return subprocess.run(command, cwd=str(ROOT), check=False).returncode
     except OSError as error:
-        return die("fast", f"cannot run {binary}: {error}")
+        return die("run test262", f"cannot run {binary}: {error}")
 
 
 # --- `manifest` (one walk for a whole chunked CI run) ---
 
 
-def fast_harness_main(options: Options, argv: list[str]) -> int:
-    """`fast-harness` — run testharness, crashtest, and reftest files in-process.
+def in_process_main(options: Options, argv: list[str]) -> int:
+    """`run in-process` — testharness, crashtest, and reftest in this process.
 
-    No WebDriver, wptserve, or renderer child. The WPT checkout is read-only;
-    requests are served from these files, and the paused clock jumps over
-    timer waits. Use `--report` and `--baseline` like `fast`.
+    No WebDriver, wptserve request path, or renderer child. The WPT checkout is
+    read-only; requests are served from these files, and the paused clock jumps
+    over timer waits. Use `--report` and `--baseline` like `run test262`.
+
+    Testdriver files are never selected: driving a WebDriver session is the
+    `run webdriver` lane, which owns exactly the files this one cannot run.
 
     Each file runs in one process, so a page that aborts the engine ends the
     attempt. The harness journals every file it starts and finishes, and this
     restarts it until the selection is complete: a finished file is reported
     from the journal, an unfinished one becomes its own ERROR or TIMEOUT.
     """
+    # The lane is defined by what it cannot do, so the exclusion is not a
+    # caller choice; accepting the old flag would only invite the duplicate.
+    argv = [arg for arg in argv if arg != "--exclude-testdriver"]
+    if "--score" in argv:
+        return die(
+            "run in-process",
+            "--score summarizes a webdriver run; use `score --report FILE`",
+            2,
+        )
     wpt = resolve_wpt_root(options)
     if not (wpt / "wpt").is_file():
         eprint(f"WPT checkout not found at {wpt}")
@@ -1750,6 +1800,7 @@ def fast_harness_main(options: Options, argv: list[str]) -> int:
     try:
         policy = [
             *harness_budget_flags(),
+            "--exclude-testdriver",
             "--content-types",
             content_types,
             "--sidecar",
@@ -1808,13 +1859,13 @@ def start_sidecar(wpt: Path, venv: Path) -> SidecarProcess | None:
             text=True,
         )
     except OSError as error:
-        die("fast-harness", f"cannot start wptserve: {error}")
+        die("run in-process", f"cannot start wptserve: {error}")
         return None
     line = process.stdout.readline().strip() if process.stdout is not None else ""
     if not line.startswith("PORT "):
         process.kill()
         process.wait(timeout=10)
-        die("fast-harness", "wptserve did not report its port")
+        die("run in-process", "wptserve did not report its port")
         return None
     return SidecarProcess(process, f"127.0.0.1:{line.removeprefix('PORT ').strip()}")
 
@@ -1913,9 +1964,9 @@ def run_harness_windows(
         binary, wpt, policy, forward, base_offset, base_limit
     )
     if total is None:
-        return die("fast-harness", "cannot list the selection")
+        return die("run in-process", "cannot list the selection")
     if total == 0:
-        return die("fast-harness", "no tests selected", 2)
+        return die("run in-process", "no tests selected", 2)
     end = total if base_limit is None else min(total, base_limit)
     position = 0
     while position < end:
@@ -1986,7 +2037,7 @@ def harness_selection_count(
             command, cwd=str(ROOT), check=False, capture_output=True, text=True
         )
     except OSError as error:
-        die("fast-harness", f"cannot run {binary}: {error}")
+        die("run in-process", f"cannot run {binary}: {error}")
         return None
     if result.returncode != 0:
         eprint(result.stderr.rstrip())
@@ -2030,7 +2081,7 @@ def run_harness_supervised(
         try:
             code = subprocess.run(command, cwd=str(ROOT), check=False).returncode
         except OSError as error:
-            return die("fast-harness", f"cannot run {binary}: {error}")
+            return die("run in-process", f"cannot run {binary}: {error}")
         if code == 0:
             return 0
         # Only a signal (the process died under a file) or exit 3 (the
@@ -2043,10 +2094,10 @@ def run_harness_supervised(
         if unfinished:
             shown = ", ".join(unfinished[:8])
             more = f" and {len(unfinished) - 8} more" if len(unfinished) > 8 else ""
-            eprint(f"wpt: fast-harness: interrupted while running {shown}{more}")
+            eprint(f"wpt: run in-process: interrupted while running {shown}{more}")
         if finished <= completed:
             eprint(
-                f"wpt: fast-harness: attempt {attempt} stopped after {finished} "
+                f"wpt: run in-process: attempt {attempt} stopped after {finished} "
                 f"files with no progress (exit {code})"
             )
             return code
@@ -2054,7 +2105,7 @@ def run_harness_supervised(
         # other failure is the process dying under a file.
         stale = "timeout" if code == 3 else "error"
         completed = finished
-        eprint(f"wpt: fast-harness: attempt {attempt} stopped; resuming")
+        eprint(f"wpt: run in-process: attempt {attempt} stopped; resuming")
 
 
 def read_journal(path: Path) -> tuple[int, list[str]]:
@@ -2155,6 +2206,7 @@ def score_run(
         sys.executable,
         str(CLI),
         "run",
+        "webdriver",
         *paths,
         *options.flags(),
         "--log-wptreport",
@@ -2196,39 +2248,39 @@ def finish_scored_run(
 def score_main(options: Options, argv: list[str]) -> int:
     report, save_report, paths, extra, dry_run, error = split_score_argv(argv)
     if error:
-        return die("run --score", error, 2)
+        return die("run webdriver --score", error, 2)
     if report is not None and save_report is not None:
         return die(
-            "run --score",
+            "run webdriver --score",
             "--report summarizes an existing report; do not combine it with --save-report",
             2,
         )
     if has_option("--skip-timeout", extra):
         return die(
-            "run --score",
+            "run webdriver --score",
             "--skip-timeout is a dev-loop flag for `run`; a score must run expected TIMEOUTs",
             2,
         )
     if report is not None:
         if paths or extra or dry_run:
             return die(
-                "run --score",
+                "run webdriver --score",
                 "--report summarizes an existing report; give no test paths",
                 2,
             )
         return summarize(report)
     if dry_run:
         eprint(
-            f"$ {CLI} run {shlex.join([*paths, '--log-wptreport', '<tmp>', '--no-fail-on-unexpected', *extra])}"
+            f"$ {CLI} run webdriver {shlex.join([*paths, '--log-wptreport', '<tmp>', '--no-fail-on-unexpected', *extra])}"
         )
         return 0
     if not paths:
-        return die("run --score", "give test paths or --report FILE", 2)
+        return die("run webdriver --score", "give test paths or --report FILE", 2)
     started = time.monotonic()
     try:
         report_path, runner_exit = score_run(paths, extra, save_report, options)
     except OSError as error:
-        return die("run --score", f"could not start the runner: {error}")
+        return die("run webdriver --score", f"could not start the runner: {error}")
     return finish_scored_run(report_path, runner_exit, save_report, started)
 
 
@@ -2253,6 +2305,7 @@ def rerun_spawn(
         sys.executable,
         str(CLI),
         "run",
+        "webdriver",
         "--include-file",
         str(include_file),
         *options.flags(),
@@ -2523,7 +2576,7 @@ def baseline_score(
     log: Path,
 ) -> int:
     """Runs one side of the diff, streaming everything it prints into `log`."""
-    command = [sys.executable, str(CLI), "run", *paths, *flags, "--score"]
+    command = [sys.executable, str(CLI), "run", "webdriver", *paths, *flags, "--score"]
     if binary is not None:
         command += ["--binary", str(binary)]
     command += runner
@@ -2705,6 +2758,13 @@ def _selftest() -> None:
         lock_timeout=7,
     )
     assert extract_options(chosen.flags())[0] == chosen
+
+    # A lane is a command argument, not a flag, and never a default: the
+    # executors disagree, so an accidental lane would be an accidental verdict.
+    with contextlib.redirect_stderr(io.StringIO()):
+        assert run_main(Options(), []) == 2
+        assert run_main(Options(), ["bogus", "dom/"]) == 2
+    assert LANES == ("in-process", "webdriver", "test262")
 
     paths, score, dry, extras, err = split_run_argv(["dom/nodes/", "--exclude=worker"])
     assert (
@@ -2903,7 +2963,7 @@ def _selftest() -> None:
     assert parse_merge_argv(["a.json", "b.json", "--out"])[3] is not None
     assert parse_merge_argv(["a.json", "b.json", "--total-chunks", "2"])[3] is not None
 
-    # fast-harness resume: the driver reads the harness journal to tell the
+    # run in-process resume: the driver reads the harness journal to tell the
     # files that finished from the one an abort left in flight, and ignores a
     # line a torn write cut in half.
     with tempfile.TemporaryDirectory() as tmp:
@@ -3132,15 +3192,34 @@ def _selftest_merge() -> None:
             assert merge_main([str(empty)]) == 1
 
 
-TOP_HELP = """tinybrowser WPT harness: run | score | rerun | merge | profile | failures | baseline | manifest | fast | fast-harness | overnight | selftest
+TOP_HELP = """tinybrowser WPT harness: run | score | rerun | merge | profile | failures | baseline | manifest | overnight | selftest
 
-  run PATH... [--score] [--dry-run] [--testdriver-only | --exclude-in-process] [-- upstream-flags...]
-    Run WPT. Upstream flags follow `--` (or start implicitly at the first
-    `-flag`). --score runs then prints the per-directory table.
-    --testdriver-only keeps only files that drive a WebDriver session.
-    --exclude-in-process keeps what the in-process lane cannot run (testdriver
-    plus worker/module wrappers), so the two lanes partition the suite.
+  run in-process PATH... [--jobs N] [--report FILE] [--baseline FILE]
+    Mount testharness, crashtest, and reftest files in the engine process,
+    with a paused clock. No WebDriver or renderer child. `.py` handler routes
+    are forwarded to a wptserve sidecar this command starts; reftests compare
+    rendered pixels. Testdriver files are never selected: `run webdriver`
+    owns exactly the files this lane cannot run.
+    --total-chunks N --this-chunk K splits by source directory.
+    A file that aborts the engine is one ERROR or TIMEOUT: the runner journals
+    each file and this command restarts it until the selection is complete.
+  run webdriver PATH... [--score] [--dry-run] [--testdriver-only | --exclude-in-process] [-- upstream-flags...]
+    Drive the real browser through upstream wptrunner and WebDriver. Upstream
+    flags follow `--` (or start implicitly at the first `-flag`). --score runs
+    then prints the per-directory table. --testdriver-only keeps only files
+    that drive a WebDriver session; --exclude-in-process keeps what
+    `run in-process` cannot run, so the two lanes partition the suite.
     --dry-run prints the wpt invocation without building or running.
+  run test262 [FILTER...] [--jobs N] [--report FILE] [--baseline FILE]
+    Run the ECMAScript suite natively in QuickJS, without HTML, testharness.js,
+    wptserve, or WebDriver. The suite is read-only. --report writes a
+    wptreport the other readers understand; --baseline compares with an
+    earlier --report and exits 1 on a regression.
+
+A lane names the executor, and the executor decides what a result means: the
+same file can time out under WebDriver and pass in-process. Every report
+records the lane it came from, and no lane is a default.
+
   score PATH... [--report FILE | --save-report FILE] [-- upstream-flags...]
     Summarize an existing report (--report) or run then summarize.
   rerun REPORT [--include-timeout] [--dry-run] [--save-report FILE] [-- runner...]
@@ -3171,20 +3250,6 @@ TOP_HELP = """tinybrowser WPT harness: run | score | rerun | merge | profile | f
   manifest
     Build MANIFEST.json once per chunked CI run, so chunk jobs can skip the
     tree walk. Locally, rerun it after editing the WPT checkout.
-  fast [FILTER...] [--jobs N] [--report FILE] [--baseline FILE]
-    Run test262 in-process with QuickJS, without HTML, testharness.js,
-    wptserve, or WebDriver. The suite is read-only. --report writes a
-    wptreport the other readers understand; --baseline compares with an
-    earlier --report and exits 1 on a regression.
-  fast-harness PATH... [--jobs N] [--report FILE] [--baseline FILE]
-    Run WPT testharness, crashtest, and reftest files in the engine
-    process, with a paused clock. No WebDriver or renderer child. `.py`
-    handler routes are forwarded to a wptserve sidecar this command starts.
-    Reftests compare rendered pixels; testdriver still needs a WebDriver
-    session (--exclude-testdriver leaves those files to it).
-    --total-chunks N --this-chunk K splits by source directory.
-    A file that aborts the engine is one ERROR or TIMEOUT: the runner journals
-    each file and this command restarts it until the selection is complete.
   overnight [--save-report FILE] [--dry-run] [-- runner...]
     Full-suite run + score. Long; needs explicit approval per AGENTS.md.
   selftest
@@ -3202,8 +3267,10 @@ Harness flags (any subcommand, before `--`):
   --lock-timeout SECONDS how long to wait for a held lock
 
 Examples:
-  cli.py run dom/events/ --exclude=worker
-  cli.py run --score dom/nodes/ -- --processes 4
+  cli.py run in-process dom/events/ --jobs 8
+  cli.py run webdriver dom/nodes/ --exclude=worker
+  cli.py run webdriver --score dom/nodes/ -- --processes 4
+  cli.py run test262 test/language --jobs 12
   cli.py rerun /tmp/fileapi.json -- --processes 8 --fully-parallel
   cli.py merge reports/*.json --out merged.json
   cli.py profile referrer-policy/gen/req.rel-noref/no-referrer/a-tag.http.html
@@ -3241,10 +3308,6 @@ def main(argv: list[str] | None = None) -> int:
         return baseline_main(options, args)
     if command == "manifest":
         return manifest_main(options, args)
-    if command == "fast":
-        return fast_main(options, args)
-    if command == "fast-harness":
-        return fast_harness_main(options, args)
     if command == "overnight":
         return overnight_main(options, args)
     if command == "_inner":
@@ -3257,7 +3320,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     return die(
         "wpt",
-        f"unknown command {command}; expected run | score | rerun | merge | profile | failures | baseline | manifest | fast | fast-harness | overnight | selftest",
+        f"unknown command {command}; expected run | score | rerun | merge | profile | failures | baseline | manifest | overnight | selftest",
         2,
     )
 

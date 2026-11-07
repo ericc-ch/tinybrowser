@@ -3,7 +3,7 @@
 
 The harness answers every request from memory except two kinds: a `.py` path,
 which is a program rather than a file, and a path with no file behind it, which
-wptserve answers 404. Both need the real server, so `cli.py fast-harness`
+wptserve answers 404. Both need the real server, so `cli.py run in-process`
 starts this process and forwards those requests here.
 
 The server binds a loopback port and reports it on stdout (`PORT <n>`). Ports

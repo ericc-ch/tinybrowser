@@ -1,7 +1,7 @@
 """WPT timeout policy — tweak these numbers, nothing else.
 
 The WebDriver lane reads them through `tinybrowser_wpt.py` and the in-process
-`fast-harness` lane gets them as its `--normal-budget`/`--long-budget` flags
+`run in-process` lane gets them as its `--normal-budget`/`--long-budget` flags
 from `cli.py`. Both lanes therefore abandon a test at the same point; a change
 here reaches both or neither.
 

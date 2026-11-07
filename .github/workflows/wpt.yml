@@ -5,7 +5,7 @@
 #   harness   — testharness, crashtest, and reftest files mounted in the real
 #               engine, with a wptserve sidecar for `.py` handler routes. No
 #               WebDriver, wptserve request path, or renderer child per test.
-#   webdriver — the files `fast-harness` cannot run: testdriver tests and the
+#   webdriver — the files `run in-process` cannot run: testdriver tests and the
 #               generated worker/module wrappers, driven through the browser.
 #
 # `test262` runs natively in QuickJS in one job. The score job folds every
@@ -254,12 +254,11 @@ jobs:
         run: |
           set -euo pipefail
           chmod +x wpt-harness
-          python3 tools/wpt/cli.py fast-harness / \
+          python3 tools/wpt/cli.py run in-process / \
             --fast-binary "$PWD/wpt-harness" \
             --jobs 4 \
             --total-chunks "$WPT_HARNESS_CHUNKS" \
             --this-chunk "${{ matrix.chunk }}" \
-            --exclude-testdriver \
             --report "$REPORT" 2>&1 | tee "$RAW"
       - uses: actions/upload-artifact@v7
         if: ${{ !cancelled() }}
@@ -332,7 +331,7 @@ jobs:
             echo "::error::test-types is empty; nothing would run"
             exit 1
           fi
-          python3 tools/wpt/cli.py run --binary "$BINARY" \
+          python3 tools/wpt/cli.py run webdriver --binary "$BINARY" \
             --exclude-in-process -- \
             --no-manifest-update \
             --log-wptreport "$REPORT" \
@@ -377,7 +376,7 @@ jobs:
         run: |
           set -euo pipefail
           chmod +x wpt-fast
-          python3 tools/wpt/cli.py fast \
+          python3 tools/wpt/cli.py run test262 \
             --fast-binary "$PWD/wpt-fast" \
             --jobs 4 \
             --report "$REPORT"

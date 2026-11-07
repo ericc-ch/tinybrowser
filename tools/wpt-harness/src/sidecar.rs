@@ -3,7 +3,7 @@
 //! A `.py` URL is a program, not a file: wptserve executes it and calls its
 //! `main(request, response)` with the server's request object, the stash, and
 //! the test config. Reimplementing that object model here would be a second
-//! wptserve, so `cli.py fast-harness` starts the real one on a loopback port
+//! wptserve, so `cli.py run in-process` starts the real one on a loopback port
 //! and the in-memory transport hands it only the requests it cannot answer:
 //! `.py` handlers and the `.well-known` endpoints, which are all programs.
 //!

@@ -1,14 +1,16 @@
 # WPT harness
 
 tools/wpt/cli.py is the whole harness: `python3 tools/wpt/cli.py --help`
-lists its subcommands (`run`, `score`, `fast`, `fast-harness`, and the rest).
+lists its subcommands (`run in-process`, `run webdriver`, `run test262`,
+`score`, `merge`, and the rest).
 It needs a dev-shell Python, so call it through `nix develop --command`.
 Builds the wpt-profile binary via cargo each run; --binary PATH uses a
 prebuilt binary as-is.
 
-    nix develop --command python3 tools/wpt/cli.py run dom/events/ --exclude=worker
-    nix develop --command python3 tools/wpt/cli.py run --score dom/nodes/ -- --processes 4
-    nix develop --command python3 tools/wpt/cli.py fast test/language --jobs 12
+    nix develop --command python3 tools/wpt/cli.py run in-process dom/nodes --jobs 8
+    nix develop --command python3 tools/wpt/cli.py run webdriver dom/events/ --exclude=worker
+    nix develop --command python3 tools/wpt/cli.py run webdriver --score dom/nodes/ -- --processes 4
+    nix develop --command python3 tools/wpt/cli.py run test262 test/language --jobs 12
 
 Paths and our flags first; literal -- starts upstream flags.
 --exclude=worker skips Worker variants too. Prove with `... selftest`.
@@ -25,20 +27,20 @@ unless --include-timeout); --dry-run lists the selection. profile
 ranks tests by wall time with --report, or runs a path and prints the
 browser's navigation/request timeline.
 
-`fast` is the native test262 lane: tools/wpt-fast runs each `.js` file in a
-fresh QuickJS context with the test262 harness, no HTML, testharness.js,
-wptserve, or WebDriver. The suite is read-only; strict variants are a
-`"use strict";` prefix added in memory. It emits a wptreport with
+`run test262` is the native ECMAScript lane: tools/wpt-fast runs each `.js`
+file in a fresh QuickJS context with the test262 harness, no HTML,
+testharness.js, wptserve, or WebDriver. The suite is read-only; strict
+variants are a `"use strict";` prefix added in memory. It emits a wptreport with
 `--report FILE`; `--baseline FILE` diffs the next run against that report
 and exits 1 on a regression. The report has no WPT metadata, so every
 failure in it reads as unexpected to `cli.py`; it is a native baseline, not
 a replacement for the full score. Module tests load through QuickJS's module
 loader; import attributes (JSON/text) and `$262.agent` are not implemented
 yet. On this machine the 53,640 test262 files take ~27 s wall across 12 jobs
-(~2m25s CPU) versus 20,587 s in the harness.
+(~2m25s CPU) versus 20,587 s under WebDriver.
 
-`fast-harness` is the in-process testharness/crashtest/reftest lane: each
-file is mounted in the real engine in the harness process, with no WebDriver
+`run in-process` is the testharness/crashtest/reftest lane: each file is
+mounted in the real engine in the harness process, with no WebDriver
 or renderer child. Requests are served from the checkout, the only replaced
 resource is `/resources/testharnessreport.js` (a small reporter the host
 polls), and a paused Tokio clock jumps over timer waits, so a hung file costs
@@ -48,7 +50,7 @@ lanes read the policy in `tools/wpt/timeouts.py`, and cli.py passes it to the
 runner as `--normal-budget`/`--long-budget`.
 
 Two request kinds are not files: a `.py` path is a wptserve handler, and an
-absent path is a 404. `cli.py fast-harness` starts the real wptserve on a
+absent path is a 404. `cli.py run in-process` starts the real wptserve on a
 loopback port (`tools/wpt/sidecar.py`) and the transport forwards those
 requests to it, so the handler runs with its request object, templates, and
 stash. The sidecar binds an ephemeral port, prints it on stdout, and exits
@@ -59,11 +61,11 @@ the WebDriver lane uses, so "a test" means what upstream says it means:
 testharness, crashtest, and reftest items, with the URL and `timeout` the
 manifest records. Multi-global tests run through wptserve's `.any.html` and
 `.window.html` wrappers, rendered from the source's `// META:` lines.
-Testdriver items are selected but skipped (`testdriver.js` needs a WebDriver
-session); `--exclude-testdriver` drops them so the WebDriver lane
-(`cli.py run --exclude-in-process`) runs exactly the complement. That
-complement is the testdriver files plus the generated wrappers this lane
-cannot render (service worker, shared worker, module, shadow realm).
+Testdriver items belong to the WebDriver lane (`testdriver.js` needs a
+session), so this lane always excludes them. `cli.py run webdriver
+--exclude-in-process` runs exactly the complement: the testdriver files plus
+the generated wrappers this lane cannot render (service worker, shared worker,
+module, shadow realm).
 
 `--total-chunks N --this-chunk K` splits by a hash of the test's source path,
 which keeps every variant of one source together and spreads the work evenly
@@ -91,7 +93,7 @@ disagreements were one lane timing out where the other finished, plus files
 that need a real browser session (popups, service workers), which are the
 WebDriver lane's half of the split.
 
-    nix develop --command python3 tools/wpt/cli.py fast-harness dom/nodes --jobs 8
+    nix develop --command python3 tools/wpt/cli.py run in-process dom/nodes --jobs 8
 
 The lane has no result cache: every run executes the selection. It is fast
 because the engine is in-process and the clock is paused, not because an
@@ -103,7 +105,7 @@ gives each file one drain with its whole budget instead of a short slice.
 A file can end the process instead of returning a verdict: layout can recurse
 until the stack overflows, a `QuickJS` assertion aborts, and a page can spin in
 a drain that never yields. The harness writes a journal line before each file
-and another with its verdict (`--journal PATH`), so `cli.py fast-harness` runs
+and another with its verdict (`--journal PATH`), so `cli.py run in-process` runs
 it again after such an abort, reports the finished files from the journal,
 records the files that were in flight as ERROR (TIMEOUT when the watchdog cut a
 file that stopped returning) and runs only the rest. Each attempt must finish
@@ -133,7 +135,7 @@ jar (`crates/cookies`). Still unimplemented: wptserve's query-param `pipe`
 handlers, `.sub.` body substitution (a `.sub.html` is served literally), and
 `.py` handlers (a network error rather than the handler's source). Popups,
 workers, and WebDriver are out of scope: `window.open` returns null and
-`testdriver.js` files are skipped.
+`testdriver.js` files belong to the WebDriver lane.
 
 **The lane runs the real fetch core.** `FsServices` is a `NetworkHost` over
 `net::Agent::with_transport`: response tainting, CORS and preflight, the

@@ -4,7 +4,7 @@
 
 ## WPT
 
-Since 2026-11-05 the push gate in `wpt.yml` runs in-process (`fast-harness`,
+Since 2026-11-05 the push gate in `wpt.yml` runs in-process (`run in-process`,
 plus WebDriver only for testdriver and worker/module wrappers, plus native
 test262), and it is the only suite run: the nightly WebDriver duplicate was
 removed on 2026-11-07. It fires on pushes to `main` that touch code, the
