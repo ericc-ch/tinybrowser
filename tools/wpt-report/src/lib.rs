@@ -292,30 +292,56 @@ pub fn compare(baseline: &Path, outcomes: &[Outcome]) -> io::Result<Comparison> 
 /// its subtests, so an entry fails when any subtest is neither `PASS` nor
 /// `SKIP`. Reading one fixed subtest instead would call a file whose later
 /// subtest fails a pass, and every later run would report the same false
-/// regression. `tools/wpt/cli.py`'s `failing_tests` reads the same rule, which
-/// is what makes a baseline written by one reader usable by the other.
+/// regression.
+///
+/// A file-level `FAIL` is a verdict of its own: a failing reftest reports
+/// `FAIL` with no subtests at all, and reading that as `SKIP` made a later
+/// pass invisible as a fix.
+///
+/// `tools/wpt/verdict-cases.json` pins this rule against `cli.py`'s
+/// `raw_verdict`; both read the same reports, so a disagreement would report a
+/// pass as a regression or hide a fix.
 fn verdict(result: &Value) -> &str {
-    let status = result
-        .get("status")
-        .and_then(Value::as_str)
-        .unwrap_or("SKIP");
+    let status = result.get("status").and_then(Value::as_str);
     // A file-level timeout, crash, or error outranks its subtests: the file
     // stopped part-way, so the subtests it reported are a prefix, not a
     // verdict.
-    if matches!(status, "TIMEOUT" | "ERROR" | "CRASH") {
+    if let Some(status) = status
+        && matches!(status, "TIMEOUT" | "ERROR" | "CRASH")
+    {
         return status;
     }
-    let mut passed = matches!(status, "OK" | "PASS");
-    if let Some(subtests) = result.get("subtests").and_then(Value::as_array) {
-        for subtest in subtests {
-            match subtest.get("status").and_then(Value::as_str) {
-                Some("PASS") => passed = true,
-                Some("SKIP") | None => {}
-                Some(_) => return "FAIL",
+    let subtests = result.get("subtests").and_then(Value::as_array);
+    if let Some(subtests) = subtests
+        && subtests.iter().any(|subtest| {
+            !matches!(
+                subtest.get("status").and_then(Value::as_str),
+                Some("PASS" | "SKIP")
+            )
+        })
+    {
+        return "FAIL";
+    }
+    match status {
+        Some("OK" | "PASS") => "PASS",
+        Some("FAIL") => "FAIL",
+        Some(other) => other,
+        // A report that omits the file status keeps the verdict in its
+        // subtests; that is how a testharness entry reads when the writer
+        // recorded only the cases. Treating it as SKIP would turn every
+        // later pass into a hidden fix.
+        None => {
+            if subtests.is_some_and(|subtests| {
+                subtests
+                    .iter()
+                    .any(|subtest| subtest.get("status").and_then(Value::as_str) == Some("PASS"))
+            }) {
+                "PASS"
+            } else {
+                "SKIP"
             }
         }
     }
-    if passed { "PASS" } else { "SKIP" }
 }
 
 /// Prints the run summary and, when `verbose`, the failures and slowest tests.
@@ -386,7 +412,7 @@ pub fn print_comparison(comparison: &Comparison) {
 mod tests {
     use std::time::Duration;
 
-    use super::{Outcome, Status, compare};
+    use super::{Outcome, Status, compare, verdict};
 
     fn outcome(id: &str, status: Status) -> Outcome {
         Outcome {
@@ -463,5 +489,27 @@ mod tests {
         assert_eq!(comparison.fixes, ["broken"]);
         assert_eq!(comparison.regressions, [] as [String; 0]);
         assert_eq!(comparison.new_failures, [] as [String; 0]);
+    }
+
+    /// The shared fixture is the contract: `cli.py` asserts the same cases, so
+    /// a change to either reader that disagrees with the other fails here.
+    #[test]
+    fn the_verdict_rule_matches_the_shared_cases() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../wpt/verdict-cases.json");
+        let text = std::fs::read_to_string(&path).expect("read verdict cases");
+        let cases: serde_json::Value = serde_json::from_str(&text).expect("parse cases");
+        let cases = cases["cases"].as_array().expect("cases array");
+        assert!(!cases.is_empty(), "no cases pinned");
+        for case in cases {
+            let result = &case["result"];
+            let expected = case["verdict"].as_str().expect("verdict string");
+            assert_eq!(
+                verdict(result),
+                expected,
+                "{}",
+                case["why"].as_str().unwrap_or("case")
+            );
+        }
     }
 }

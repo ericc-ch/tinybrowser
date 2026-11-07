@@ -736,30 +736,47 @@ def parse_rerun_argv(
 
 def parse_merge_argv(
     argv: list[str],
-) -> tuple[list[Path], Path | None, bool, str | None]:
+) -> tuple[list[Path], Path | None, Path | None, str | None, bool, str | None]:
     reports: list[Path] = []
     out: Path | None = None
+    summary_out: Path | None = None
+    product_revision: str | None = None
     strict = False
     i = 0
     while i < len(argv):
         arg = argv[i]
-        if arg == "--out" or arg.startswith("--out="):
-            if arg == "--out":
-                if i + 1 >= len(argv) or argv[i + 1].startswith("-"):
-                    return reports, None, strict, "--out needs a file"
-                out = Path(argv[i + 1])
+        name = arg.split("=", 1)[0]
+        if name in ("--out", "--summary-out", "--product-revision"):
+            if "=" in arg:
+                value = arg.split("=", 1)[1]
+            elif i + 1 < len(argv) and not argv[i + 1].startswith("-"):
+                value = argv[i + 1]
                 i += 1
             else:
-                value = arg.split("=", 1)[1]
-                if not value:
-                    return reports, None, strict, "--out needs a file"
+                value = ""
+            if not value:
+                return (
+                    reports,
+                    out,
+                    summary_out,
+                    product_revision,
+                    strict,
+                    (f"{name} needs a value"),
+                )
+            if name == "--out":
                 out = Path(value)
+            elif name == "--summary-out":
+                summary_out = Path(value)
+            else:
+                product_revision = value
         elif arg == "--strict-skips":
             strict = True
         elif arg.startswith("-"):
             return (
                 reports,
                 out,
+                summary_out,
+                product_revision,
                 strict,
                 f"merge takes report files, not {arg} (chunk flags belong to `run`)",
             )
@@ -767,8 +784,15 @@ def parse_merge_argv(
             reports.append(Path(arg))
         i += 1
     if not reports:
-        return reports, out, strict, "merge needs at least one report file"
-    return reports, out, strict, None
+        return (
+            reports,
+            out,
+            summary_out,
+            product_revision,
+            strict,
+            "merge needs at least one report file",
+        )
+    return reports, out, summary_out, product_revision, strict, None
 
 
 # --- report primitives (score + rerun share these) ---
@@ -778,6 +802,10 @@ def group_of(test: str) -> str:
     parts = [p for p in test.split("/") if p]
     if len(parts) <= 1:
         return "(root)"
+    if parts[0] == "third_party" and len(parts) > 1 and parts[1] == "test262":
+        # The ECMAScript suite is one thing, not a subtree of third_party/;
+        # it has no expected-status metadata, so it reads as its own card.
+        return "test262"
     if "." in parts[1]:
         # A test directly inside a top-level directory groups under that
         # directory, not under the file; the table header says "directory".
@@ -805,6 +833,37 @@ def unexpected_subs(subtests: list) -> list[dict]:
     return [s for s in subtests if s.get("status") != "SKIP" and not is_expected(s)]
 
 
+def raw_verdict(result: dict) -> str:
+    """The verdict a report states for one result, without any metadata.
+
+    A file-level timeout, crash, or error outranks its subtests: the file
+    stopped part-way, so the subtests it reported are a prefix, not a verdict.
+    Otherwise any subtest that is neither PASS nor SKIP fails the file, and a
+    file with no subtests keeps its own status — a failing reftest reports
+    FAIL with an empty subtest list.
+
+    `tools/wpt/verdict-cases.json` pins this rule against `tools/wpt-report`'s
+    `verdict`, which reads the same reports for a baseline diff. Two readers
+    that disagree would call a pass a regression (or hide a fix).
+    """
+    status = result.get("status")
+    if status in HARD_STATUSES:
+        return status
+    subtests = result.get("subtests") or []
+    if any(sub.get("status") not in ("PASS", "SKIP") for sub in subtests):
+        return "FAIL"
+    if status == "FAIL":
+        return "FAIL"
+    if status in ("OK", "PASS"):
+        return "PASS"
+    if status is None:
+        # A writer that recorded only the subtests keeps the verdict there.
+        return (
+            "PASS" if any(sub.get("status") == "PASS" for sub in subtests) else "SKIP"
+        )
+    return status
+
+
 def classify_results(
     results: list[dict],
 ) -> tuple[dict[str, dict[str, int]], list[tuple[str, str, str]]]:
@@ -820,7 +879,12 @@ def classify_results(
         sub_failed = [s for s in subtests if s.get("status") not in ("PASS", "SKIP")]
         row["subtests"] += len(subtests)
         row["subfail"] += len(sub_failed)
-        status = result.get("status", "ERROR")
+        for sub in subtests:
+            name = "unknown"
+            if isinstance(sub, dict) and sub.get("status"):
+                name = str(sub["status"]).lower().replace("-", "_")
+            row[f"subtest_{name}"] += 1
+        status = raw_verdict(result)
         if status == "SKIP":
             row["skip"] += 1
         elif status in HARD_STATUSES:
@@ -1038,8 +1102,65 @@ def fold_reports(
     return merged, warnings, None
 
 
+# The compact run record. The merged wptreport is a debug artifact; this is
+# what the history, the site, and the regression diff consume, so it must stay
+# small and stable while the wptreport keeps growing.
+RECORD_SCHEMA = 1
+RECORD_COUNTERS = (
+    "tests",
+    "pass",
+    "expected_fail",
+    "unexpected",
+    "timeout",
+    "crash",
+    "error",
+    "skip",
+    "subtests",
+    "subfail",
+    "time_ms",
+)
+
+
+def record_row(row: dict[str, int]) -> dict[str, int]:
+    """One area's counters, with stable spelling and no zero noise removed."""
+    return {
+        key: row.get(key, 0)
+        for key in sorted(row)
+        if key in RECORD_COUNTERS or key.startswith("subtest_")
+    }
+
+
+def build_record(merged: dict, product_revision: str | None) -> dict:
+    """The compact record of one merged run.
+
+    Totals and areas come from the same classifier the table uses, so the
+    record can never disagree with the printed score. `failures` is the
+    attention list with the diagnostic message dropped: a status, a test, and
+    an optional subtest name are what a diff and a site need.
+    """
+    rows, attention = classify_results(merged.get("results") or [])
+    totals: dict[str, int] = defaultdict(int)
+    for row in rows.values():
+        for key, value in row.items():
+            totals[key] += value
+    run_info = merged.get("run_info") or {}
+    return {
+        "schema": RECORD_SCHEMA,
+        "product_revision": product_revision,
+        "wpt_revision": run_info.get("revision"),
+        "time_start": merged.get("time_start"),
+        "time_end": merged.get("time_end"),
+        "totals": record_row(totals),
+        "areas": {name: record_row(row) for name, row in sorted(rows.items())},
+        "failures": [
+            {"test": test, "subtest": subtest, "status": status.split(" ", 1)[0]}
+            for test, subtest, status in attention
+        ],
+    }
+
+
 def merge_main(argv: list[str]) -> int:
-    reports, out, strict, error = parse_merge_argv(argv)
+    reports, out, summary_out, product_revision, strict, error = parse_merge_argv(argv)
     if error:
         return die("merge", error, 2)
     loaded: list[tuple[Path, dict]] = []
@@ -1064,6 +1185,14 @@ def merge_main(argv: list[str]) -> int:
         out.write_text(json.dumps(merged))
         eprint(
             f"merged {len(loaded)} reports -> {out} ({len(merged['results'])} results)"
+        )
+    if summary_out is not None:
+        summary_out.parent.mkdir(parents=True, exist_ok=True)
+        record = build_record(merged, product_revision)
+        summary_out.write_text(json.dumps(record, separators=(",", ":")))
+        eprint(
+            f"record -> {summary_out} ({record['totals']['tests']} tests, "
+            f"{len(record['failures'])} failures)"
         )
     code = summarize_results(merged["results"])
     if strict and skipped:
@@ -2871,10 +3000,7 @@ def _selftest() -> None:
             },
         ]
     )
-    assert (
-        rows["third_party/test262"]["pass"] == 1
-        and rows["third_party/test262"]["unexpected"] == 1
-    )
+    assert rows["test262"]["pass"] == 1 and rows["test262"]["unexpected"] == 1
     assert attention == [("/third_party/test262/bad.test262.html", "a", "FAIL")]
     rows, attention = classify_results(
         [
@@ -2887,6 +3013,13 @@ def _selftest() -> None:
         ]
     )
     assert rows["dom"]["expected_fail"] == 1 and attention == []
+
+    # The metadata-free verdict is pinned in one file both readers test:
+    # cli.py here, tools/wpt-report against the same cases.
+    pinned = json.loads((ROOT / "tools" / "wpt" / "verdict-cases.json").read_text())
+    assert pinned["cases"]
+    for case in pinned["cases"]:
+        assert raw_verdict(case["result"]) == case["verdict"], case["why"]
 
     ok = {"test": "/dom/ok.html", "status": "PASS"}
     skip = {
@@ -2948,20 +3081,33 @@ def _selftest() -> None:
     assert r == Path("r.json") and err is None
     assert parse_rerun_argv([])[5] is not None
 
-    reports, out, strict, err = parse_merge_argv(
-        ["a.json", "b.json", "--out", "m.json", "--strict-skips"]
+    reports, out, summary, revision, strict, err = parse_merge_argv(
+        [
+            "a.json",
+            "b.json",
+            "--out",
+            "m.json",
+            "--summary-out",
+            "r.json",
+            "--product-revision",
+            "abc",
+            "--strict-skips",
+        ]
     )
     assert (
         reports == [Path("a.json"), Path("b.json")]
         and out == Path("m.json")
+        and summary == Path("r.json")
+        and revision == "abc"
         and strict
         and err is None
     )
     assert parse_merge_argv(["a.json", "b.json"])[1] is None
-    assert parse_merge_argv(["a.json"])[3] is None  # one report is a valid merge
-    assert parse_merge_argv([])[3] is not None
-    assert parse_merge_argv(["a.json", "b.json", "--out"])[3] is not None
-    assert parse_merge_argv(["a.json", "b.json", "--total-chunks", "2"])[3] is not None
+    assert parse_merge_argv(["a.json"])[5] is None  # one report is a valid merge
+    assert parse_merge_argv([])[5] is not None
+    assert parse_merge_argv(["a.json", "b.json", "--out"])[5] is not None
+    assert parse_merge_argv(["a.json", "--summary-out"])[5] is not None
+    assert parse_merge_argv(["a.json", "b.json", "--total-chunks", "2"])[5] is not None
 
     # run in-process resume: the driver reads the harness journal to tell the
     # files that finished from the one an abort left in flight, and ignores a
@@ -3126,9 +3272,24 @@ def _selftest_merge() -> None:
         empty.write_text(chunk([]))
 
         merged_path = tmp / "merged.json"
+        record_path = tmp / "run.json"
         stdout, stderr = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-            assert merge_main([str(a), str(b), "--out", str(merged_path)]) == 0
+            assert (
+                merge_main(
+                    [
+                        str(a),
+                        str(b),
+                        "--out",
+                        str(merged_path),
+                        "--summary-out",
+                        str(record_path),
+                        "--product-revision",
+                        "abc123",
+                    ]
+                )
+                == 0
+            )
         merged = json.loads(merged_path.read_text())
         assert [r["test"] for r in merged["results"]] == [
             "/a.html",
@@ -3137,6 +3298,45 @@ def _selftest_merge() -> None:
         ]
         assert merged["run_info"] == info
         assert merged["time_start"] == 5 and merged["time_end"] == 30
+
+        # The record is the hand-off: same classifier as the table, and the
+        # failure list is a status token per entry, not a diagnostic string.
+        record = json.loads(record_path.read_text())
+        assert record["schema"] == 1
+        assert record["product_revision"] == "abc123"
+        assert record["wpt_revision"] is None
+        assert record["totals"]["tests"] == 3
+        assert record["totals"]["pass"] == 3
+        assert record["areas"]["(root)"]["tests"] == 3
+        assert record["failures"] == []
+
+        failing = tmp / "failing.json"
+        failing.write_text(
+            chunk(
+                [
+                    {
+                        "test": "/dom/x.html",
+                        "status": "OK",
+                        "subtests": [
+                            {"name": "s", "status": "FAIL", "expected": "PASS"}
+                        ],
+                    }
+                ]
+            )
+        )
+        record_path = tmp / "run-failing.json"
+        with (
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            assert merge_main([str(failing), "--summary-out", str(record_path)]) == 0
+        record = json.loads(record_path.read_text())
+        assert record["totals"]["unexpected"] == 1
+        assert record["totals"]["subtest_fail"] == 1
+        assert record["areas"]["dom"]["unexpected"] == 1
+        assert record["failures"] == [
+            {"test": "/dom/x.html", "subtest": "s", "status": "FAIL"}
+        ]
 
         # A dead chunk is skipped, the rest still scores.
         stdout, stderr = io.StringIO(), io.StringIO()
@@ -3194,6 +3394,7 @@ def _selftest_merge() -> None:
 
 TOP_HELP = """tinybrowser WPT harness: run | score | rerun | merge | profile | failures | baseline | manifest | overnight | selftest
 
+Lanes — `run <lane>`, required, one executor each:
   run in-process PATH... [--jobs N] [--report FILE] [--baseline FILE]
     Mount testharness, crashtest, and reftest files in the engine process,
     with a paused clock. No WebDriver or renderer child. `.py` handler routes
@@ -3220,16 +3421,30 @@ A lane names the executor, and the executor decides what a result means: the
 same file can time out under WebDriver and pass in-process. Every report
 records the lane it came from, and no lane is a default.
 
+Reports and diffs:
   score PATH... [--report FILE | --save-report FILE] [-- upstream-flags...]
     Summarize an existing report (--report) or run then summarize.
   rerun REPORT [--include-timeout] [--dry-run] [--save-report FILE] [-- runner...]
     Re-run only the attention set from a wptreport.
-  merge REPORT... [--out FILE] [--strict-skips]
+  merge REPORT... [--out FILE] [--summary-out FILE] [--product-revision SHA] [--strict-skips]
     Fold the chunk reports of one CI run into a single score. Reports that
     are missing, corrupt, or empty are skipped with a warning; overlapping
     tests are refused. --out writes the merged wptreport, keeping run_info,
-    subsuites, and the time bounds. --strict-skips exits 2 after printing
-    the table when any report was unusable, so a dead chunk still fails CI.
+    subsuites, and the time bounds. --summary-out writes the compact run
+    record (totals, per-area counters, subtest outcomes, failure list) that
+    the history and the site read; --product-revision stamps it with the
+    commit under test. --strict-skips exits 2 after printing the table when
+    any report was unusable, so a dead chunk still fails CI.
+  failures [LOG...]
+    Print the canonical failure list of a `--score` log, one
+    `STATUS PATH :: SUBTEST` line per failing result, sorted and deduplicated.
+    Reads stdin when given no logs.
+  baseline REV PATH... [-- upstream-flags...]
+    Run the slice at REV and in the working tree and diff the failure lists;
+    exit 1 on a failure the working tree adds. The baseline browser is built
+    in a detached worktree that is removed on exit.
+
+Utilities:
   profile PATH... [--top N]
   profile --report FILE [--top N]
     Rank tests by wall time. With paths it runs them at trace with the
@@ -3239,14 +3454,6 @@ records the lane it came from, and no lane is a default.
     end in milliseconds while the test still times out mean the renderer is
     spinning, not the network. Records sit at the browser's seams, never in
     the renderer crate (that crate is shared with wasm and carries no logger).
-  failures [LOG...]
-    Print the canonical failure list of a `--score` log, one
-    `STATUS PATH :: SUBTEST` line per failing result, sorted and deduplicated.
-    Reads stdin when given no logs.
-  baseline REV PATH... [-- upstream-flags...]
-    Run the slice at REV and in the working tree and diff the failure lists;
-    exit 1 on a failure the working tree adds. The baseline browser is built
-    in a detached worktree that is removed on exit.
   manifest
     Build MANIFEST.json once per chunked CI run, so chunk jobs can skip the
     tree walk. Locally, rerun it after editing the WPT checkout.

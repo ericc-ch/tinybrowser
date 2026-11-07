@@ -155,6 +155,13 @@ worktree (exit 1 on new failures). Metadata-expected TIMEOUTs:
 explicit approval. Update the docs/progress.md total after scoring.
 Timeout policy (DEFAULT/LONG/EXTRA seconds) lives in tools/wpt/timeouts.py.
 
+`merge --summary-out run.json` writes the compact record of a CI run: totals,
+per-area counters, per-subtest outcome tallies, and the failure list with the
+diagnostic message dropped. It comes from the same classifier as the printed
+table, so the two cannot disagree. The 335 MB merged wptreport is a debug
+artifact; the record is the hand-off, and `tools/wpt/verdict-cases.json`
+pins its verdict rule against `tools/wpt-report`.
+
 A test file whose own timers outlast DEFAULT_TIMEOUT cannot be sped up
 from the engine: `referrer-policy/css-integration/svg/` sleeps 800 ms
 per subtest (nine serially) before it checks anything. SLOW_TEST_PREFIXES

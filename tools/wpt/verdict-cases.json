@@ -1,0 +1,98 @@
+{
+  "why": "One rule, two readers: cli.py scores a merged run, wpt-report diffs a baseline. They read the same wptreports, so a disagreement would report a pass as a regression or hide a fix. Each side tests every case here.",
+  "cases": [
+    {
+      "why": "a file timeout outranks the subtests it managed to report",
+      "result": {
+        "test": "/dom/a.html",
+        "status": "TIMEOUT",
+        "subtests": [{ "name": "early", "status": "PASS" }]
+      },
+      "verdict": "TIMEOUT"
+    },
+    {
+      "why": "an error outranks its subtests the same way",
+      "result": {
+        "test": "/dom/b.html",
+        "status": "ERROR",
+        "subtests": [{ "name": "early", "status": "PASS" }]
+      },
+      "verdict": "ERROR"
+    },
+    {
+      "why": "a crash has no subtests to read",
+      "result": { "test": "/css/crash.html", "status": "CRASH", "subtests": [] },
+      "verdict": "CRASH"
+    },
+    {
+      "why": "a testharness file keeps OK and reports its verdict in the subtests",
+      "result": {
+        "test": "/dom/c.html",
+        "status": "OK",
+        "subtests": [
+          { "name": "one", "status": "PASS" },
+          { "name": "two", "status": "PASS" }
+        ]
+      },
+      "verdict": "PASS"
+    },
+    {
+      "why": "any subtest that is neither PASS nor SKIP fails the file",
+      "result": {
+        "test": "/dom/d.html",
+        "status": "OK",
+        "subtests": [
+          { "name": "one", "status": "PASS" },
+          { "name": "two", "status": "FAIL" }
+        ]
+      },
+      "verdict": "FAIL"
+    },
+    {
+      "why": "a skipped subtest does not fail the file",
+      "result": {
+        "test": "/dom/e.html",
+        "status": "OK",
+        "subtests": [
+          { "name": "one", "status": "PASS" },
+          { "name": "two", "status": "SKIP" }
+        ]
+      },
+      "verdict": "PASS"
+    },
+    {
+      "why": "a failing reftest reports FAIL with no subtests",
+      "result": { "test": "/css/f.html", "status": "FAIL", "subtests": [] },
+      "verdict": "FAIL"
+    },
+    {
+      "why": "a passing crashtest reports PASS with no subtests",
+      "result": { "test": "/css/g.html", "status": "PASS", "subtests": [] },
+      "verdict": "PASS"
+    },
+    {
+      "why": "a file-level FAIL wins over subtests that happen to pass",
+      "result": {
+        "test": "/dom/h.html",
+        "status": "FAIL",
+        "subtests": [{ "name": "one", "status": "PASS" }]
+      },
+      "verdict": "FAIL"
+    },
+    {
+      "why": "a skipped file stays skipped",
+      "result": { "test": "/dom/i.html", "status": "SKIP", "subtests": [] },
+      "verdict": "SKIP"
+    },
+    {
+      "why": "a writer that recorded only the subtests keeps the verdict there",
+      "result": { "test": "/dom/j.html", "subtests": [{ "status": "PASS" }] },
+      "verdict": "PASS"
+    },
+    {
+      "why": "no file status and no passing subtest is a skip, not a pass",
+      "result": { "test": "/dom/k.html", "subtests": [{ "status": "SKIP" }] },
+      "verdict": "SKIP"
+    }
+  ]
+}

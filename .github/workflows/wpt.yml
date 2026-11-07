@@ -413,7 +413,8 @@ jobs:
             exit 1
           fi
           python3 tools/wpt/cli.py merge --strict-skips "${reports[@]}" \
-            --out merged.json | tee summary.txt
+            --out merged.json --summary-out run.json \
+            --product-revision "$GITHUB_SHA" | tee summary.txt
           if (( ${#reports[@]} != expected )); then
             echo "::error::incomplete run: ${#reports[@]} of $expected chunk reports"
             exit 1
@@ -435,6 +436,7 @@ jobs:
           name: wpt-merged
           path: |
             merged.json
+            run.json
             summary.txt
           if-no-files-found: warn
           retention-days: 7
